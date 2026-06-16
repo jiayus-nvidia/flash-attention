@@ -463,9 +463,15 @@ if not SKIP_CUDA_BUILD:
     if DISABLE_SM8x and DISABLE_SM90:
         raise RuntimeError("Cannot disable both SM8x and SM90. At least one architecture must be enabled.")
 
-    # Auto-generate kernel instantiation files if they don't exist or are empty
+    # Auto-generate kernel instantiation files if they don't exist, are empty, or
+    # were generated before forward nfunc files became shape-scoped.
     instantiations_dir = Path(this_dir) / "instantiations"
-    if not instantiations_dir.exists() or not any(instantiations_dir.glob("*.cu")):
+    nfunc_split_sentinel = instantiations_dir / "flash_fwd_nfunc1_hdim128_bf16_sm80.cu"
+    if (
+        not instantiations_dir.exists()
+        or not any(instantiations_dir.glob("*.cu"))
+        or not nfunc_split_sentinel.exists()
+    ):
         print("Generating kernel instantiation files...")
         subprocess.run([sys.executable, "generate_kernels.py", "-o", "instantiations"], cwd=this_dir, check=True)
 
@@ -619,17 +625,37 @@ if not SKIP_CUDA_BUILD:
         sources_bwd_sm90 = []
         sources_bwd_sm80 = []
 
-    # Per-nfunc instantiation files for parallel compilation of arbitrary mask kernels
-    # Each nfunc value gets its own .cu file (per SM arch and direction), so they compile in parallel
+    def nfunc_fwd_source(nfunc_val, hdim, dtype, sm):
+        return f"instantiations/flash_fwd_nfunc{nfunc_val}_hdim{hdim}_{dtype}_sm{sm}.cu"
+
+    # Per-nfunc instantiation files for arbitrary mask kernels. Forward files
+    # are split by dtype/head-dim so SM80 does not compile one very large
+    # flash_fwd_nfunc*_sm80.cu translation unit.
     sources_nfunc = []
     if not DISABLE_ARBITRARY and NUM_FUNC_VALUES:
         for nfunc_val in NUM_FUNC_VALUES:
             if not DISABLE_SM90:
-                sources_nfunc.append(f"instantiations/flash_fwd_nfunc{nfunc_val}_sm90.cu")
+                sources_nfunc += [
+                    nfunc_fwd_source(nfunc_val, hdim, dtype, 90)
+                    for hdim, dtype in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90)
+                ]
+                if not DISABLE_HDIMDIFF64:
+                    sources_nfunc += [
+                        nfunc_fwd_source(nfunc_val, hdim, dtype, 90)
+                        for hdim, dtype in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90)
+                    ]
+                if not DISABLE_HDIMDIFF192:
+                    sources_nfunc += [
+                        nfunc_fwd_source(nfunc_val, hdim, dtype, 90)
+                        for hdim, dtype in itertools.product(HEAD_DIMENSIONS_DIFF192_FWD, DTYPE_FWD_SM90)
+                    ]
                 if not DISABLE_BACKWARD:
                     sources_nfunc.append(f"instantiations/flash_bwd_nfunc{nfunc_val}_sm90.cu")
             if not DISABLE_SM8x:
-                sources_nfunc.append(f"instantiations/flash_fwd_nfunc{nfunc_val}_sm80.cu")
+                sources_nfunc += [
+                    nfunc_fwd_source(nfunc_val, hdim, dtype, 80)
+                    for hdim, dtype in itertools.product(HEAD_DIMENSIONS_FWD_SM80, DTYPE_FWD_SM80)
+                ]
                 if not DISABLE_BACKWARD:
                     sources_nfunc.append(f"instantiations/flash_bwd_nfunc{nfunc_val}_sm80.cu")
 
