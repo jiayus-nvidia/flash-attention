@@ -380,6 +380,8 @@ class FlashAttentionBackwardSm100:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
+        dQ_lock_values_mask: Optional[cute.Tensor] = None,
+        dQ_lock_values_full: Optional[cute.Tensor] = None,
     ):
         assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
             "Variable sequence length is not supported yet in FlashAttentionBackwardSm100"
@@ -694,6 +696,8 @@ class FlashAttentionBackwardSm100:
             mdQ_semaphore,
             mdK_semaphore,
             mdV_semaphore,
+            dQ_lock_values_mask,
+            dQ_lock_values_full,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -752,6 +756,8 @@ class FlashAttentionBackwardSm100:
         mdQ_semaphore: Optional[cute.Tensor],
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
+        dQ_lock_values_mask: Optional[cute.Tensor],
+        dQ_lock_values_full: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
@@ -1182,6 +1188,8 @@ class FlashAttentionBackwardSm100:
                 TileSchedulerCls,
                 blocksparse_tensors,
                 mdQ_semaphore,
+                dQ_lock_values_mask,
+                dQ_lock_values_full,
             )
 
         return
@@ -2348,6 +2356,8 @@ class FlashAttentionBackwardSm100:
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[LinearBlockSparseTensors],
         mdQ_semaphore: Optional[cute.Tensor],
+        dQ_lock_values_mask: Optional[cute.Tensor],
+        dQ_lock_values_full: Optional[cute.Tensor],
     ):
         num_reduce_threads = cute.arch.WARP_SIZE * len(self.reduce_warp_ids)
         tidx = cute.arch.thread_idx()[0] % num_reduce_threads
@@ -2470,6 +2480,15 @@ class FlashAttentionBackwardSm100:
                                 ),
                             )
                             lock_value = n_block_max_for_m_block - 1 - n_block
+                        elif const_expr(self.use_block_sparsity):
+                            lock_value = Int32(0)
+                            if const_expr(dQ_lock_values_full is not None):
+                                if iter_idx < curr_mask_cnt:
+                                    lock_value = dQ_lock_values_mask[curr_mask_offset + iter_idx]
+                                else:
+                                    lock_value = dQ_lock_values_full[curr_full_offset + iter_idx - curr_mask_cnt]
+                            else:
+                                lock_value = dQ_lock_values_mask[curr_mask_offset + iter_idx]
                         else:
                             lock_value = n_block
                         barrier.wait_eq(
