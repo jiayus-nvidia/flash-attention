@@ -15,6 +15,7 @@ from cutlass import Float32, Int32, const_expr
 from quack import copy_utils
 
 # Import data structures from block_sparsity
+from flash_attn.cute import barrier
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -1804,14 +1805,31 @@ def _store_one_dQaccum_sm90(
     num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
+    deterministic: cutlass.Constexpr[bool] = False,
+    mdQ_semaphore_cur: Optional[cute.Tensor] = None,
+    warp_local_tidx: Int32 = Int32(0),
+    lock_value: Int32 = Int32(0),
 ):
     """Store dQaccum for a single m_block."""
     for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
-        cute.arch.cp_async_bulk_wait_group(num_dQ_warp_groups - 1 - warp_group_idx, read=True)
+        if const_expr(not deterministic):
+            cute.arch.cp_async_bulk_wait_group(
+                num_dQ_warp_groups - 1 - warp_group_idx, read=True
+            )
         cute.arch.barrier_arrive(
             barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
             number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
         )
+
+    if const_expr(deterministic):
+        assert mdQ_semaphore_cur is not None
+        barrier.wait_eq(
+            mdQ_semaphore_cur[(m_block, None)].iterator,
+            warp_local_tidx,
+            0,  # flag_offset
+            lock_value,
+        )
+
     for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
         cute.arch.barrier(
             barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
@@ -1824,6 +1842,18 @@ def _store_one_dQaccum_sm90(
                 tma_copy_bytes_dQ,
             )
         cute.arch.cp_async_bulk_commit_group()
+
+    if const_expr(deterministic):
+        assert mdQ_semaphore_cur is not None
+        # The next contributor must not start until every dQ chunk from this
+        # CTA has completed its global-memory reduction.
+        cute.arch.cp_async_bulk_wait_group(0, read=False)
+        barrier.arrive_inc(
+            mdQ_semaphore_cur[(m_block, None)].iterator,
+            warp_local_tidx,
+            0,  # flag_offset
+            1,
+        )
 
 
 @cute.jit
@@ -1839,6 +1869,9 @@ def dQaccum_store_block_sparse_bwd_sm90(
     num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
+    deterministic: cutlass.Constexpr[bool] = False,
+    mdQ_semaphore_cur: Optional[cute.Tensor] = None,
+    warp_local_tidx: Int32 = Int32(0),
 ):
     """SM90 backward block sparse dQaccum store with separate partial/full loops.
 
@@ -1847,6 +1880,13 @@ def dQaccum_store_block_sparse_bwd_sm90(
     curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx = get_curr_blocksparse_tensors_fixed(
         batch_idx, head_idx, n_block, blocksparse_tensors
     )
+    curr_dq_write_order = None
+    curr_dq_write_order_full = None
+    if const_expr(deterministic):
+        curr_dq_write_order, curr_dq_write_order_full = get_curr_dq_write_order_bwd(
+            blocksparse_tensors, batch_idx, head_idx, n_block
+        )
+        assert curr_dq_write_order is not None
 
     for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
         sparse_idx = iter_idx // subtile_factor
@@ -1861,9 +1901,19 @@ def dQaccum_store_block_sparse_bwd_sm90(
                 num_dQ_warp_groups,
                 num_threads_per_warp_group,
                 tma_copy_bytes_dQ,
+                deterministic=deterministic,
+                mdQ_semaphore_cur=mdQ_semaphore_cur,
+                warp_local_tidx=warp_local_tidx,
+                lock_value=(
+                    curr_dq_write_order[sparse_idx]
+                    if const_expr(deterministic)
+                    else Int32(0)
+                ),
             )
 
     if const_expr(curr_full_idx is not None):
+        if const_expr(deterministic):
+            assert curr_dq_write_order_full is not None
         for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
             sparse_idx = iter_idx // subtile_factor
             subtile_offset = iter_idx % subtile_factor
@@ -1877,4 +1927,12 @@ def dQaccum_store_block_sparse_bwd_sm90(
                     num_dQ_warp_groups,
                     num_threads_per_warp_group,
                     tma_copy_bytes_dQ,
+                    deterministic=deterministic,
+                    mdQ_semaphore_cur=mdQ_semaphore_cur,
+                    warp_local_tidx=warp_local_tidx,
+                    lock_value=(
+                        curr_dq_write_order_full[sparse_idx]
+                        if const_expr(deterministic)
+                        else Int32(0)
+                    ),
                 )

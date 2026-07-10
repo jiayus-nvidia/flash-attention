@@ -4,7 +4,10 @@ import pytest
 import torch
 from einops import rearrange
 
-from flash_attn.cute.block_sparsity import LinearBlockSparseTensorsTorch
+from flash_attn.cute.block_sparsity import (
+    LinearBlockSparseTensorsTorch,
+    compute_dq_write_order_from_linear_csr,
+)
 from flash_attn.cute.interface import (
     _tile_size_bwd_sm90,
     _tile_size_fwd_sm90,
@@ -195,6 +198,37 @@ def _make_linear_block_sparse_pair(arbitrary_func, seqlen_q, seqlen_k, fwd_block
     return linear_k, linear_q
 
 
+def _make_mixed_block_arbitrary_func(seqlen_q, seqlen_k, device):
+    """Make a broadcast mask whose K2Q CSR contains mixed partial/full blocks."""
+    func = torch.zeros(1, 1, 3, seqlen_q + 256, dtype=torch.int32, device=device)
+    q_idx = torch.arange(seqlen_q, dtype=torch.int32, device=device)
+    full_prefix = min(128, seqlen_k)
+    interval_start = torch.maximum(
+        torch.full_like(q_idx, full_prefix),
+        q_idx - 48,
+    )
+    interval_end = torch.maximum(
+        interval_start,
+        torch.clamp(q_idx + 65, max=seqlen_k),
+    )
+    func[0, 0, 0, :seqlen_q] = full_prefix
+    func[0, 0, 1, :seqlen_q] = interval_start
+    func[0, 0, 2, :seqlen_q] = interval_end
+    return func
+
+
+def _with_deterministic_dq_write_order(linear_q, *, spt):
+    dq_write_order, dq_write_order_full = compute_dq_write_order_from_linear_csr(
+        linear_q,
+        spt=spt,
+    )
+    return linear_q._replace(
+        dq_write_order=dq_write_order,
+        dq_write_order_full=dq_write_order_full,
+        spt=spt,
+    )
+
+
 def _run_linear_block_sparse_case(kv_mode, head_dim, head_dim_v, seqlen_q, seqlen_k, seed):
     torch.manual_seed(seed)
     device = "cuda"
@@ -247,6 +281,112 @@ def _run_linear_block_sparse_case(kv_mode, head_dim, head_dim_v, seqlen_q, seqle
     torch.testing.assert_close(q.grad, q_ref.grad, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(k.grad, k_ref.grad, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(v.grad, v_ref.grad, atol=5e-2, rtol=5e-2)
+
+
+def _run_sm90_deterministic_linear_block_sparse_case(
+    kv_mode,
+    head_dim,
+    *,
+    spt,
+    seed,
+    bwd_q_block_size=None,
+    deterministic_repeats=5,
+):
+    torch.manual_seed(seed)
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch, heads = 2, 4
+    seqlen_q, seqlen_k = 257, 321
+    kv_heads = _kv_heads_for_mode(kv_mode, heads)
+    q = torch.randn(
+        batch,
+        seqlen_q,
+        heads,
+        head_dim,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        batch,
+        seqlen_k,
+        kv_heads,
+        head_dim,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    v = torch.randn(
+        batch,
+        seqlen_k,
+        kv_heads,
+        head_dim,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    arbitrary_func = _make_mixed_block_arbitrary_func(seqlen_q, seqlen_k, device)
+    fwd_block_size, bwd_block_size = _linear_block_sizes(
+        head_dim,
+        head_dim,
+        seqlen_q,
+        heads // kv_heads,
+    )
+    if bwd_q_block_size is not None:
+        bwd_block_size = (bwd_q_block_size, bwd_block_size[1])
+    linear_k, linear_q = _make_linear_block_sparse_pair(
+        arbitrary_func,
+        seqlen_q,
+        seqlen_k,
+        fwd_block_size,
+        bwd_block_size,
+    )
+
+    # Exercise combined ranks: at least one Q block must receive contributors
+    # from both the partial and full K2Q lists.
+    assert linear_q.mask_block_idx.numel() > 0
+    assert linear_q.full_block_idx is not None
+    assert linear_q.full_block_idx.numel() > 0
+    assert torch.isin(linear_q.mask_block_idx, linear_q.full_block_idx).any().item()
+    linear_q = _with_deterministic_dq_write_order(linear_q, spt=spt)
+    assert linear_q.dq_write_order_full is not None
+
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        arbitrary=True,
+        aux_tensors=[arbitrary_func],
+        linear_k_block_sparse_tensors=linear_k,
+        linear_q_block_sparse_tensors=linear_q,
+        deterministic=True,
+        return_lse=True,
+    )
+    out_ref = _attention_ref(q_ref, k_ref, v_ref, arbitrary_func)
+    torch.testing.assert_close(out, out_ref, atol=3e-2, rtol=3e-2)
+
+    grad = torch.randn_like(out)
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), grad)
+    grads = torch.autograd.grad(out, (q, k, v), grad, retain_graph=True)
+    for actual, expected in zip(grads, grads_ref):
+        torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+    grad_names = ("dQ", "dK", "dV")
+    for repeat_idx in range(1, deterministic_repeats):
+        repeated_grads = torch.autograd.grad(
+            out,
+            (q, k, v),
+            grad,
+            retain_graph=repeat_idx + 1 < deterministic_repeats,
+        )
+        for name, actual, repeated in zip(grad_names, grads, repeated_grads):
+            assert torch.equal(actual, repeated), (
+                f"{name} changed on deterministic repeat {repeat_idx} "
+                f"for head_dim={head_dim}, kv_mode={kv_mode}, spt={spt}"
+            )
 
 
 def _run_arbitrary_case(
@@ -397,6 +537,34 @@ def test_arbitrary_mask_linear_block_sparse(kv_mode):
         seqlen_q=96,
         seqlen_k=160,
         seed=97 + len(kv_mode),
+    )
+
+
+@pytest.mark.parametrize(
+    "head_dim,kv_mode,spt,bwd_q_block_size",
+    [
+        pytest.param(64, "mha", False, None, id="hd64_mha_spt_false"),
+        pytest.param(96, "gqa", True, None, id="hd96_gqa_spt_true"),
+        pytest.param(128, "gqa", False, 64, id="hd128_gqa_spt_false_qblock64"),
+        pytest.param(128, "gqa", True, 64, id="hd128_gqa_spt_true_qblock64"),
+        pytest.param(192, "mha", True, None, id="hd192_mha_spt_true"),
+        pytest.param(256, "mha", False, None, id="hd256_mha_spt_false"),
+    ],
+)
+def test_arbitrary_mask_linear_block_sparse_sm90_deterministic(
+    head_dim, kv_mode, spt, bwd_q_block_size
+):
+    if _device_major() != 9:
+        pytest.skip("SM90 deterministic linear CSR backward test only runs on SM90")
+    _run_sm90_deterministic_linear_block_sparse_case(
+        kv_mode,
+        head_dim,
+        spt=spt,
+        seed=1301 + head_dim + 17 * (kv_mode == "gqa") + int(spt),
+        bwd_q_block_size=bwd_q_block_size,
+        deterministic_repeats=(
+            50 if head_dim == 128 and kv_mode == "gqa" and not spt else 5
+        ),
     )
 
 
