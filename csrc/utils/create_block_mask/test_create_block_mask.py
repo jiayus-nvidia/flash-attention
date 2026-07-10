@@ -358,6 +358,7 @@ def test_q2k_random_mask(seqlen_q, seqlen_k, n_func, Q_BLOCK_SIZE, KV_BLOCK_SIZE
 @pytest.mark.parametrize("n_func", [1, 3, 5, 7, 9])
 @pytest.mark.parametrize("Q_BLOCK_SIZE,KV_BLOCK_SIZE", [
     (128, 128),
+    (128, 256),
     (256, 128),
 ])
 def test_k2q_random_mask(seqlen_q, seqlen_k, n_func, Q_BLOCK_SIZE, KV_BLOCK_SIZE):
@@ -382,6 +383,25 @@ def test_k2q_random_mask(seqlen_q, seqlen_k, n_func, Q_BLOCK_SIZE, KV_BLOCK_SIZE
     assert mask_ok, "Mask block mismatch"
     assert full_ok, "Full block mismatch"
     print("  PASSED!")
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize(
+    "headdim,headdim_v,expected",
+    [
+        (128, 128, (128, 256)),
+        (192, 128, (128, 256)),
+        (128, 64, (128, 128)),
+        (256, 256, (256, 128)),
+    ],
+)
+def test_sm100_k2q_auto_tile_sizes(headdim, headdim_v, expected):
+    assert create_block_mask_cuda.get_bwd_tile_sizes(
+        headdim,
+        is_arbitrary=True,
+        arch=100,
+        headdim_v=headdim_v,
+    ) == expected
 
 
 # =============================================================================

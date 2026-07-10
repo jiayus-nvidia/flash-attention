@@ -946,6 +946,9 @@ class FlashAttentionBackwardSm100:
             assert blocksparse_tensors.mask_block_offset is not None, (
                 "2-CTA block sparse backward only supports linear CSR block sparsity."
             )
+            assert self.subtile_factor == 1, (
+                "2-CTA block sparse backward requires one CSR Q block per M tile."
+            )
             assert not self.deterministic, (
                 "2-CTA block sparse backward does not support deterministic=True yet."
             )

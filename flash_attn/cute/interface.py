@@ -1632,10 +1632,10 @@ def _flash_attn_bwd(
                 "SM100/SM110 backward with 2CTA linear CSR block sparsity does not "
                 "support softcap or score_mod yet."
             )
-        if block_sparse_tensors.block_size != (2 * m_block_size, 2 * n_block_size):
+        if block_sparse_tensors.block_size != (m_block_size, 2 * n_block_size):
             raise ValueError(
                 "SM100/SM110 backward with 2CTA linear CSR block "
-                f"sparsity expects BLOCK_SIZE=({2 * m_block_size}, {2 * n_block_size})."
+                f"sparsity expects BLOCK_SIZE=({m_block_size}, {2 * n_block_size})."
             )
         if deterministic:
             raise NotImplementedError(

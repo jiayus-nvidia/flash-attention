@@ -79,6 +79,7 @@ inline std::pair<int, int> get_fwd_tile_sizes(
  * @param is_local Whether using local attention
  * @param is_arbitrary Whether using arbitrary mask
  * @param has_softcap Whether using softcap
+ * @param headdim_v Value head dimension; negative means the same as headdim
  *
  * @return Pair of (Q_BLOCK_SIZE, KV_BLOCK_SIZE) for backward pass
  */
@@ -88,13 +89,30 @@ inline std::pair<int, int> get_bwd_tile_sizes(
     bool is_causal = false,
     bool is_local = false,
     bool is_arbitrary = false,
-    bool has_softcap = false
+    bool has_softcap = false,
+    int headdim_v = -1
 ) {
     if (arch < 0) {
         arch = get_gpu_arch();
     }
 
-    if (arch >= 100) {
+    if (headdim_v < 0) {
+        headdim_v = headdim;
+    }
+
+    if (arch >= 100 && arch < 120) {
+        if (headdim == 256 && headdim_v == 256) {
+            return {256, 128};
+        }
+        const bool use_2cta_linear_csr =
+            is_arbitrary && !is_causal && !is_local && !has_softcap &&
+            ((headdim == 128 && headdim_v == 128) ||
+             (headdim == 192 && headdim_v == 128));
+        if (use_2cta_linear_csr) {
+            return {128, 256};
+        }
+        return {128, 128};
+    } else if (arch >= 120) {
         return {128, 128};
     } else if (arch >= 90) {
         if (headdim <= 64) {
@@ -630,7 +648,8 @@ create_k2q_csr_sparse_auto(
     bool is_causal = false,
     bool is_local = false,
     bool is_arbitrary = true,
-    bool has_softcap = false
+    bool has_softcap = false,
+    int headdim_v = -1
 ) {
     // Auto-detect tile sizes
     auto [Q_BLOCK_SIZE, KV_BLOCK_SIZE] = get_bwd_tile_sizes(
@@ -639,7 +658,8 @@ create_k2q_csr_sparse_auto(
         is_causal,
         is_local,
         is_arbitrary,
-        has_softcap
+        has_softcap,
+        headdim_v
     );
 
     // Create CSR sparse tensors
@@ -679,10 +699,11 @@ std::tuple<int, int> py_get_bwd_tile_sizes(
     bool is_local = false,
     bool is_arbitrary = true,
     bool has_softcap = false,
-    int arch = -1
+    int arch = -1,
+    int headdim_v = -1
 ) {
     auto [Q_BLOCK_SIZE, KV_BLOCK_SIZE] = get_bwd_tile_sizes(
-        arch, headdim, is_causal, is_local, is_arbitrary, has_softcap);
+        arch, headdim, is_causal, is_local, is_arbitrary, has_softcap, headdim_v);
     return std::make_tuple(Q_BLOCK_SIZE, KV_BLOCK_SIZE);
 }
 
@@ -799,7 +820,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("is_causal") = false,
           py::arg("is_local") = false,
           py::arg("is_arbitrary") = true,
-          py::arg("has_softcap") = false);
+          py::arg("has_softcap") = false,
+          py::arg("headdim_v") = -1);
 
     // ========================================================================
     // Helper functions for tile size queries
@@ -822,7 +844,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("is_local") = false,
           py::arg("is_arbitrary") = true,
           py::arg("has_softcap") = false,
-          py::arg("arch") = -1);
+          py::arg("arch") = -1,
+          py::arg("headdim_v") = -1);
 
     m.def("get_gpu_arch", &py_get_gpu_arch,
           "Get GPU architecture as int (e.g., 80, 86, 89, 90, 100).");

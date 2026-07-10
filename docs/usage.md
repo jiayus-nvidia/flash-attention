@@ -266,10 +266,11 @@ def current_fa4_linear_block_sizes(head_dim, head_dim_v, seqlen_q, qhead_per_kvh
     if major in (10, 11):
         q_stage = 2 if seqlen_q * qhead_per_kvhead > 128 else 1
         fwd_block_size = (q_stage * 128, 128)
-        if head_dim == 192 and head_dim_v == 128:
-            bwd_block_size = (256, 256)
-        else:
-            bwd_block_size = (256, 128)
+        bwd_block_size = create_block_mask_cuda.get_bwd_tile_sizes(
+            head_dim,
+            is_arbitrary=True,
+            headdim_v=head_dim_v,
+        )
         return fwd_block_size, bwd_block_size
 
     raise RuntimeError("arbitrary CSR path is supported by the current tests on SM90/SM100/SM110")
@@ -360,7 +361,10 @@ The extension also exposes helper functions:
 ```text
 create_block_mask_cuda.get_gpu_arch()
 create_block_mask_cuda.get_fwd_tile_sizes(headdim, is_causal=False, is_local=False, is_arbitrary=True)
-create_block_mask_cuda.get_bwd_tile_sizes(headdim, is_causal=False, is_local=False, is_arbitrary=True)
+create_block_mask_cuda.get_bwd_tile_sizes(
+    headdim, is_causal=False, is_local=False, is_arbitrary=True,
+    has_softcap=False, arch=-1, headdim_v=-1
+)
 create_block_mask_cuda.create_q2k_csr_sparse_auto(...)
 create_block_mask_cuda.create_k2q_csr_sparse_auto(...)
 ```
@@ -381,6 +385,17 @@ q2k_auto = create_block_mask_cuda.create_q2k_csr_sparse_auto(
 )
 q2k_csr, fwd_block_size = q2k_auto[:6], tuple(q2k_auto[6:8])
 linear_k = linear_from_csr_tuple(q2k_csr, fwd_block_size)
+
+k2q_auto = create_block_mask_cuda.create_k2q_csr_sparse_auto(
+    arbitrary_func,
+    seqlen_q,
+    seqlen_k,
+    head_dim,
+    is_arbitrary=True,
+    headdim_v=head_dim_v,
+)
+k2q_csr, bwd_block_size = k2q_auto[:6], tuple(k2q_auto[6:8])
+linear_q = linear_from_csr_tuple(k2q_csr, bwd_block_size)
 ```
 
 Use the explicit path above when you need to match the exact current FA4 test
@@ -408,8 +423,8 @@ Legend:
 | --- | --- | --- | --- | --- | --- |
 | SM90 | `head_dim/head_dim_v` in the SM90 valid range, current CSR target `192/192` | MHA | supported | supported | Uses the generic SM90 block-sparse path. CSR block sizes must match `_tile_size_fwd_sm90` / `_tile_size_bwd_sm90`. |
 | SM90 | current CSR target `192/192` | GQA/MQA | supported | forward only | Current CSR tests intentionally skip backward for SM90 `192/192` GQA/MQA. Treat K2Q CSR backward as unsupported until it is validated. |
-| SM100/SM110 | standard aligned dimensions `<=128/<=128` | MHA/GQA/MQA | supported | supported | Generic SM100 block-sparse path. Use fixed-length linear CSR; do not combine with built-in causal/local/window or `mask_mod`. |
-| SM100/SM110 | `192/128` | MHA/GQA/MQA | supported | supported with limits | Backward linear CSR uses the 2CTA path and expects K2Q `block_size=(256, 256)`. It does not support varlen/seqused tensors, `deterministic=True`, `softcap`, or `score_mod`. |
+| SM100/SM110 | standard aligned dimensions `<=128/<=128`, except `128/128` | MHA/GQA/MQA | supported | supported | Generic SM100 block-sparse path. Use fixed-length linear CSR; do not combine with built-in causal/local/window or `mask_mod`. |
+| SM100/SM110 | `128/128` or `192/128` | MHA/GQA/MQA | supported | supported with limits | Backward linear CSR uses the 2CTA path and expects K2Q `block_size=(128, 256)`, matching one 128-row Q tile and the 256-column KV cluster. It does not support varlen/seqused tensors, `deterministic=True`, `softcap`, or `score_mod`. |
 | SM100 | `256/256` | MHA | supported | supported with limits | Dedicated hd256 path. Forward CSR uses `block_size=(q_stage * 128, 128)`; backward K2Q CSR uses `block_size=(256, 128)`. Fixed-length only. |
 | SM100 | `256/256` | GQA/MQA | supported | supported with limits | Same hd256 limits as MHA. For GQA/MQA backward, `linear_q_block_sparse_tensors` must be head-broadcast (`shape[1] == 1`). |
 | SM100/SM110 | MLA `qv` path | MLA | not supported | not supported | `flash_attn_func(..., qv=..., arbitrary=True)` raises `NotImplementedError`. |

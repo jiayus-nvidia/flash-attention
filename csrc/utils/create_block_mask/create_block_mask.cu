@@ -1399,6 +1399,8 @@ void launch_create_k2q_block_sparse_from_func(
 
     if (Q_BLOCK_SIZE == 128 && KV_BLOCK_SIZE == 128) {
         DISPATCH_K2Q_BY_NFUNC(n_func, 128, 128);
+    } else if (Q_BLOCK_SIZE == 128 && KV_BLOCK_SIZE == 256) {
+        DISPATCH_K2Q_BY_NFUNC(n_func, 128, 256);
     } else if (Q_BLOCK_SIZE == 256 && KV_BLOCK_SIZE == 128) {
         DISPATCH_K2Q_BY_NFUNC(n_func, 256, 128);
     } else if (Q_BLOCK_SIZE == 64 && KV_BLOCK_SIZE == 64) {
@@ -1425,6 +1427,9 @@ void launch_create_k2q_block_sparse_from_func(
     if (Q_BLOCK_SIZE == 128 && KV_BLOCK_SIZE == 128) {
         // Backward pass default: 128x128
         DISPATCH_K2Q_BY_NFUNC(n_func, 128, 128);
+    } else if (Q_BLOCK_SIZE == 128 && KV_BLOCK_SIZE == 256) {
+        // SM100/SM110 2-CTA linear CSR backward
+        DISPATCH_K2Q_BY_NFUNC(n_func, 128, 256);
     } else if (Q_BLOCK_SIZE == 256 && KV_BLOCK_SIZE == 128) {
         // 256x128 configuration
         DISPATCH_K2Q_BY_NFUNC(n_func, 256, 128);

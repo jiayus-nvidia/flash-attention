@@ -77,4 +77,7 @@ The CSR tuple order is:
 )
 ```
 
-Use `create_q2k_csr_sparse_auto` and `create_k2q_csr_sparse_auto` to get the selected tile sizes back with the CSR tensors.
+Use `create_q2k_csr_sparse_auto` and `create_k2q_csr_sparse_auto` to get the
+selected tile sizes back with the CSR tensors. Pass `headdim_v` to the backward
+helper when it differs from `headdim`; the default SM100/SM110 2-CTA linear CSR
+paths for `128/128` and `192/128` use K2Q blocks of `128x256`.

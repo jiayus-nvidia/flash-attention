@@ -142,7 +142,7 @@ def _linear_block_sizes(head_dim, head_dim_v, seqlen_q, qhead_per_kvhead):
     if major == 10:
         q_stage = 2 if seqlen_q * qhead_per_kvhead > 128 else 1
         if head_dim in (128, 192) and head_dim_v == 128:
-            return (q_stage * 128, 128), (256, 256)
+            return (q_stage * 128, 128), (128, 256)
         return (q_stage * 128, 128), (256, 128)
     pytest.skip("linear arbitrary block-sparse test only runs on SM90/SM100")
 
@@ -582,7 +582,7 @@ def test_arbitrary_mask_linear_block_sparse_sm100_hdim128_2cta(kv_mode):
     )
 
 
-def test_arbitrary_mask_linear_block_sparse_sm100_hdim128_rejects_1cta_csr():
+def test_arbitrary_mask_linear_block_sparse_sm100_hdim128_rejects_coarse_q_csr():
     if _device_major() != 10:
         pytest.skip("SM100 hdim128 2CTA linear CSR backward test only runs on SM100")
     torch.manual_seed(191)
@@ -604,7 +604,7 @@ def test_arbitrary_mask_linear_block_sparse_sm100_hdim128_rejects_1cta_csr():
         seqlen_q,
         seqlen_k,
         fwd_block_size=(128, 128),
-        bwd_block_size=(256, 128),
+        bwd_block_size=(256, 256),
     )
     out, _ = flash_attn_func(
         q,
@@ -616,7 +616,7 @@ def test_arbitrary_mask_linear_block_sparse_sm100_hdim128_rejects_1cta_csr():
         linear_q_block_sparse_tensors=linear_q,
         return_lse=True,
     )
-    with pytest.raises(ValueError, match=r"expects BLOCK_SIZE=\(256, 256\)"):
+    with pytest.raises(ValueError, match=r"expects BLOCK_SIZE=\(128, 256\)"):
         out.backward(torch.randn_like(out))
 
 
