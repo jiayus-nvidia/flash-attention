@@ -2055,7 +2055,10 @@ def _build_block_sparse_masks_for_bwd(
     )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="deterministic bwd only supported on sm100/sm110")
+@pytest.mark.skipif(
+    COMPUTE_CAPABILITY not in (9, 10, 11),
+    reason="deterministic bwd only supported on sm90/sm100/sm110",
+)
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 256), (512, 512), (383, 769)])
 @pytest.mark.parametrize(
     "mask_name,window_size",
@@ -2190,7 +2193,10 @@ def test_block_sparse_bwd_deterministic(seqlen_q, seqlen_k, mask_name, window_si
         assert torch.equal(dv, dv0)
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="deterministic bwd only supported on sm100/sm110")
+@pytest.mark.skipif(
+    COMPUTE_CAPABILITY not in (9, 10, 11),
+    reason="deterministic bwd only supported on sm90/sm100/sm110",
+)
 def _setup_block_sparse_deterministic_validation_case():
     torch.manual_seed(42)
     batch_size = 1
@@ -2234,7 +2240,10 @@ def _setup_block_sparse_deterministic_validation_case():
     return q, k, v, out_cute, lse_cute, torch.randn_like(out_cute), block_sparse_mask_bwd, tile_m, tile_n
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="deterministic bwd only supported on sm100/sm110")
+@pytest.mark.skipif(
+    COMPUTE_CAPABILITY not in (9, 10, 11),
+    reason="deterministic bwd only supported on sm90/sm100/sm110",
+)
 def test_block_sparse_bwd_deterministic_missing_dq_write_order_raises():
     q, k, v, out_cute, lse_cute, grad_out, block_sparse_mask_bwd, tile_m, tile_n = (
         _setup_block_sparse_deterministic_validation_case()
@@ -2261,7 +2270,10 @@ def test_block_sparse_bwd_deterministic_missing_dq_write_order_raises():
         )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="deterministic bwd only supported on sm100/sm110")
+@pytest.mark.skipif(
+    COMPUTE_CAPABILITY not in (9, 10, 11),
+    reason="deterministic bwd only supported on sm90/sm100/sm110",
+)
 def test_block_sparse_bwd_deterministic_missing_dq_write_order_full_raises():
     q, k, v, out_cute, lse_cute, grad_out, block_sparse_mask_bwd, tile_m, tile_n = (
         _setup_block_sparse_deterministic_validation_case()
@@ -2289,7 +2301,10 @@ def test_block_sparse_bwd_deterministic_missing_dq_write_order_full_raises():
         )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="deterministic bwd only supported on sm100/sm110")
+@pytest.mark.skipif(
+    COMPUTE_CAPABILITY not in (9, 10, 11),
+    reason="deterministic bwd only supported on sm90/sm100/sm110",
+)
 def test_block_sparse_bwd_deterministic_missing_spt_raises():
     q, k, v, out_cute, lse_cute, grad_out, block_sparse_mask_bwd, tile_m, tile_n = (
         _setup_block_sparse_deterministic_validation_case()

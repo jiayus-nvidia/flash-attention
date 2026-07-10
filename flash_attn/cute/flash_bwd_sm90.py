@@ -54,6 +54,7 @@ class FlashAttentionBackwardSm90:
         is_causal: bool = False,
         is_local: bool = False,
         deterministic: bool = False,
+        spt: Optional[bool] = None,
         tile_m: int = 64,
         tile_n: int = 128,
         Q_stage: int = 2,
@@ -88,6 +89,7 @@ class FlashAttentionBackwardSm90:
         self.is_causal = is_causal
         self.is_local = is_local
         self.deterministic = deterministic
+        self.spt_override = spt
         self.tile_m = tile_m
         self.tile_n = tile_n
         self.num_threads = num_threads
@@ -514,7 +516,11 @@ class FlashAttentionBackwardSm90:
             TileScheduler = SingleTileLPTBwdScheduler
         else:
             TileScheduler = SingleTileScheduler
-        self.spt = (self.is_causal or self.is_local) and self.deterministic
+        if const_expr(self.spt_override is None):
+            self.spt = (self.is_causal or self.is_local) and self.deterministic
+        else:
+            assert self.spt_override is not None
+            self.spt = self.spt_override and self.deterministic
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.tile_n),
             cute.size(mQ.shape[2]),
@@ -1806,6 +1812,7 @@ class FlashAttentionBackwardSm90:
                 (None,),
             )
 
+            mdQ_semaphore_cur = None
             if const_expr(mdQ_semaphore is not None):
                 # mdQ_semaphore is (num_m_blocks, cluster_size, num_head, batch) after transpose
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
@@ -1887,9 +1894,6 @@ class FlashAttentionBackwardSm90:
                                 1,
                             )
                 else:
-                    assert not self.deterministic, (
-                        "Deterministic not implemented for block-sparse backward"
-                    )
                     dQaccum_store_block_sparse_bwd_sm90(
                         blocksparse_tensors,
                         batch_idx,
@@ -1902,12 +1906,16 @@ class FlashAttentionBackwardSm90:
                         num_dQ_warp_groups=self.num_wg_dQ,
                         num_threads_per_warp_group=self.num_threads_per_warp_group,
                         tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
+                        deterministic=self.deterministic,
+                        mdQ_semaphore_cur=mdQ_semaphore_cur,
+                        warp_local_tidx=warp_local_tidx,
                     )
 
             # For local masking + deterministic (non-spt): signal remaining m_blocks
             # that this n_block won't visit, so they don't deadlock waiting.
             if const_expr(
                 self.deterministic and not self.spt and block_info.window_size_left is not None
+                and not self.use_block_sparsity
             ):
                 m_block_global_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
                 for m_block in cutlass.range(m_block_max, m_block_global_max, unroll=1):
