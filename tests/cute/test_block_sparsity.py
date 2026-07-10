@@ -5,7 +5,7 @@ import torch
 from torch.nn.attention.flex_attention import create_block_mask
 
 from mask_mod_definitions import get_mask_pair
-from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+from flash_attn_cute.compute_block_sparsity import compute_block_sparsity
 
 
 def _call_compute_block_sparsity(

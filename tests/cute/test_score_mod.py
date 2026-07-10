@@ -5,13 +5,13 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import math as mlir_math
 import operator
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-from flash_attn.cute.interface import (
+from flash_attn_cute.interface import (
     flash_attn_func,
     _flash_attn_fwd,
     _flash_attn_bwd,
     _tile_size_bwd_sm90,
 )
-from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+from flash_attn_cute.block_sparsity import BlockSparseTensorsTorch
 
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 

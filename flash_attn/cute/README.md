@@ -5,19 +5,19 @@ FlashAttention-4 is a CuTeDSL-based implementation of FlashAttention for Hopper 
 ## Installation
 
 ```sh
-pip install flash-attn-4
+pip install flash-attn-cute
 ```
 
 If you're on CUDA 13, install with the `cu13` extra for best performance:
 
 ```sh
-pip install "flash-attn-4[cu13]"
+pip install "flash-attn-cute[cu13]"
 ```
 
 ## Usage
 
 ```python
-from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+from flash_attn_cute import flash_attn_func, flash_attn_varlen_func
 
 out = flash_attn_func(q, k, v, causal=True)
 ```

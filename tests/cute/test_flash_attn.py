@@ -18,7 +18,7 @@ try:
 except ImportError:
     apply_rotary_emb = None
 
-from flash_attn.cute.testing import (
+from flash_attn_cute.testing import (
     attention_ref,
     generate_qkv,
     generate_random_padding_mask,
@@ -27,7 +27,7 @@ from flash_attn.cute.testing import (
     maybe_fake_tensor_mode,
     is_fake_mode,
 )
-from flash_attn.cute.interface import (
+from flash_attn_cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
     _flash_attn_fwd,
@@ -1533,7 +1533,7 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 256)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtype):
-    from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+    from flash_attn_cute.interface import _flash_attn_fwd, _flash_attn_bwd
 
     device = "cuda"
     torch.random.manual_seed(42)

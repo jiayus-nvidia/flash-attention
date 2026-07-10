@@ -68,17 +68,17 @@ FlashAttention-4 is written in CuTeDSL and optimized for Hopper and Blackwell GP
 
 To install:
 ```sh
-pip install flash-attn-4
+pip install flash-attn-cute
 ```
 
 If you're on CUDA 13, we recommend installing with the `cu13` extra for best performance:
 ```sh
-pip install "flash-attn-4[cu13]"
+pip install "flash-attn-cute[cu13]"
 ```
 
 Once installed, you can use it as follows:
 ```python
-from flash_attn.cute import flash_attn_func
+from flash_attn_cute import flash_attn_func
 
 out = flash_attn_func(q, k, v, causal=True)
 ```

@@ -26,8 +26,8 @@ from cutlass.utils.hardware_info import HardwareInfo
 
 from quack.cute_dsl_utils import ParamsBase
 
-import flash_attn.cute.utils as utils
-from flash_attn.cute.fast_math import clz
+import flash_attn_cute.utils as utils
+from flash_attn_cute.fast_math import clz
 
 
 class SchedulingMode(IntEnum):

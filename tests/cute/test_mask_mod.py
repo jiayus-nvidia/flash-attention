@@ -22,8 +22,8 @@ import cutlass.cute as cute
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import torch.nn.functional as F
 
-from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd, flash_attn_func
-from flash_attn.cute.block_sparsity import (
+from flash_attn_cute.interface import _flash_attn_fwd, _flash_attn_bwd, flash_attn_func
+from flash_attn_cute.block_sparsity import (
     BlockSparseTensorsTorch,
     LinearBlockSparseTensorsTorch,
     fast_sampling,
@@ -32,8 +32,8 @@ from flash_attn.cute.block_sparsity import (
     compute_dq_write_order_from_block_mask,
     compute_dq_write_order_from_linear_csr,
 )
-from flash_attn.cute.cache_utils import get_jit_cache
-from flash_attn.cute import utils
+from flash_attn_cute.cache_utils import get_jit_cache
+from flash_attn_cute import utils
 from mask_mod_definitions import get_mask_pair, random_doc_id_tensor
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
@@ -877,8 +877,8 @@ def test_sm100_block_sparse_sink_all_masked():
 
 @pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
 def test_sm100_block_sparse_q_stage1():
-    from flash_attn.cute import flash_fwd_sm100
-    from flash_attn.cute.interface import _flash_attn_fwd
+    from flash_attn_cute import flash_fwd_sm100
+    from flash_attn_cute.interface import _flash_attn_fwd
 
     observed = {}
     original_init = flash_fwd_sm100.FlashAttentionForwardSm100.__init__
@@ -1069,7 +1069,7 @@ def test_sm100_block_sparse_coarse_blocks_mismatch():
         observed["q_subtile_factor"] = q_subtile_factor
         return normalized, pattern, q_subtile_factor
 
-    with mock.patch("flash_attn.cute.interface.normalize_block_sparse_config", wrapped_normalize):
+    with mock.patch("flash_attn_cute.interface.normalize_block_sparse_config", wrapped_normalize):
         out_cute, _ = _flash_attn_fwd(
             q=tensors["q"],
             k=tensors["k"],

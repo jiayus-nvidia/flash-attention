@@ -4,11 +4,11 @@ import pytest
 import torch
 from einops import rearrange
 
-from flash_attn.cute.block_sparsity import (
+from flash_attn_cute.block_sparsity import (
     LinearBlockSparseTensorsTorch,
     compute_dq_write_order_from_linear_csr,
 )
-from flash_attn.cute.interface import (
+from flash_attn_cute.interface import (
     _tile_size_bwd_sm90,
     _tile_size_fwd_sm90,
     flash_attn_func,

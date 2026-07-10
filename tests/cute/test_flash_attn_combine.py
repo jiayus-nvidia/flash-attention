@@ -5,11 +5,11 @@ import os
 import pytest
 import torch
 
-from flash_attn.cute.testing import (
+from flash_attn_cute.testing import (
     maybe_fake_tensor_mode,
     is_fake_mode,
 )
-from flash_attn.cute.interface import (
+from flash_attn_cute.interface import (
     flash_attn_combine,
 )
 

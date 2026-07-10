@@ -10,9 +10,9 @@ import cutlass.cute as cute
 from cutlass import Float32, Boolean
 
 from quack import layout_utils
-import flash_attn.cute.utils as utils
+import flash_attn_cute.utils as utils
 from quack.cute_dsl_utils import ParamsBase
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn_cute.seqlen_info import SeqlenInfoQK
 
 
 @dataclass

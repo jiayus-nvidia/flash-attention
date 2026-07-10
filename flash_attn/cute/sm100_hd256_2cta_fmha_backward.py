@@ -15,14 +15,14 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Int32
 
-from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dqkernel import (
+from flash_attn_cute.sm100_hd256_2cta_fmha_backward_dqkernel import (
     BlackwellFusedMultiHeadAttentionBackwardDQKernel,
 )
-from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
+from flash_attn_cute.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
     BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
 )
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn_cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn_cute.block_sparsity import BlockSparseTensors
 
 
 def _as_bshkrd_tensor(

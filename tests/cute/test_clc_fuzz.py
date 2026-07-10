@@ -13,11 +13,11 @@ from unittest import mock
 import pytest
 import torch
 
-from flash_attn.cute import utils as cute_utils
-from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
-from flash_attn.cute.testing import attention_ref
-from flash_attn.cute.tile_scheduler import (
+from flash_attn_cute import utils as cute_utils
+from flash_attn_cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn_cute.interface import flash_attn_func, flash_attn_varlen_func
+from flash_attn_cute.testing import attention_ref
+from flash_attn_cute.tile_scheduler import (
     SchedulingMode,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
@@ -251,7 +251,7 @@ class TestCLCHeadDim:
         check_output(randn(4, sq, 4, d), randn(4, sk, 4, d), randn(4, sk, 4, dv))
 
     def test_overlap_sO_sQ_fallback(self):
-        from flash_attn.cute.tile_scheduler import SingleTileScheduler
+        from flash_attn_cute.tile_scheduler import SingleTileScheduler
 
         _captured_schedulers.clear()
         check_output(randn(4, 128, 4, 192), randn(4, 257, 4, 192), randn(4, 257, 4, 128), assert_clc=False)

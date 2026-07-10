@@ -7,8 +7,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from flash_attn.cute import utils
-from flash_attn.cute.block_sparsity import fast_sampling
+from flash_attn_cute import utils
+from flash_attn_cute.block_sparsity import fast_sampling
 
 
 # =============================================================================

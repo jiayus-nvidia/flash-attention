@@ -1,8 +1,8 @@
 import logging
 from types import SimpleNamespace
 
-import flash_attn.cute.cache_utils as cache_utils
-from flash_attn.cute import fa_logging
+import flash_attn_cute.cache_utils as cache_utils
+from flash_attn_cute import fa_logging
 
 
 def test_persistent_cache_hit_logs_at_host_level_only(tmp_path, monkeypatch, caplog):

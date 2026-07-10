@@ -37,8 +37,8 @@ Forward uses Q2K metadata and backward uses K2Q metadata:
 
 ```python
 import create_block_mask_cuda
-from flash_attn.cute import flash_attn_func
-from flash_attn.cute.block_sparsity import LinearBlockSparseTensorsTorch
+from flash_attn_cute import flash_attn_func
+from flash_attn_cute.block_sparsity import LinearBlockSparseTensorsTorch
 
 q2k = create_block_mask_cuda.create_q2k_csr_sparse_from_func(
     arbitrary_func, seqlen_q, seqlen_k, q_block_size, kv_block_size

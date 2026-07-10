@@ -37,7 +37,7 @@ import time
 
 import torch
 import torch.nn.functional as F
-from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+from flash_attn_cute.interface import _flash_attn_fwd, _flash_attn_bwd
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────

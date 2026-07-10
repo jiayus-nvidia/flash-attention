@@ -373,8 +373,8 @@ def flash_attn_imports():
         sys.modules["flash_attn"] = stub
     import torch
     from torch._subclasses.fake_tensor import FakeTensorMode
-    from flash_attn.cute import utils as cute_utils
-    from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
+    from flash_attn_cute import utils as cute_utils
+    from flash_attn_cute.interface import flash_attn_func, flash_attn_varlen_func
 
     return torch, FakeTensorMode, cute_utils, flash_attn_func, flash_attn_varlen_func
 
@@ -386,7 +386,7 @@ def block_sparse_imports():
         sys.modules["flash_attn"] = stub
     if str(REPO_ROOT / "tests" / "cute") not in sys.path:
         sys.path.insert(0, str(REPO_ROOT / "tests" / "cute"))
-    from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+    from flash_attn_cute.compute_block_sparsity import compute_block_sparsity
     from mask_mod_definitions import get_mask_pair
 
     return compute_block_sparsity, get_mask_pair

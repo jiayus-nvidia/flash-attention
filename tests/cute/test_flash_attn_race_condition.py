@@ -14,14 +14,14 @@ try:
 except ImportError:
     apply_rotary_emb = None
 
-from flash_attn.cute.testing import (
+from flash_attn_cute.testing import (
     attention_ref,
     generate_qkv,
     generate_random_padding_mask,
     pad_input,
     unpad_input,
 )
-from flash_attn.cute.interface import (
+from flash_attn_cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_combine,

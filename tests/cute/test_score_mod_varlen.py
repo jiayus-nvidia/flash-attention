@@ -1,7 +1,7 @@
 import pytest
 import torch
 from torch.nn.attention.flex_attention import flex_attention
-from flash_attn.cute.interface import _flash_attn_fwd
+from flash_attn_cute.interface import _flash_attn_fwd
 from test_score_mod import _generate_block_kvcache
 from score_mod_definitions import (
     # TensorSSA-based score mods

@@ -1,9 +1,9 @@
-"""Unit tests for flash_attn.cute.utils module."""
+"""Unit tests for flash_attn_cute.utils module."""
 
 import functools
 
-from flash_attn.cute import utils as cute_utils
-from flash_attn.cute.utils import hash_callable
+from flash_attn_cute import utils as cute_utils
+from flash_attn_cute.utils import hash_callable
 
 
 class TestHashCallable:

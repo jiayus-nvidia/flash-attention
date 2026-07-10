@@ -14,16 +14,16 @@ from cutlass.cute.runtime import from_dlpack
 import numpy as np
 import torch
 
-from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+from flash_attn_cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from mask_mod_definitions import (
     get_mask_pair,
     random_doc_id_tensor,
 )
-from flash_attn.cute.block_sparsity import (
+from flash_attn_cute.block_sparsity import (
     BlockSparseTensorsTorch,
     to_cute_block_sparse_tensors,
 )
-from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+from flash_attn_cute.compute_block_sparsity import compute_block_sparsity
 
 
 @dataclass

@@ -18,9 +18,9 @@ import cutlass
 import cutlass.cute as cute
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-from flash_attn.cute.interface import _flash_attn_fwd
-from flash_attn.cute import utils
-from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+from flash_attn_cute.interface import _flash_attn_fwd
+from flash_attn_cute import utils
+from flash_attn_cute.compute_block_sparsity import compute_block_sparsity
 from mask_mod_definitions import (
     get_mask_pair,
     random_doc_id_tensor,

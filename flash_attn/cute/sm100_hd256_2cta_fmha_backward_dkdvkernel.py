@@ -24,7 +24,7 @@ from cutlass.cute.typing import Int32
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from cutlass.utils import ClcDynamicPersistentTileScheduler
-from flash_attn.cute.tile_scheduler import (
+from flash_attn_cute.tile_scheduler import (
     ClcState,
     SM100_TMEM_CAPACITY_COLUMNS,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
@@ -33,10 +33,10 @@ from flash_attn.cute.tile_scheduler import (
     Sm100FmhaStaticTileSchedulerParams as FmhaStaticTileSchedulerParams,
 )
 
-import flash_attn.cute.copy_utils as fa_copy_utils
-from flash_attn.cute.mask import Sm100FusedMask as FusedMask
-from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.block_sparse_utils import (
+import flash_attn_cute.copy_utils as fa_copy_utils
+from flash_attn_cute.mask import Sm100FusedMask as FusedMask
+from flash_attn_cute.block_sparsity import BlockSparseTensors
+from flash_attn_cute.block_sparse_utils import (
     get_block_sparse_iteration_info_bwd,
     get_m_block_from_iter_bwd,
 )

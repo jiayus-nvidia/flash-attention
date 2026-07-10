@@ -3,7 +3,7 @@ import pytest
 
 import torch
 import torch.nn.functional as F
-from flash_attn.cute import flash_attn_varlen_func
+from flash_attn_cute import flash_attn_varlen_func
 
 @pytest.mark.parametrize("B", [1, 7, 20])
 @pytest.mark.parametrize("H", [1, 4, 6])

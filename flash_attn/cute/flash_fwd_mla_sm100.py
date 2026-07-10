@@ -19,13 +19,13 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 
 from quack import copy_utils
 
-from flash_attn.cute.pack_gqa import pack_gqa_layout, make_packgqa_tiled_tma_atom
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.mask import AttentionMask
-import flash_attn.cute.blackwell_helpers as fa_sm100_utils
-from flash_attn.cute.softmax import SoftmaxSm100
-from flash_attn.cute.tile_scheduler import (
+from flash_attn_cute.pack_gqa import pack_gqa_layout, make_packgqa_tiled_tma_atom
+from flash_attn_cute.seqlen_info import SeqlenInfoQK
+from flash_attn_cute.block_info import BlockInfo
+from flash_attn_cute.mask import AttentionMask
+import flash_attn_cute.blackwell_helpers as fa_sm100_utils
+from flash_attn_cute.softmax import SoftmaxSm100
+from flash_attn_cute.tile_scheduler import (
     ClcState,
     SchedulingMode,
     TileSchedulerArguments,
@@ -35,16 +35,16 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileVarlenScheduler,
     ParamsBase,
 )
-from flash_attn.cute.fa_logging import fa_log, fa_printf
-from flash_attn.cute.utils import smid
+from flash_attn_cute.fa_logging import fa_log, fa_printf
+from flash_attn_cute.utils import smid
 
-from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
+from flash_attn_cute.topk_gather_kv import CpasyncGatherKVManager
 
-from flash_attn.cute.testing import attention_ref
+from flash_attn_cute.testing import attention_ref
 
-from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
+from flash_attn_cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
 
-from flash_attn.cute.cute_dsl_utils import dump_kernel_attributes
+from flash_attn_cute.cute_dsl_utils import dump_kernel_attributes
 
 
 class FlashAttentionMLAForwardSm100:

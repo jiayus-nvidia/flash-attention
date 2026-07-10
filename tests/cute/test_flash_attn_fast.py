@@ -10,14 +10,14 @@ import torch
 
 from einops import rearrange
 
-from flash_attn.cute.testing import (
+from flash_attn_cute.testing import (
     attention_ref,
     generate_random_padding_mask,
     generate_qkv,
     maybe_fake_tensor_mode,
     is_fake_mode,
 )
-from flash_attn.cute.interface import (
+from flash_attn_cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_combine,

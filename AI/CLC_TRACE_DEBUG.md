@@ -26,7 +26,7 @@ Minimal repro pattern:
 FA_LOG_LEVEL=3 FA_CLC=1 CUDA_VISIBLE_DEVICES=0 python - <<'PY' \
   > agent_space/clc_trace.log 2>&1
 import torch
-from flash_attn.cute.interface import flash_attn_func
+from flash_attn_cute.interface import flash_attn_func
 
 torch.manual_seed(0)
 q = torch.randn(1, 512, 16, 128, device='cuda', dtype=torch.bfloat16)

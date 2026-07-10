@@ -9,7 +9,7 @@ except ImportError:
 
 from einops import rearrange
 
-from flash_attn.cute.bench_utils import (
+from flash_attn_cute.bench_utils import (
     flops,
     bandwidth_fwd_bytes,
     bandwidth_bwd_bytes,
@@ -24,8 +24,8 @@ except ImportError:
     flash_attn_func = None
     flash_attn_varlen_func = None
 try:
-    from flash_attn.cute.interface import flash_attn_func as flash_attn_func_python
-    from flash_attn.cute.interface import flash_attn_varlen_func as flash_attn_varlen_func_python
+    from flash_attn_cute.interface import flash_attn_func as flash_attn_func_python
+    from flash_attn_cute.interface import flash_attn_varlen_func as flash_attn_varlen_func_python
 except ImportError:
     flash_attn_func_python = None
     flash_attn_varlen_func_python = None

@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-FlashAttention-4 (FA4) — fast, memory-efficient exact attention kernels written in Python using CuTeDSL (NVIDIA CUTLASS DSL). Kernels are compiled to PTX/CUBIN at runtime. Targets Hopper (SM90) and Blackwell (SM100/SM110) GPUs. Package name: `flash-attn-4`.
+FFA_FA4 is the MagiAttention-specific FlashAttention-4 backend written in Python using CuTeDSL (NVIDIA CUTLASS DSL). Kernels are compiled to PTX/CUBIN at runtime. Targets Hopper (SM90) and Blackwell (SM100/SM110) GPUs. Package name: `flash-attn-cute`.
 
-The repository also contains older generations (FA2 in top-level `csrc/`, FA3 in `hopper/`) but active development is on FA4 in `flash_attn/cute/`.
+The repository also contains older generations (FA2 in top-level `csrc/`, FA3 in `hopper/`) but active development is on FFA_FA4 in `flash_attn/cute/`, exposed through the `flash_attn_cute` Python namespace.
 
 ## Agent Scratch Space
 
@@ -15,7 +15,7 @@ Use `agent_space/` for project-local scratch work such as lab notes, profiling o
 ## Build & Install
 
 ```bash
-pip install flash-attn-4
+pip install flash-attn-cute
 # or dev install:
 pip install -e "flash_attn/cute[dev]"
 ```

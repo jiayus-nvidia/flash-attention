@@ -14,7 +14,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Int64, Float32
 
 from cutlass.utils import ClcDynamicPersistentTileScheduler
-from flash_attn.cute.tile_scheduler import (
+from flash_attn_cute.tile_scheduler import (
     ClcState,
     compute_sm100_fmha_grid as compute_grid,
     compute_sm100_fmha_grid_clc as compute_grid_clc,
@@ -24,14 +24,14 @@ from flash_attn.cute.tile_scheduler import (
     Sm100FmhaClcDynamicTileScheduler as FmhaClcDynamicTileScheduler,
     Sm100FmhaClcDynamicTileSchedulerParams as FmhaClcDynamicTileSchedulerParams,
 )
-from flash_attn.cute.mask import (
+from flash_attn_cute.mask import (
     Sm100FusedMask as FusedMask,
 )
-from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
-from flash_attn.cute.utils import ex2_emulation_2
-from flash_attn.cute.block_sparse_utils import _get_curr_blocksparse_tensors_linear_raw
-from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn_cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
+from flash_attn_cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
+from flash_attn_cute.utils import ex2_emulation_2
+from flash_attn_cute.block_sparse_utils import _get_curr_blocksparse_tensors_linear_raw
+from flash_attn_cute.block_sparsity import BlockSparseTensors
 
 
 @cute.jit

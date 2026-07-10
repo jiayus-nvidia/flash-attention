@@ -220,8 +220,8 @@ you need exact control over FA4's effective block size.
 import torch
 
 import create_block_mask_cuda
-from flash_attn.cute import flash_attn_func
-from flash_attn.cute.block_sparsity import LinearBlockSparseTensorsTorch
+from flash_attn_cute import flash_attn_func
+from flash_attn_cute.block_sparsity import LinearBlockSparseTensorsTorch
 
 
 def linear_from_csr_tuple(csr_tensors, block_size):
@@ -251,7 +251,7 @@ def current_fa4_linear_block_sizes(head_dim, head_dim_v, seqlen_q, qhead_per_kvh
     if major == 9:
         # Current tests reuse the private FA4 SM90 tile selectors so the CSR
         # block size stays in lockstep with flash_attn/cute/interface.py.
-        from flash_attn.cute.interface import _tile_size_bwd_sm90, _tile_size_fwd_sm90
+        from flash_attn_cute.interface import _tile_size_bwd_sm90, _tile_size_fwd_sm90
 
         fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, False, False)
         bwd_cfg = _tile_size_bwd_sm90(
@@ -471,7 +471,7 @@ C++ CSR notes:
 
 ## API Notes
 
-`flash_attn.cute.flash_attn_func` takes arbitrary-mask inputs through these
+`flash_attn_cute.flash_attn_func` takes arbitrary-mask inputs through these
 arguments:
 
 ```text

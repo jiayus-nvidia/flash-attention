@@ -12,8 +12,8 @@ import itertools
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.testing import benchmark as cute_benchmark
 import cutlass.cute as cute
-from flash_attn.cute.compute_block_sparsity import BlockSparsityKernel
-from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn_cute.compute_block_sparsity import BlockSparsityKernel
+from flash_attn_cute.block_sparsity import BlockSparseTensors
 from mask_mod_definitions import (
     get_mask_pair,
     random_doc_id_tensor,

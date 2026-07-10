@@ -33,17 +33,17 @@ from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils, layout_utils
 
-from flash_attn.cute.paged_kv import PagedKVManager
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute import utils
-import flash_attn.cute.pipeline as pipeline_custom
+from flash_attn_cute.paged_kv import PagedKVManager
+from flash_attn_cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn_cute import utils
+import flash_attn_cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
-from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.block_sparse_utils import (
+from flash_attn_cute.mask import AttentionMask
+from flash_attn_cute.softmax import SoftmaxSm100, apply_score_mod_inner
+from flash_attn_cute.seqlen_info import SeqlenInfoQK
+from flash_attn_cute.block_info import BlockInfo
+from flash_attn_cute.block_sparsity import BlockSparseTensors
+from flash_attn_cute.block_sparse_utils import (
     get_total_block_count,
     get_total_block_count_linear_sm100,
     produce_block_sparse_loads_sm100,
@@ -52,13 +52,13 @@ from flash_attn.cute.block_sparse_utils import (
     softmax_block_sparse_sm100_linear,
     handle_block_sparse_empty_tile_correction_sm100,
 )
-from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
-from flash_attn.cute import mma_sm100_desc as sm100_desc
-from flash_attn.cute import blackwell_helpers as sm100_utils
-from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
+from flash_attn_cute.pack_gqa import PackGQA, pack_gqa_layout
+from flash_attn_cute import mma_sm100_desc as sm100_desc
+from flash_attn_cute import blackwell_helpers as sm100_utils
+from flash_attn_cute.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
 from quack.cute_dsl_utils import ParamsBase
-from flash_attn.cute.tile_scheduler import (
+from flash_attn_cute.tile_scheduler import (
     ClcState,
     SchedulingMode,
     TileSchedulerArguments,
@@ -68,8 +68,8 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
 )
-from flash_attn.cute.fa_logging import fa_log, fa_printf
-from flash_attn.cute.utils import smid
+from flash_attn_cute.fa_logging import fa_log, fa_printf
+from flash_attn_cute.utils import smid
 
 # === TUNING KNOBS (agent-editable) ===
 # Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
