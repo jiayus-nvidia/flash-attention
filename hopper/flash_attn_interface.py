@@ -6,6 +6,7 @@ import os
 import torch
 import torch.nn as nn
 import warnings
+import weakref
 
 
 # ============================================================================
@@ -33,6 +34,10 @@ class LinearBlockSparseTensors(NamedTuple):
     full_block_cnt: Optional[torch.Tensor] = None       # [B, H, num_m_blocks]: count of full blocks, supports broadcasting (B, H can be 1)
     full_block_offset: Optional[torch.Tensor] = None    # [B*H*num_m_blocks+1]: cumulative offset into full_idx, supports broadcasting (B, H can be 1)
     full_block_idx: Optional[torch.Tensor] = None       # [total_full_blocks]: indices of full blocks (csr format)
+    # Optional deterministic K2Q/backward metadata.  These fields are appended
+    # to preserve the first six positional fields used by existing callers.
+    dq_write_order: Optional[torch.Tensor] = None
+    dq_write_order_full: Optional[torch.Tensor] = None
 
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
@@ -194,14 +199,23 @@ def _dense_bwd_block_size_sm8x(head_dim, sm86_or_89=False):
     return 64, 64
 
 
-def _dense_bwd_block_size(q):
+def _dense_bwd_block_size(q, v=None):
     major, minor = _device_capability_major(q.device)
+    head_dim = round_up_headdim(
+        max(q.shape[-1], v.shape[-1] if v is not None else q.shape[-1])
+    )
     if major == 8:
-        return _dense_bwd_block_size_sm8x(q.shape[-1], sm86_or_89=minor in (6, 9))
-    return _dense_bwd_block_size_sm90(q.shape[-1])
+        return _dense_bwd_block_size_sm8x(head_dim, sm86_or_89=minor in (6, 9))
+    return _dense_bwd_block_size_sm90(head_dim)
 
 
-def _make_dense_linear_block_sparse(num_outer_blocks, num_inner_blocks, device):
+def _make_dense_linear_block_sparse(
+    num_outer_blocks,
+    num_inner_blocks,
+    device,
+    *,
+    deterministic_k2q=False,
+):
     mask_block_cnt = torch.full(
         (1, 1, num_outer_blocks), num_inner_blocks, dtype=torch.int32, device=device
     )
@@ -214,17 +228,404 @@ def _make_dense_linear_block_sparse(num_outer_blocks, num_inner_blocks, device):
     full_block_cnt = torch.zeros_like(mask_block_cnt)
     full_block_offset = torch.zeros(num_outer_blocks + 1, dtype=torch.int32, device=device)
     full_block_idx = torch.empty(0, dtype=torch.int32, device=device)
-    return LinearBlockSparseTensors(
+    dq_write_order = None
+    dq_write_order_full = None
+    if deterministic_k2q:
+        # K2Q rows are n_blocks.  The C++ SPT scheduler visits n in
+        # descending order, so every edge in row n has rank N - 1 - n.
+        dq_write_order = torch.arange(
+            num_outer_blocks - 1, -1, -1, dtype=torch.int32, device=device
+        ).repeat_interleave(num_inner_blocks)
+        dq_write_order_full = torch.empty(0, dtype=torch.int32, device=device)
+    tensors = LinearBlockSparseTensors(
         mask_block_cnt,
         mask_block_offset,
         mask_block_idx,
         full_block_cnt,
         full_block_offset,
         full_block_idx,
+        dq_write_order,
+        dq_write_order_full,
+    )
+    if deterministic_k2q:
+        # Construction proves the generic CSR/rank invariants, so avoid a
+        # redundant device-to-host semantic scan on the first launch.
+        _register_trusted_deterministic_k2q_semantics(
+            tensors, num_inner_blocks - 1 if num_inner_blocks > 0 else -1
+        )
+    return tensors
+
+
+def _as_linear_block_sparse_tensors(tensors, name="block_sparse"):
+    if tensors is None:
+        return None
+    if isinstance(tensors, LinearBlockSparseTensors):
+        return tensors
+    if hasattr(tensors, "mask_block_cnt"):
+        return LinearBlockSparseTensors(
+            tensors.mask_block_cnt,
+            tensors.mask_block_offset,
+            tensors.mask_block_idx,
+            tensors.full_block_cnt,
+            tensors.full_block_offset,
+            tensors.full_block_idx,
+            getattr(tensors, "dq_write_order", None),
+            getattr(tensors, "dq_write_order_full", None),
+        )
+    if not isinstance(tensors, (tuple, list)) or len(tensors) not in (6, 8):
+        raise ValueError(f"{name} must be LinearBlockSparseTensors or a 6/8-item tuple")
+    return LinearBlockSparseTensors(*tensors)
+
+
+def _validate_linear_csr_structure(tensors, name="k2q_block_sparse"):
+    tensors = _as_linear_block_sparse_tensors(tensors, name)
+    assert tensors is not None
+    base = (
+        tensors.mask_block_cnt,
+        tensors.mask_block_offset,
+        tensors.mask_block_idx,
+        tensors.full_block_cnt,
+        tensors.full_block_offset,
+        tensors.full_block_idx,
+    )
+    if any(x is None for x in base):
+        raise ValueError(
+            f"{name} requires all six mask/full CSR tensors; partial metadata is not supported"
+        )
+    for field, tensor, ndim in (
+        ("mask_block_cnt", tensors.mask_block_cnt, 3),
+        ("mask_block_offset", tensors.mask_block_offset, 1),
+        ("mask_block_idx", tensors.mask_block_idx, 1),
+        ("full_block_cnt", tensors.full_block_cnt, 3),
+        ("full_block_offset", tensors.full_block_offset, 1),
+        ("full_block_idx", tensors.full_block_idx, 1),
+    ):
+        assert tensor is not None
+        if tensor.dtype != torch.int32:
+            raise ValueError(f"{name}.{field} must have dtype torch.int32")
+        if tensor.ndim != ndim:
+            raise ValueError(f"{name}.{field} must be {ndim}D")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name}.{field} must be contiguous")
+    assert tensors.full_block_cnt is not None
+    assert tensors.mask_block_offset is not None
+    assert tensors.full_block_offset is not None
+    if tensors.full_block_cnt.shape != tensors.mask_block_cnt.shape:
+        raise ValueError(f"{name} mask/full count tensors must have the same shape")
+    num_rows = tensors.mask_block_cnt.numel()
+    if tensors.mask_block_offset.numel() != num_rows + 1:
+        raise ValueError(f"{name}.mask_block_offset must have count.numel() + 1 entries")
+    if tensors.full_block_offset.numel() != num_rows + 1:
+        raise ValueError(f"{name}.full_block_offset must have count.numel() + 1 entries")
+    return tensors
+
+
+def compute_dq_write_order_from_linear_csr(tensors):
+    """Compute compact deterministic dQ write ranks for K2Q linear CSR.
+
+    Partial and full contributors are ranked together for each
+    ``(metadata_batch, metadata_head, m_block)``.  The highest contributing
+    n_block receives rank 0, matching the C++ SM90 deterministic scheduler.
+    """
+    tensors = _validate_linear_csr_structure(tensors)
+    mask_cnt = tensors.mask_block_cnt
+    mask_offset = tensors.mask_block_offset
+    mask_idx = tensors.mask_block_idx
+    full_cnt = tensors.full_block_cnt
+    full_offset = tensors.full_block_offset
+    full_idx = tensors.full_block_idx
+    assert mask_offset is not None and full_cnt is not None
+    assert full_offset is not None and full_idx is not None
+
+    device = mask_idx.device
+    num_n_blocks = mask_cnt.shape[2]
+
+    def _entry_metadata(offset, idx):
+        positions = torch.arange(idx.numel(), device=device, dtype=torch.int64)
+        row = torch.searchsorted(offset.to(torch.int64), positions, right=True) - 1
+        bh = row // num_n_blocks
+        n_block = row - bh * num_n_blocks
+        return bh, n_block, idx.to(torch.int64)
+
+    mask_bh, mask_n, mask_m = _entry_metadata(mask_offset, mask_idx)
+    full_bh, full_n, full_m = _entry_metadata(full_offset, full_idx)
+    total = mask_idx.numel() + full_idx.numel()
+    if total == 0:
+        return torch.zeros_like(mask_idx), torch.zeros_like(full_idx)
+
+    flat_bh = torch.cat((mask_bh, full_bh))
+    flat_n = torch.cat((mask_n, full_n))
+    flat_m = torch.cat((mask_m, full_m))
+    if bool((flat_m < 0).any()):
+        raise ValueError("k2q_block_sparse m_block indices must be non-negative")
+    max_m = torch.max(flat_m)
+    group_key = flat_bh * (max_m + 1) + flat_m
+    n_order = num_n_blocks - 1 - flat_n
+    sort_key = group_key * num_n_blocks + n_order
+    sorted_pos = torch.argsort(sort_key, stable=True)
+    sorted_group = group_key[sorted_pos]
+
+    pos = torch.arange(total, device=device, dtype=torch.int64)
+    boundary_pos = torch.full_like(pos, -1)
+    boundary_pos[0] = 0
+    if total > 1:
+        boundary_pos[1:] = torch.where(
+            sorted_group[1:] != sorted_group[:-1],
+            pos[1:],
+            torch.full_like(pos[1:], -1),
+        )
+    last_boundary, _ = torch.cummax(boundary_pos, dim=0)
+    sorted_rank = (pos - last_boundary).to(torch.int32)
+    flat_rank = torch.empty(total, device=device, dtype=torch.int32)
+    flat_rank[sorted_pos] = sorted_rank
+    return flat_rank[: mask_idx.numel()], flat_rank[mask_idx.numel() :]
+
+
+def prepare_deterministic_k2q_metadata(tensors):
+    """Return validated K2Q CSR metadata for SM90 deterministic backward.
+
+    The returned CSR and rank tensors must be treated as immutable.  Normal
+    in-place PyTorch mutations invalidate the cached validation certificate,
+    but writes through ``.data`` or unregistered raw CUDA kernels cannot be
+    detected and may make the metadata unsafe for a deterministic launch.
+    """
+    tensors = _validate_linear_csr_structure(tensors)
+    dq_write_order, dq_write_order_full = compute_dq_write_order_from_linear_csr(tensors)
+    prepared = tensors._replace(
+        dq_write_order=dq_write_order,
+        dq_write_order_full=dq_write_order_full,
+    )
+    _certify_deterministic_k2q_semantics(prepared)
+    return prepared
+
+
+_validated_deterministic_k2q = {}
+
+
+def _tensor_validation_token(tensor):
+    try:
+        version = tensor._version
+    except RuntimeError:
+        # Inference tensors intentionally do not expose a version counter, so
+        # they cannot participate in the one-time validation cache safely.
+        return None
+    return (
+        tensor.data_ptr(),
+        version,
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.device,
     )
 
 
+def _validation_cache_key(tensors):
+    return tuple(id(tensor) for tensor in tensors)
+
+
+def _validation_cache_hit(cache_key, tensors):
+    cached = _validated_deterministic_k2q.get(cache_key)
+    if cached is None:
+        return None
+    refs, tokens, max_m_block = cached
+    current_tokens = tuple(_tensor_validation_token(tensor) for tensor in tensors)
+    valid = (
+        all(token is not None for token in current_tokens)
+        and all(ref() is tensor for ref, tensor in zip(refs, tensors))
+        and tokens == current_tokens
+    )
+    return max_m_block if valid else None
+
+
+def _cache_validated_metadata(cache_key, tensors, max_m_block):
+    tokens = tuple(_tensor_validation_token(tensor) for tensor in tensors)
+    if any(token is None for token in tokens):
+        return
+    if len(_validated_deterministic_k2q) >= 256:
+        # Keep this bounded without retaining Tensor objects.  Weak references
+        # make allocator pointer/id reuse fail closed instead of accidentally
+        # treating a new metadata object as already validated.
+        _validated_deterministic_k2q.pop(next(iter(_validated_deterministic_k2q)))
+    _validated_deterministic_k2q[cache_key] = (
+        tuple(weakref.ref(tensor) for tensor in tensors),
+        tokens,
+        max_m_block,
+    )
+
+
+def _deterministic_k2q_certificate_tensors(tensors):
+    tensors = _validate_linear_csr_structure(tensors)
+    if tensors.dq_write_order is None:
+        raise ValueError("deterministic K2Q metadata requires dq_write_order")
+    assert tensors.mask_block_idx is not None
+    assert tensors.full_block_idx is not None
+    if tensors.full_block_idx.numel() != 0 and tensors.dq_write_order_full is None:
+        raise ValueError(
+            "deterministic K2Q metadata requires dq_write_order_full "
+            "for non-empty full CSR"
+        )
+    for name, rank, idx in (
+        ("dq_write_order", tensors.dq_write_order, tensors.mask_block_idx),
+        ("dq_write_order_full", tensors.dq_write_order_full, tensors.full_block_idx),
+    ):
+        if rank is None:
+            continue
+        if rank.dtype != torch.int32 or rank.ndim != 1 or not rank.is_contiguous():
+            raise ValueError(f"k2q_block_sparse.{name} must be contiguous 1D torch.int32")
+        if rank.numel() != idx.numel():
+            raise ValueError(f"k2q_block_sparse.{name} must be parallel to its compact idx")
+
+    required_tensors = (
+        tensors.mask_block_cnt,
+        tensors.mask_block_offset,
+        tensors.mask_block_idx,
+        tensors.full_block_cnt,
+        tensors.full_block_offset,
+        tensors.full_block_idx,
+        tensors.dq_write_order,
+    )
+    all_tensors = required_tensors + (
+        () if tensors.dq_write_order_full is None else (tensors.dq_write_order_full,)
+    )
+    metadata_device = all_tensors[0].device
+    if any(tensor.device != metadata_device for tensor in all_tensors):
+        raise ValueError("all deterministic K2Q metadata tensors must be on one device")
+    return tensors, all_tensors
+
+
+def _certify_deterministic_k2q_semantics(tensors):
+    """Validate launch-independent CSR/rank invariants and cache max m_block."""
+    tensors, all_tensors = _deterministic_k2q_certificate_tensors(tensors)
+    cache_key = _validation_cache_key(all_tensors)
+    max_m_block = _validation_cache_hit(cache_key, all_tensors)
+    if max_m_block is not None:
+        return max_m_block
+
+    mask_cnt = tensors.mask_block_cnt.detach().cpu().reshape(-1).tolist()
+    mask_offset = tensors.mask_block_offset.detach().cpu().tolist()
+    mask_idx = tensors.mask_block_idx.detach().cpu().tolist()
+    full_cnt = tensors.full_block_cnt.detach().cpu().reshape(-1).tolist()
+    full_offset = tensors.full_block_offset.detach().cpu().tolist()
+    full_idx = tensors.full_block_idx.detach().cpu().tolist()
+    mask_rank = tensors.dq_write_order.detach().cpu().tolist()
+    full_rank = (
+        []
+        if tensors.dq_write_order_full is None
+        else tensors.dq_write_order_full.detach().cpu().tolist()
+    )
+
+    def _validate_csr(kind, counts, offsets, indices):
+        if not offsets or offsets[0] != 0:
+            raise ValueError(f"K2Q {kind} CSR offset must start at 0")
+        if offsets[-1] != len(indices):
+            raise ValueError(f"K2Q {kind} CSR final offset must equal idx.numel()")
+        for row, count in enumerate(counts):
+            if count < 0 or offsets[row + 1] < offsets[row]:
+                raise ValueError(f"K2Q {kind} CSR counts/offsets must be non-negative")
+            if offsets[row + 1] - offsets[row] != count:
+                raise ValueError(f"K2Q {kind} CSR offset delta must equal count")
+
+    _validate_csr("partial", mask_cnt, mask_offset, mask_idx)
+    _validate_csr("full", full_cnt, full_offset, full_idx)
+
+    num_n_blocks = tensors.mask_block_cnt.shape[2]
+    max_m_block = -1
+    contributors = {}
+    edges_per_row = [set() for _ in range(len(mask_cnt))]
+    for kind, offsets, indices, ranks in (
+        ("partial", mask_offset, mask_idx, mask_rank),
+        ("full", full_offset, full_idx, full_rank),
+    ):
+        for row in range(len(mask_cnt)):
+            n_block = row % num_n_blocks
+            bh = row // num_n_blocks
+            for pos in range(offsets[row], offsets[row + 1]):
+                m_block = indices[pos]
+                if m_block < 0:
+                    raise ValueError(f"K2Q {kind} CSR contains a negative m_block")
+                max_m_block = max(max_m_block, m_block)
+                if m_block in edges_per_row[row]:
+                    raise ValueError(
+                        "K2Q CSR contains a duplicate edge or the same edge in partial/full"
+                    )
+                edges_per_row[row].add(m_block)
+                contributors.setdefault((bh, m_block), []).append(
+                    (n_block, ranks[pos])
+                )
+    for values in contributors.values():
+        n_blocks = [n for n, _ in values]
+        if len(n_blocks) != len(set(n_blocks)):
+            raise ValueError("K2Q CSR contains duplicate contributors")
+        expected = {n: rank for rank, n in enumerate(sorted(n_blocks, reverse=True))}
+        if any(rank != expected[n] for n, rank in values):
+            raise ValueError(
+                "K2Q dq_write_order must be the contiguous rank of descending n_block "
+                "across partial and full contributors"
+            )
+
+    _cache_validated_metadata(cache_key, all_tensors, max_m_block)
+    return max_m_block
+
+
+def _register_trusted_deterministic_k2q_semantics(tensors, max_m_block):
+    """Register metadata whose construction proves the generic invariants."""
+    _, all_tensors = _deterministic_k2q_certificate_tensors(tensors)
+    if torch.compiler.is_compiling():
+        return
+    from torch._subclasses.fake_tensor import is_fake
+    if any(is_fake(tensor) for tensor in all_tensors):
+        return
+    _cache_validated_metadata(
+        _validation_cache_key(all_tensors), all_tensors, max_m_block
+    )
+
+
+def _validate_deterministic_k2q_metadata(
+    tensors,
+    q,
+    k,
+    v,
+    seqlen_q,
+    seqlen_k,
+):
+    tensors, all_tensors = _deterministic_k2q_certificate_tensors(tensors)
+    expected_block_size = _dense_bwd_block_size(q, v)
+    for tensor in all_tensors:
+        if tensor.device != q.device:
+            raise ValueError("deterministic K2Q metadata must be on the same CUDA device as q")
+
+    batch_size, num_heads = q.shape[0], q.shape[-2]
+    metadata_batch, metadata_heads, num_n_blocks = tensors.mask_block_cnt.shape
+    if metadata_batch not in (1, batch_size):
+        raise ValueError("K2Q metadata batch dimension must be 1 or match q batch")
+    if metadata_heads not in (1, num_heads):
+        raise ValueError("K2Q metadata head dimension must be 1 or match q heads")
+    block_m, block_n = expected_block_size
+    expected_n_blocks = _ceildiv(seqlen_k, block_n)
+    if num_n_blocks != expected_n_blocks:
+        raise ValueError(
+            f"K2Q metadata has {num_n_blocks} n-block rows, expected {expected_n_blocks}"
+        )
+
+    # Fake tensors have no values to inspect.  Real metadata is semantically
+    # validated once per tensor version and then cached for repeated launches.
+    if torch.compiler.is_compiling():
+        # The opaque backward custom op repeats this validation at runtime.
+        # Avoid data_ptr/value inspection while Dynamo/AOT is tracing the
+        # public wrapper around it.
+        return tensors
+    from torch._subclasses.fake_tensor import is_fake
+    if any(is_fake(t) for t in all_tensors):
+        return tensors
+    max_m_block = _certify_deterministic_k2q_semantics(tensors)
+    num_m_blocks = _ceildiv(seqlen_q, block_m)
+    if max_m_block >= num_m_blocks:
+        raise ValueError("K2Q CSR contains out-of-range m_block")
+    return tensors
+
+
 def _warn_arbitrary_dense_fallback(missing_names):
+    if torch.compiler.is_compiling():
+        return
     missing = " and ".join(missing_names)
     warnings.warn(
         f"arbitrary_func was provided without {missing}; FlashAttention will generate dense "
@@ -234,6 +635,25 @@ def _warn_arbitrary_dense_fallback(missing_names):
         RuntimeWarning,
         stacklevel=3,
     )
+
+
+def _validate_arbitrary_mask_mode(
+    arbitrary_func,
+    causal,
+    window_size_left,
+    window_size_right,
+    attention_chunk=0,
+):
+    if arbitrary_func is not None and (
+        causal
+        or window_size_left >= 0
+        or window_size_right >= 0
+        or attention_chunk >= 1
+    ):
+        raise ValueError(
+            "arbitrary mask cannot be combined with native causal/local flags; "
+            "encode the constraint in arbitrary_func/CSR"
+        )
 
 
 def _prepare_arbitrary_block_sparse(
@@ -250,13 +670,30 @@ def _prepare_arbitrary_block_sparse(
     varlen_and_split=False,
     append_kv=False,
     prepare_k2q=True,
+    deterministic=False,
+    is_varlen=False,
 ):
     if arbitrary_func is None:
         return q2k_block_sparse, k2q_block_sparse
+    needs_backward_sparse = any(t is not None and t.requires_grad for t in (q, k, v))
+    deterministic_backward = deterministic and needs_backward_sparse
+    if deterministic_backward:
+        major, minor = _device_capability_major(q.device)
+        if (major, minor) != (9, 0):
+            raise NotImplementedError(
+                "C++ arbitrary deterministic backward is currently supported only on SM90"
+            )
+        if is_varlen or q.ndim != 4 or k.ndim != 4:
+            raise NotImplementedError(
+                "C++ arbitrary deterministic backward currently supports fixed-length tensors only"
+            )
+        if round_up_headdim(max(q.shape[-1], v.shape[-1])) > 192:
+            raise ValueError(
+                "C++ arbitrary deterministic backward does not support the rounded hdim-256 bucket"
+            )
     missing_sparse = []
     if q2k_block_sparse is None:
         missing_sparse.append("q2k_block_sparse")
-    needs_backward_sparse = any(t is not None and t.requires_grad for t in (q, k, v))
     if prepare_k2q and k2q_block_sparse is None and needs_backward_sparse:
         missing_sparse.append("k2q_block_sparse")
     if missing_sparse:
@@ -275,14 +712,77 @@ def _prepare_arbitrary_block_sparse(
             _ceildiv(seqlen_k, block_n),
             q.device,
         )
-    if prepare_k2q and k2q_block_sparse is None:
-        block_m, block_n = _dense_bwd_block_size(q)
+    else:
+        q2k_block_sparse = _as_linear_block_sparse_tensors(
+            q2k_block_sparse, "q2k_block_sparse"
+        )
+    if prepare_k2q and k2q_block_sparse is None and needs_backward_sparse:
+        block_m, block_n = _dense_bwd_block_size(q, v)
         k2q_block_sparse = _make_dense_linear_block_sparse(
             _ceildiv(seqlen_k, block_n),
             _ceildiv(seqlen_q, block_m),
             q.device,
+            deterministic_k2q=deterministic_backward,
+        )
+    elif prepare_k2q and k2q_block_sparse is not None:
+        k2q_block_sparse = _as_linear_block_sparse_tensors(
+            k2q_block_sparse, "k2q_block_sparse"
+        )
+    if deterministic_backward:
+        if k2q_block_sparse is None:
+            raise ValueError("arbitrary deterministic backward requires K2Q CSR metadata")
+        k2q_block_sparse = _validate_deterministic_k2q_metadata(
+            k2q_block_sparse,
+            q,
+            k,
+            v,
+            seqlen_q,
+            seqlen_k,
         )
     return q2k_block_sparse, k2q_block_sparse
+
+
+def _save_k2q_metadata(ctx, tensors):
+    tensors = _as_linear_block_sparse_tensors(tensors, "k2q_block_sparse")
+    if tensors is None:
+        return
+    ctx.k2q_mask_cnt = tensors.mask_block_cnt
+    ctx.k2q_mask_offset = tensors.mask_block_offset
+    ctx.k2q_mask_idx = tensors.mask_block_idx
+    ctx.k2q_full_cnt = tensors.full_block_cnt
+    ctx.k2q_full_offset = tensors.full_block_offset
+    ctx.k2q_full_idx = tensors.full_block_idx
+    ctx.k2q_dq_write_order = tensors.dq_write_order
+    ctx.k2q_dq_write_order_full = tensors.dq_write_order_full
+
+
+def _k2q_metadata_args_from_ctx(ctx):
+    return (
+        getattr(ctx, "k2q_mask_cnt", None),
+        getattr(ctx, "k2q_mask_offset", None),
+        getattr(ctx, "k2q_mask_idx", None),
+        getattr(ctx, "k2q_full_cnt", None),
+        getattr(ctx, "k2q_full_offset", None),
+        getattr(ctx, "k2q_full_idx", None),
+        getattr(ctx, "k2q_dq_write_order", None),
+        getattr(ctx, "k2q_dq_write_order_full", None),
+    )
+
+
+def _k2q_metadata_kwargs(tensors):
+    tensors = _as_linear_block_sparse_tensors(tensors, "k2q_block_sparse")
+    if tensors is None:
+        return {}
+    return {
+        "k2q_block_sparse_mask_cnt": tensors.mask_block_cnt,
+        "k2q_block_sparse_mask_offset": tensors.mask_block_offset,
+        "k2q_block_sparse_mask_idx": tensors.mask_block_idx,
+        "k2q_block_sparse_full_cnt": tensors.full_block_cnt,
+        "k2q_block_sparse_full_offset": tensors.full_block_offset,
+        "k2q_block_sparse_full_idx": tensors.full_block_idx,
+        "k2q_block_sparse_dq_write_order": tensors.dq_write_order,
+        "k2q_block_sparse_dq_write_order_full": tensors.dq_write_order_full,
+    }
 
 
 def round_up_headdim(head_size: int) -> int:
@@ -358,9 +858,19 @@ def _flash_attn_forward(
     k2q_block_sparse_full_cnt: Optional[torch.Tensor] = None,
     k2q_block_sparse_full_offset: Optional[torch.Tensor] = None,
     k2q_block_sparse_full_idx: Optional[torch.Tensor] = None,
+    k2q_block_sparse_dq_write_order: Optional[torch.Tensor] = None,
+    k2q_block_sparse_dq_write_order_full: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # Note: k2q_block_sparse_* parameters are not used in forward pass.
     # They are saved by setup_context for use in backward pass.
+    _validate_arbitrary_mask_mode(
+        arbitrary_func,
+        causal,
+        window_size_left,
+        window_size_right,
+        attention_chunk,
+    )
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
@@ -477,11 +987,21 @@ def _flash_attn_forward_fake(
     k2q_block_sparse_full_cnt: Optional[torch.Tensor] = None,
     k2q_block_sparse_full_offset: Optional[torch.Tensor] = None,
     k2q_block_sparse_full_idx: Optional[torch.Tensor] = None,
+    k2q_block_sparse_dq_write_order: Optional[torch.Tensor] = None,
+    k2q_block_sparse_dq_write_order_full: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Symbolic fake implementation of flash attention forward.
     Returns tensors with the correct shapes and dtypes without actual computation.
     """
+    _validate_arbitrary_mask_mode(
+        arbitrary_func,
+        causal,
+        window_size_left,
+        window_size_right,
+        attention_chunk,
+    )
 
     # Determine if we're in varlen mode
     is_varlen_q = cu_seqlens_q is not None
@@ -579,9 +1099,34 @@ def _flash_attn_backward(
     block_sparse_full_cnt: Optional[torch.Tensor] = None,
     block_sparse_full_offset: Optional[torch.Tensor] = None,
     block_sparse_full_idx: Optional[torch.Tensor] = None,
+    block_sparse_dq_write_order: Optional[torch.Tensor] = None,
+    block_sparse_dq_write_order_full: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    metadata_prevalidated = False
+    if deterministic and arbitrary_func is not None:
+        if any(
+            x is not None
+            for x in (cu_seqlens_q, cu_seqlens_k, sequed_q, sequed_k)
+        ):
+            raise NotImplementedError(
+                "C++ arbitrary deterministic backward currently supports fixed-length tensors only"
+            )
+        metadata = LinearBlockSparseTensors(
+            block_sparse_mask_cnt,
+            block_sparse_mask_offset,
+            block_sparse_mask_idx,
+            block_sparse_full_cnt,
+            block_sparse_full_offset,
+            block_sparse_full_idx,
+            block_sparse_dq_write_order,
+            block_sparse_dq_write_order_full,
+        )
+        _validate_deterministic_k2q_metadata(
+            metadata, q, k, v, q.shape[1], k.shape[1]
+        )
+        metadata_prevalidated = True
     softmax_d, *rest = flash_attn_3_gpu.bwd(
         dout,
         q,
@@ -612,6 +1157,9 @@ def _flash_attn_backward(
         block_sparse_full_cnt,
         block_sparse_full_offset,
         block_sparse_full_idx,
+        block_sparse_dq_write_order,
+        block_sparse_dq_write_order_full,
+        metadata_prevalidated,
     )
     return softmax_d
 
@@ -649,6 +1197,8 @@ def _flash_attn_backward_fake(
     block_sparse_full_cnt: Optional[torch.Tensor] = None,
     block_sparse_full_offset: Optional[torch.Tensor] = None,
     block_sparse_full_idx: Optional[torch.Tensor] = None,
+    block_sparse_dq_write_order: Optional[torch.Tensor] = None,
+    block_sparse_dq_write_order_full: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 
     is_varlen_q = cu_seqlens_q is not None
@@ -687,7 +1237,14 @@ def _flash_attn_backward_fake(
 
     is_local = (window_size_left >= 0 or window_size_right >= 0) and not is_causal
 
-    if head_size_rounded <= 64:
+    is_arbitrary = arbitrary_func is not None
+    if is_arbitrary:
+        kBlockM_sm90 = _dense_bwd_block_size_sm90(head_size_rounded)[0]
+        kBlockM_sm80 = _dense_bwd_block_size_sm8x(head_size_rounded)[0]
+        kBlockM_sm86 = _dense_bwd_block_size_sm8x(
+            head_size_rounded, sm86_or_89=True
+        )[0]
+    elif head_size_rounded <= 64:
         kBlockM_sm90 = 96 if (is_causal and softcap > 0.0) else 128
     elif head_size_rounded <= 96:
         kBlockM_sm90 = 64
@@ -696,8 +1253,9 @@ def _flash_attn_backward_fake(
     else:
         kBlockM_sm90 = 64
 
-    kBlockM_sm80 = 128 if head_size_rounded <= 64 else 64
-    kBlockM_sm86 = 64 if head_size_rounded <= 192 else 32
+    if not is_arbitrary:
+        kBlockM_sm80 = 128 if head_size_rounded <= 64 else 64
+        kBlockM_sm86 = 64 if head_size_rounded <= 192 else 32
 
     if arch >= 90:
         kBlockM = kBlockM_sm90
@@ -727,27 +1285,23 @@ def setup_context(ctx, inputs, output):
     q, k, v = inputs[:3]
     out, softmax_lse, _, _ = output
     ctx.save_for_backward(q, k, v, out, softmax_lse)
-    # Note: _flash_attn_forward has 47 parameters, indices from end:
-    # -1~-6: k2q_block_sparse (6 tensors for backward)
-    # -7: arbitrary_func
-    # -8~-13: q2k_block_sparse (6 tensors for forward)
-    # -14: sm_margin, -15: pack_gqa, -16: num_splits, -17: scheduler_metadata,
-    # -18: rotary_interleaved, -19: softcap, -20: attention_chunk,
-    # -21: window_size_right, -22: window_size_left, -23: causal, -24: softmax_scale
-    ctx.softmax_scale = inputs[-24]
-    ctx.causal = inputs[-23]
-    ctx.window_size = [inputs[-22], inputs[-21]]
-    ctx.attention_chunk = inputs[-20]
-    ctx.softcap = inputs[-19]
-    ctx.sm_margin = inputs[-14]
-    ctx.arbitrary_func = inputs[-7]  # arbitrary_func for backward
-    # Save k2q block sparse for backward (6 tensors at the end)
-    ctx.k2q_mask_cnt = inputs[-6]
-    ctx.k2q_mask_offset = inputs[-5]
-    ctx.k2q_mask_idx = inputs[-4]
-    ctx.k2q_full_cnt = inputs[-3]
-    ctx.k2q_full_offset = inputs[-2]
-    ctx.k2q_full_idx = inputs[-1]
+    # K2Q metadata and deterministic were appended to the original inputs.
+    ctx.softmax_scale = inputs[-27]
+    ctx.causal = inputs[-26]
+    ctx.window_size = [inputs[-25], inputs[-24]]
+    ctx.attention_chunk = inputs[-23]
+    ctx.softcap = inputs[-22]
+    ctx.sm_margin = inputs[-17]
+    ctx.arbitrary_func = inputs[-10]
+    ctx.k2q_mask_cnt = inputs[-9]
+    ctx.k2q_mask_offset = inputs[-8]
+    ctx.k2q_mask_idx = inputs[-7]
+    ctx.k2q_full_cnt = inputs[-6]
+    ctx.k2q_full_offset = inputs[-5]
+    ctx.k2q_full_idx = inputs[-4]
+    ctx.k2q_dq_write_order = inputs[-3]
+    ctx.k2q_dq_write_order_full = inputs[-2]
+    ctx.deterministic = inputs[-1]
 
 
 def _backward(ctx, dout, *grads):
@@ -771,19 +1325,13 @@ def _backward(ctx, dout, *grads):
         ctx.window_size[0],
         ctx.window_size[1],
         ctx.softcap,
-        False, # deterministic
+        ctx.deterministic,
         ctx.sm_margin,
         ctx.arbitrary_func if hasattr(ctx, 'arbitrary_func') else None,
-        # k2q block sparse (for backward)
-        ctx.k2q_mask_cnt if hasattr(ctx, 'k2q_mask_cnt') else None,
-        ctx.k2q_mask_offset if hasattr(ctx, 'k2q_mask_offset') else None,
-        ctx.k2q_mask_idx if hasattr(ctx, 'k2q_mask_idx') else None,
-        ctx.k2q_full_cnt if hasattr(ctx, 'k2q_full_cnt') else None,
-        ctx.k2q_full_offset if hasattr(ctx, 'k2q_full_offset') else None,
-        ctx.k2q_full_idx if hasattr(ctx, 'k2q_full_idx') else None,
+        *_k2q_metadata_args_from_ctx(ctx),
     )
-    # _flash_attn_forward has 47 parameters: q, k, v + 44 others (including k2q block sparse)
-    return dq, dk, dv, *((None,) * 44)
+    # _flash_attn_forward has 50 parameters: q, k, v + 47 others.
+    return dq, dk, dv, *((None,) * 47)
 
 
 _flash_attn_forward.register_autograd(_backward, setup_context=setup_context)
@@ -810,7 +1358,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         # Q2K block sparse (for forward)
         q2k_block_sparse=None,  # LinearBlockSparseTensors or tuple of 6 tensors
         # K2Q block sparse (for backward, stored to ctx)
-        k2q_block_sparse=None,  # LinearBlockSparseTensors or tuple of 6 tensors
+        k2q_block_sparse=None,  # LinearBlockSparseTensors or tuple of 6/8 tensors
     ):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -834,6 +1382,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             q.shape[1],
             k.shape[1],
             softcap=softcap,
+            deterministic=deterministic,
         )
 
         # Extract q2k block sparse tensors for forward
@@ -881,6 +1430,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             block_sparse_full_offset=q2k_full_offset,
             block_sparse_full_idx=q2k_full_idx,
             arbitrary_func=arbitrary_func,
+            deterministic=deterministic,
+            **_k2q_metadata_kwargs(k2q_block_sparse),
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -894,20 +1445,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         ctx.sm_margin = sm_margin
         # Save arbitrary_func for backward
         ctx.arbitrary_func = arbitrary_func
-        # Save k2q block sparse for backward
-        if k2q_block_sparse is not None:
-            if hasattr(k2q_block_sparse, 'mask_block_cnt'):
-                # LinearBlockSparseTensors object
-                ctx.k2q_mask_cnt = k2q_block_sparse.mask_block_cnt
-                ctx.k2q_mask_offset = k2q_block_sparse.mask_block_offset
-                ctx.k2q_mask_idx = k2q_block_sparse.mask_block_idx
-                ctx.k2q_full_cnt = k2q_block_sparse.full_block_cnt
-                ctx.k2q_full_offset = k2q_block_sparse.full_block_offset
-                ctx.k2q_full_idx = k2q_block_sparse.full_block_idx
-            else:
-                # Tuple of 6 tensors
-                (ctx.k2q_mask_cnt, ctx.k2q_mask_offset, ctx.k2q_mask_idx,
-                 ctx.k2q_full_cnt, ctx.k2q_full_offset, ctx.k2q_full_idx) = k2q_block_sparse
+        _save_k2q_metadata(ctx, k2q_block_sparse)
         return (out, softmax_lse) if return_softmax else out
 
     @staticmethod
@@ -945,13 +1483,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.deterministic,
             ctx.sm_margin,
             ctx.arbitrary_func if hasattr(ctx, 'arbitrary_func') else None,
-            # k2q block sparse (for backward)
-            ctx.k2q_mask_cnt if hasattr(ctx, 'k2q_mask_cnt') else None,
-            ctx.k2q_mask_offset if hasattr(ctx, 'k2q_mask_offset') else None,
-            ctx.k2q_mask_idx if hasattr(ctx, 'k2q_mask_idx') else None,
-            ctx.k2q_full_cnt if hasattr(ctx, 'k2q_full_cnt') else None,
-            ctx.k2q_full_offset if hasattr(ctx, 'k2q_full_offset') else None,
-            ctx.k2q_full_idx if hasattr(ctx, 'k2q_full_idx') else None,
+            *_k2q_metadata_args_from_ctx(ctx),
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
         # Return gradients for: qkv, softmax_scale, causal, q_descale, k_descale, v_descale,
@@ -985,7 +1517,7 @@ class FlashAttnFunc(torch.autograd.Function):
         # Q2K block sparse (for forward)
         q2k_block_sparse=None,  # LinearBlockSparseTensors or tuple of 6 tensors
         # K2Q block sparse (for backward, stored to ctx)
-        k2q_block_sparse=None,  # LinearBlockSparseTensors or tuple of 6 tensors
+        k2q_block_sparse=None,  # LinearBlockSparseTensors or tuple of 6/8 tensors
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -1000,6 +1532,7 @@ class FlashAttnFunc(torch.autograd.Function):
             q.shape[1],
             k.shape[1],
             softcap=softcap,
+            deterministic=deterministic,
         )
 
         # Extract q2k block sparse tensors for forward
@@ -1050,6 +1583,8 @@ class FlashAttnFunc(torch.autograd.Function):
             block_sparse_full_offset=q2k_full_offset,
             block_sparse_full_idx=q2k_full_idx,
             arbitrary_func=arbitrary_func,
+            deterministic=deterministic,
+            **_k2q_metadata_kwargs(k2q_block_sparse),
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -1062,20 +1597,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.sm_margin = sm_margin
         # Save arbitrary_func for backward
         ctx.arbitrary_func = arbitrary_func
-        # Save k2q block sparse for backward
-        if k2q_block_sparse is not None:
-            if hasattr(k2q_block_sparse, 'mask_block_cnt'):
-                # LinearBlockSparseTensors object
-                ctx.k2q_mask_cnt = k2q_block_sparse.mask_block_cnt
-                ctx.k2q_mask_offset = k2q_block_sparse.mask_block_offset
-                ctx.k2q_mask_idx = k2q_block_sparse.mask_block_idx
-                ctx.k2q_full_cnt = k2q_block_sparse.full_block_cnt
-                ctx.k2q_full_offset = k2q_block_sparse.full_block_offset
-                ctx.k2q_full_idx = k2q_block_sparse.full_block_idx
-            else:
-                # Tuple of 6 tensors
-                (ctx.k2q_mask_cnt, ctx.k2q_mask_offset, ctx.k2q_mask_idx,
-                 ctx.k2q_full_cnt, ctx.k2q_full_offset, ctx.k2q_full_idx) = k2q_block_sparse
+        _save_k2q_metadata(ctx, k2q_block_sparse)
         return (out, softmax_lse) if return_softmax else out
 
     @staticmethod
@@ -1104,13 +1626,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.deterministic,
             ctx.sm_margin,
             ctx.arbitrary_func if hasattr(ctx, 'arbitrary_func') else None,
-            # k2q block sparse (for backward)
-            ctx.k2q_mask_cnt if hasattr(ctx, 'k2q_mask_cnt') else None,
-            ctx.k2q_mask_offset if hasattr(ctx, 'k2q_mask_offset') else None,
-            ctx.k2q_mask_idx if hasattr(ctx, 'k2q_mask_idx') else None,
-            ctx.k2q_full_cnt if hasattr(ctx, 'k2q_full_cnt') else None,
-            ctx.k2q_full_offset if hasattr(ctx, 'k2q_full_offset') else None,
-            ctx.k2q_full_idx if hasattr(ctx, 'k2q_full_idx') else None,
+            *_k2q_metadata_args_from_ctx(ctx),
         )
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
@@ -1150,7 +1666,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # Arbitrary mask and block sparse support
         arbitrary_func=None,  # [batch, head_q, func_num, seqlen_q+256], supports broadcasting
         q2k_block_sparse=None,  # LinearBlockSparseTensors or tuple of 6 tensors
-        k2q_block_sparse=None,  # LinearBlockSparseTensors or tuple of 6 tensors
+        k2q_block_sparse=None,  # LinearBlockSparseTensors or tuple of 6/8 tensors
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -1166,6 +1682,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_k,
             softcap=softcap,
             varlen_and_split=num_splits > 1,
+            deterministic=deterministic,
+            is_varlen=True,
         )
 
         # Extract q2k block sparse tensors for forward
@@ -1220,6 +1738,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             block_sparse_full_offset=q2k_full_offset,
             block_sparse_full_idx=q2k_full_idx,
             arbitrary_func=arbitrary_func,
+            deterministic=deterministic,
+            **_k2q_metadata_kwargs(k2q_block_sparse),
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -1234,20 +1754,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.sm_margin = sm_margin
         # Save arbitrary_func for backward
         ctx.arbitrary_func = arbitrary_func
-        # Save k2q block sparse for backward
-        if k2q_block_sparse is not None:
-            if hasattr(k2q_block_sparse, 'mask_block_cnt'):
-                # LinearBlockSparseTensors object
-                ctx.k2q_mask_cnt = k2q_block_sparse.mask_block_cnt
-                ctx.k2q_mask_offset = k2q_block_sparse.mask_block_offset
-                ctx.k2q_mask_idx = k2q_block_sparse.mask_block_idx
-                ctx.k2q_full_cnt = k2q_block_sparse.full_block_cnt
-                ctx.k2q_full_offset = k2q_block_sparse.full_block_offset
-                ctx.k2q_full_idx = k2q_block_sparse.full_block_idx
-            else:
-                # Tuple of 6 tensors
-                (ctx.k2q_mask_cnt, ctx.k2q_mask_offset, ctx.k2q_mask_idx,
-                 ctx.k2q_full_cnt, ctx.k2q_full_offset, ctx.k2q_full_idx) = k2q_block_sparse
+        _save_k2q_metadata(ctx, k2q_block_sparse)
         return (out, softmax_lse) if return_softmax else out
 
     @staticmethod
@@ -1279,13 +1786,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.deterministic,
             ctx.sm_margin,
             ctx.arbitrary_func if hasattr(ctx, 'arbitrary_func') else None,
-            # k2q block sparse (for backward)
-            ctx.k2q_mask_cnt if hasattr(ctx, 'k2q_mask_cnt') else None,
-            ctx.k2q_mask_offset if hasattr(ctx, 'k2q_mask_offset') else None,
-            ctx.k2q_mask_idx if hasattr(ctx, 'k2q_mask_idx') else None,
-            ctx.k2q_full_cnt if hasattr(ctx, 'k2q_full_cnt') else None,
-            ctx.k2q_full_offset if hasattr(ctx, 'k2q_full_offset') else None,
-            ctx.k2q_full_idx if hasattr(ctx, 'k2q_full_idx') else None,
+            *_k2q_metadata_args_from_ctx(ctx),
         )
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]

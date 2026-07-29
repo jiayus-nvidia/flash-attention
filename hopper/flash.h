@@ -178,6 +178,9 @@ struct Flash_fwd_params : public Qkv_params {
     int block_sparse_num_blocks;                   // num_m_blocks (for computing flat index)
     int block_sparse_num_heads;                    // num_heads (for computing flat index, can be 1 for broadcasting)
     int block_sparse_num_batches;                  // num_batches (for computing flat index, can be 1 for broadcasting)
+    // Deterministic backward write ranks, parallel to the compact K2Q idx arrays.
+    int * __restrict__ block_sparse_dq_write_order = nullptr;
+    int * __restrict__ block_sparse_dq_write_order_full = nullptr;
 
     // Arbitrary mask function tensor for element-level masking within mask_blocks
     // Shape: [batch or 1, head_q or 1, func_num, seqlen_q + 256] where func_num is odd, 1 for broadcasting if head_q is 1 or batch is 1
