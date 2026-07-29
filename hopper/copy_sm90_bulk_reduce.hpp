@@ -11,6 +11,23 @@ namespace cute
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Wait until every previously committed bulk async group has completed,
+// including its global-memory update.  CUTLASS's tma_store_wait<0>() emits
+// cp.async.bulk.wait_group.read 0, which only guarantees that the shared
+// source can be reused and is therefore not a valid release point for a
+// deterministic reduce-add turnstile.
+CUTE_HOST_DEVICE static void
+tma_store_wait_full()
+{
+#if defined(CUTE_ARCH_TMA_SM90_ENABLED)
+  asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
+#elif defined(__CUDA_ARCH__)
+  CUTE_INVALID_CONTROL_PATH("Trying to wait on BULK_REDUCE_ADD without CUTE_ARCH_TMA_SM90_ENABLED.");
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 struct SM90_BULK_REDUCE_ADD
 {
   CUTE_HOST_DEVICE static void

@@ -148,7 +148,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         // Block sparsity arguments (K2Q direction for backward)
         {params.block_sparse_mask_cnt, params.block_sparse_mask_offset, params.block_sparse_mask_idx,
          params.block_sparse_full_cnt, params.block_sparse_full_offset, params.block_sparse_full_idx,
-         params.block_sparse_num_blocks, params.block_sparse_num_heads, params.block_sparse_num_batches},
+         params.block_sparse_num_blocks, params.block_sparse_num_heads, params.block_sparse_num_batches,
+         params.block_sparse_dq_write_order, params.block_sparse_dq_write_order_full},
         // Arbitrary mask function parameters
         params.mask_func_ptr,
         {params.func_seqlen, params.arbitrary_func_num, params.func_head, params.func_batch},  // shape_mask_func: (seqlen_q, func_num, head, batch)

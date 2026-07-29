@@ -13,6 +13,7 @@
 #include "seqlen.h"
 #include "named_barrier.hpp"
 #include "utils.h"
+#include "copy_sm90_bulk_reduce.hpp"
 
 namespace flash {
 
@@ -471,6 +472,7 @@ struct CollectiveEpilogueBwdGQA {
                 SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdKV_flat.data()), raw_pointer_cast(gdVaccum.data()), dKV_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
                 tma_store_arrive();
                 tma_store_wait<0>();
+                if constexpr (Deterministic) { tma_store_wait_full(); }
             }
         } else {
             Tensor tdVrdV_atomic = r2g_thr_copy_dKVaccum.retile_S(tdVrdV);
@@ -502,6 +504,7 @@ struct CollectiveEpilogueBwdGQA {
                 SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdKV_flat.data()), raw_pointer_cast(gdKaccum.data()), dKV_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
                 tma_store_arrive();
                 tma_store_wait<0>();
+                if constexpr (Deterministic) { tma_store_wait_full(); }
             }
         } else {
             Tensor tdKrdK_atomic = r2g_thr_copy_dKVaccum.retile_S(tdKrdK);
@@ -528,7 +531,31 @@ struct CollectiveEpilogueBwdGQA {
          int thread_idx,
          cute::tuple<int32_t, int32_t, int32_t> const& block_coord
          ) {
-        // Don't need to do anything since dKaccum and dVaccum are already zero-initialized
+        // dKaccum and dVaccum are already zero-initialized, but an empty K2Q
+        // row still represents this q-head's turn in deterministic GQA/MQA.
+        // Skipping it would leave later q-heads waiting forever.
+        if constexpr (Deterministic) {
+            auto [n_block, bidh, bidb] = block_coord;
+            int bidh_idx_in_group;
+            int const bidh_kv = params.qhead_per_khead_divmod.divmod(bidh_idx_in_group, bidh);
+            int const num_head_kv = get<1>(params.shape_dKaccum);
+            int const flag_idx = n_block * params.num_batch * num_head_kv;
+            using GroupBarrier = std::conditional_t<
+                Use_TMA,
+                cutlass::GenericBarrier<
+                    cutlass::detail::NamedBarrierSync<
+                        NumEpilogueThreads,
+                        static_cast<int>(cutlass::arch::ReservedNamedBarriers::EpilogueBarrier)>>,
+                cutlass::GenericBarrier<cutlass::detail::SyncthreadsSync>>;
+
+            int *dv_lock_ptr = params.dv_semaphore + bidb * num_head_kv + bidh_kv;
+            GroupBarrier::wait_eq(dv_lock_ptr, thread_idx, flag_idx, bidh_idx_in_group);
+            GroupBarrier::arrive_inc(dv_lock_ptr, thread_idx, flag_idx);
+
+            int *dk_lock_ptr = params.dk_semaphore + bidb * num_head_kv + bidh_kv;
+            GroupBarrier::wait_eq(dk_lock_ptr, thread_idx, flag_idx, bidh_idx_in_group);
+            GroupBarrier::arrive_inc(dk_lock_ptr, thread_idx, flag_idx);
+        }
     }
 
 };

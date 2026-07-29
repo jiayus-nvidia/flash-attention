@@ -14,6 +14,7 @@
 #include "tile_size.h"
 #include "heuristics.h"
 #include "cuda_check.h"
+#include "block_sparse_semantic_validation.h"
 
 
 extern "C" {
@@ -804,6 +805,14 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         }
     }
 
+    TORCH_CHECK(!arbitrary_func_.has_value() ||
+                    (!is_causal &&
+                     window_size_left < 0 &&
+                     window_size_right < 0 &&
+                     attention_chunk < 1),
+                "arbitrary mask cannot be combined with native causal/local flags; "
+                "encode the constraint in arbitrary_func/CSR");
+
     // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
     // TODO: check this
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
@@ -816,7 +825,6 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         }
     }
     if (is_causal) { window_size_right = 0; }
-
     if (!is_varlen_q) {
         CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
     } else {
@@ -1448,13 +1456,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     std::optional<at::Tensor> block_sparse_mask_idx_,     // [total_mask_blocks]: indices of mask blocks
     std::optional<at::Tensor> block_sparse_full_cnt_,     // [batch, head_q, num_n_blocks]: count of full blocks per n_block
     std::optional<at::Tensor> block_sparse_full_offset_,  // [batch * head_q * num_n_blocks + 1]: cumulative offset into full_idx
-    std::optional<at::Tensor> block_sparse_full_idx_      // [total_full_blocks]: indices of full blocks
+    std::optional<at::Tensor> block_sparse_full_idx_,     // [total_full_blocks]: indices of full blocks
+    std::optional<at::Tensor> block_sparse_dq_write_order_,       // [total_mask_blocks]: combined dQ write rank
+    std::optional<at::Tensor> block_sparse_dq_write_order_full_,  // [total_full_blocks]: combined dQ write rank
+    bool unsafe_skip_block_sparse_semantic_validation
 ) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
     #endif
 
+    CHECK_DEVICE(q);
+    auto device_guard = make_cuda_guard_from_tensor(q);
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm8x = dprops->major >= 8;
     TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
@@ -1467,8 +1480,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     TORCH_CHECK(out.dtype() == q_type, "query and out must have the same dtype");
     TORCH_CHECK(dout.dtype() == q_type, "query and dout must have the same dtype");
 
-    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(out); CHECK_DEVICE(dout); CHECK_DEVICE(softmax_lse);
+    TORCH_CHECK(k.get_device() == q.get_device() &&
+                v.get_device() == q.get_device() &&
+                out.get_device() == q.get_device() &&
+                dout.get_device() == q.get_device() &&
+                softmax_lse.get_device() == q.get_device(),
+                "q, k, v, out, dout, and softmax_lse must be on the same CUDA device");
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -1517,6 +1536,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     if (softmax_scale_.has_value()) {
         softmax_scale = softmax_scale_.value();
     }
+
+    TORCH_CHECK(!arbitrary_func_.has_value() ||
+                    (!is_causal &&
+                     window_size_left < 0 &&
+                     window_size_right < 0),
+                "arbitrary mask cannot be combined with native causal/local flags; "
+                "encode the constraint in arbitrary_func/CSR");
 
     // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
@@ -1619,10 +1645,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
         dv = torch::empty_like(v);
     }
 
-    // Otherwise the kernel will be launched from cuda:0 device
-    // Cast to char to avoid compiler warning about narrowing
-    auto device_guard = make_cuda_guard_from_tensor(q);
-
     auto opts = q.options();
     // Need softmax_d to have total_q_padded_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64
     at::Tensor softmax_d, softmax_lse_log2;
@@ -1688,6 +1710,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
         auto arbitrary_func = arbitrary_func_.value();
 
         CHECK_DEVICE(arbitrary_func); CHECK_CONTIGUOUS(arbitrary_func);
+        TORCH_CHECK(arbitrary_func.get_device() == q.get_device(),
+                    "arbitrary_func must be on the same CUDA device as q");
         TORCH_CHECK(arbitrary_func.dtype() == torch::kInt32,
                     "arbitrary_func must have dtype int32");
         TORCH_CHECK(arbitrary_func.dim() == 4,
@@ -1697,6 +1721,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
         TORCH_CHECK(arbitrary_func.size(3) >= seqlen_q + 256,
                     "arbitrary_func seqlen_q dimension must be greater than or equal to (Q seqlen + 256). "
                     "Got ", arbitrary_func.size(3), ", expected >= ", seqlen_q + 256);
+        TORCH_CHECK(arbitrary_func.size(0) == 1 || arbitrary_func.size(0) == batch_size,
+                    "arbitrary_func batch dimension must be 1 or match batch size");
+        TORCH_CHECK(arbitrary_func.size(1) == 1 || arbitrary_func.size(1) == num_heads,
+                    "arbitrary_func head dimension must be 1 or match num_heads");
 
         params.mask_func_ptr = arbitrary_func.data_ptr<int>();
         // Shape
@@ -1720,12 +1748,30 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     }
 
     // Set block sparsity parameters (K2Q direction for backward)
-    bool use_block_sparsity = block_sparse_mask_cnt_.has_value() &&
-                              block_sparse_mask_offset_.has_value() &&
-                              block_sparse_mask_idx_.has_value() &&
-                              block_sparse_full_cnt_.has_value() &&
-                              block_sparse_full_offset_.has_value() &&
-                              block_sparse_full_idx_.has_value();
+    bool const has_any_block_sparsity = block_sparse_mask_cnt_.has_value() ||
+                                        block_sparse_mask_offset_.has_value() ||
+                                        block_sparse_mask_idx_.has_value() ||
+                                        block_sparse_full_cnt_.has_value() ||
+                                        block_sparse_full_offset_.has_value() ||
+                                        block_sparse_full_idx_.has_value();
+    bool const use_block_sparsity = block_sparse_mask_cnt_.has_value() &&
+                                    block_sparse_mask_offset_.has_value() &&
+                                    block_sparse_mask_idx_.has_value() &&
+                                    block_sparse_full_cnt_.has_value() &&
+                                    block_sparse_full_offset_.has_value() &&
+                                    block_sparse_full_idx_.has_value();
+    TORCH_CHECK(!has_any_block_sparsity || use_block_sparsity,
+                "Block sparsity requires all six mask/full CSR tensors");
+    TORCH_CHECK(!is_arbitrary || use_block_sparsity,
+                "arbitrary backward requires all six K2Q block-sparse CSR tensors");
+    if (deterministic && is_arbitrary) {
+        TORCH_CHECK(arch == 90,
+                    "C++ arbitrary deterministic backward is currently supported only on SM90");
+        TORCH_CHECK(!is_varlen,
+                    "C++ arbitrary deterministic backward currently supports fixed-length tensors only");
+        TORCH_CHECK(block_sparse_dq_write_order_.has_value(),
+                    "deterministic K2Q metadata requires block_sparse_dq_write_order");
+    }
     params.use_block_sparsity = use_block_sparsity;
 
     if (use_block_sparsity) {
@@ -1777,6 +1823,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
             "block_sparse_mask_cnt batch dimension must be 1 or match batch size");
         TORCH_CHECK(block_sparse_mask_cnt.size(1) == num_heads || block_sparse_mask_cnt.size(1) == 1,
             "block_sparse_mask_cnt head dimension must be 1 or match num_heads");
+        TORCH_CHECK(!is_arbitrary || block_sparse_mask_cnt.size(2) == (seqlen_k + kBlockN - 1) / kBlockN,
+            "K2Q metadata n-block dimension must equal ceil(seqlen_k / kBlockN)");
 
         // Validate offset size
         int64_t cnt_numel = block_sparse_mask_cnt.numel();
@@ -1789,6 +1837,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
         TORCH_CHECK(block_sparse_mask_cnt.sizes() == block_sparse_full_cnt.sizes(),
             "block_sparse_mask_cnt and block_sparse_full_cnt must have the same shape");
 
+        auto check_same_device = [&](at::Tensor const &tensor, char const *name) {
+            TORCH_CHECK(tensor.get_device() == q.get_device(), name, " must be on the same CUDA device as q");
+        };
+        check_same_device(block_sparse_mask_cnt, "block_sparse_mask_cnt");
+        check_same_device(block_sparse_mask_offset, "block_sparse_mask_offset");
+        check_same_device(block_sparse_mask_idx, "block_sparse_mask_idx");
+        check_same_device(block_sparse_full_cnt, "block_sparse_full_cnt");
+        check_same_device(block_sparse_full_offset, "block_sparse_full_offset");
+        check_same_device(block_sparse_full_idx, "block_sparse_full_idx");
+
         params.block_sparse_mask_cnt = block_sparse_mask_cnt.data_ptr<int>();
         params.block_sparse_mask_offset = block_sparse_mask_offset.data_ptr<int>();
         params.block_sparse_mask_idx = block_sparse_mask_idx.data_ptr<int>();
@@ -1799,6 +1857,56 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
         params.block_sparse_num_blocks = block_sparse_mask_cnt.size(2);
         params.block_sparse_num_heads = block_sparse_mask_cnt.size(1);
         params.block_sparse_num_batches = block_sparse_mask_cnt.size(0);
+
+        params.block_sparse_dq_write_order = nullptr;
+        params.block_sparse_dq_write_order_full = nullptr;
+        if (deterministic && is_arbitrary) {
+            auto block_sparse_dq_write_order = block_sparse_dq_write_order_.value();
+            CHECK_DEVICE(block_sparse_dq_write_order); CHECK_CONTIGUOUS(block_sparse_dq_write_order);
+            TORCH_CHECK(block_sparse_dq_write_order.dtype() == torch::kInt32,
+                        "block_sparse_dq_write_order must have dtype int32");
+            TORCH_CHECK(block_sparse_dq_write_order.dim() == 1,
+                        "block_sparse_dq_write_order must be 1D");
+            TORCH_CHECK(block_sparse_dq_write_order.numel() == block_sparse_mask_idx.numel(),
+                        "block_sparse_dq_write_order must be parallel to block_sparse_mask_idx");
+            check_same_device(block_sparse_dq_write_order, "block_sparse_dq_write_order");
+            params.block_sparse_dq_write_order = block_sparse_dq_write_order.data_ptr<int>();
+
+            auto validate_semantics = [&](at::Tensor const* full_rank) {
+                if (!unsafe_skip_block_sparse_semantic_validation) {
+                    auto validation_stream = at::cuda::getCurrentCUDAStream().stream();
+                    flash::validate_deterministic_k2q_semantics(
+                        block_sparse_mask_cnt,
+                        block_sparse_mask_offset,
+                        block_sparse_mask_idx,
+                        block_sparse_full_cnt,
+                        block_sparse_full_offset,
+                        block_sparse_full_idx,
+                        block_sparse_dq_write_order,
+                        full_rank,
+                        block_sparse_mask_cnt.size(2),
+                        (seqlen_q + kBlockM - 1) / kBlockM,
+                        validation_stream);
+                }
+            };
+            if (block_sparse_dq_write_order_full_.has_value()) {
+                auto block_sparse_dq_write_order_full = block_sparse_dq_write_order_full_.value();
+                CHECK_DEVICE(block_sparse_dq_write_order_full); CHECK_CONTIGUOUS(block_sparse_dq_write_order_full);
+                TORCH_CHECK(block_sparse_dq_write_order_full.dtype() == torch::kInt32,
+                            "block_sparse_dq_write_order_full must have dtype int32");
+                TORCH_CHECK(block_sparse_dq_write_order_full.dim() == 1,
+                            "block_sparse_dq_write_order_full must be 1D");
+                TORCH_CHECK(block_sparse_dq_write_order_full.numel() == block_sparse_full_idx.numel(),
+                            "block_sparse_dq_write_order_full must be parallel to block_sparse_full_idx");
+                check_same_device(block_sparse_dq_write_order_full, "block_sparse_dq_write_order_full");
+                params.block_sparse_dq_write_order_full = block_sparse_dq_write_order_full.data_ptr<int>();
+                validate_semantics(&block_sparse_dq_write_order_full);
+            } else {
+                TORCH_CHECK(block_sparse_full_idx.numel() == 0,
+                            "non-empty full CSR requires block_sparse_dq_write_order_full");
+                validate_semantics(nullptr);
+            }
+        }
     } else {
         params.block_sparse_mask_cnt = nullptr;
         params.block_sparse_mask_offset = nullptr;
@@ -1806,6 +1914,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
         params.block_sparse_full_cnt = nullptr;
         params.block_sparse_full_offset = nullptr;
         params.block_sparse_full_idx = nullptr;
+        params.block_sparse_dq_write_order = nullptr;
+        params.block_sparse_dq_write_order_full = nullptr;
         params.block_sparse_num_blocks = 0;
         params.block_sparse_num_heads = 0;
         params.block_sparse_num_batches = 0;
@@ -2023,7 +2133,11 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? block_sparse_mask_idx = None,"
         "Tensor? block_sparse_full_cnt = None,"
         "Tensor? block_sparse_full_offset = None,"
-        "Tensor? block_sparse_full_idx = None) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "Tensor? block_sparse_full_idx = None,"
+        "Tensor? block_sparse_dq_write_order = None,"
+        "Tensor? block_sparse_dq_write_order_full = None,"
+        "bool unsafe_skip_block_sparse_semantic_validation = False) "
+        "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"

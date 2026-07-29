@@ -429,7 +429,8 @@ struct CollectiveMainloopBwdSm90 {
                 // Block sparsity params - convert from Arguments to Params (same structure)
                 {args.block_sparse.mask_block_cnt, args.block_sparse.mask_block_offset, args.block_sparse.mask_block_idx,
                  args.block_sparse.full_block_cnt, args.block_sparse.full_block_offset, args.block_sparse.full_block_idx,
-                 args.block_sparse.num_blocks, args.block_sparse.num_heads, args.block_sparse.num_batches},
+                 args.block_sparse.num_blocks, args.block_sparse.num_heads, args.block_sparse.num_batches,
+                 args.block_sparse.dq_write_order, args.block_sparse.dq_write_order_full},
                 // Arbitrary mask function params
                 args.mask_func_ptr, args.shape_mask_func, args.stride_mask_func};
     }
@@ -730,9 +731,12 @@ struct CollectiveMainloopBwdSm90 {
         int n_block_global_max = cute::ceil_div(seqlen_info.seqlen_k, kBlockN);
 
         // Lambda for storing dQ for one m_block
-        auto store_dq_step = [&](int m_block) {
+        auto store_dq_step = [&](int m_block, int write_rank) {
             if constexpr (Deterministic) {
-                if constexpr(Is_causal) {
+                if constexpr (Use_block_sparsity) {
+                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp,
+                                     m_block * num_batch * num_head, write_rank);
+                } else if constexpr(Is_causal) {
                     int n_block_max_for_m_block = std::min(n_block_global_max, cute::ceil_div((m_block + 1) * kBlockM + seqlen_info.seqlen_k - seqlen_info.seqlen_q, kBlockN));
                     Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block_max_for_m_block - 1 - n_block);
                 } else {
@@ -753,6 +757,10 @@ struct CollectiveMainloopBwdSm90 {
                 cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
             });
             if constexpr (Deterministic) {
+                // The .read waits above only make the shared-memory source
+                // reusable.  Publish the semaphore only after every reduce-add
+                // in this CTA has completed its global-memory update.
+                if (lane_predicate) { tma_store_wait_full(); }
                 Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
             }
         };
@@ -764,7 +772,7 @@ struct CollectiveMainloopBwdSm90 {
             BlockSparsityInfoBwd block_sparse_info;
             block_sparse_info.init(block_sparse_params, bidb, bidh, n_block);
 
-            store_dq_block_sparse(block_sparse_info, store_dq_step);
+            store_dq_block_sparse<Deterministic>(block_sparse_info, store_dq_step);
 
             // For Is_local && Deterministic, we still need to handle the semaphore for remaining m_blocks
             // However, with block sparsity, the m_block iteration is non-contiguous, so we skip this
@@ -776,7 +784,7 @@ struct CollectiveMainloopBwdSm90 {
             int m_block = m_block_min;
             #pragma unroll 2
             for (; m_block < m_block_max; ++m_block) {
-                store_dq_step(m_block);
+                store_dq_step(m_block, n_block);
             }
 
             if constexpr (Is_local && Deterministic) {

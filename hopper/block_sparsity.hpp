@@ -46,6 +46,11 @@ struct BlockSparsityArguments {
     int num_heads = 0;
     // Number of batches (needed for computing flat index, can be 1 for broadcasting)
     int num_batches = 0;
+
+    // Deterministic backward write ranks, parallel to mask/full_block_idx.
+    // These are only consumed by the K2Q backward dQ store.
+    int const* dq_write_order = nullptr;
+    int const* dq_write_order_full = nullptr;
 };
 
 // Device-side params (same as Arguments for now, but can be optimized separately)
@@ -797,6 +802,8 @@ struct BlockSparsityInfoBwd {
     int full_block_offset = 0;
     int const* mask_block_idx = nullptr;
     int const* full_block_idx = nullptr;
+    int const* dq_write_order = nullptr;
+    int const* dq_write_order_full = nullptr;
 
     CUTLASS_DEVICE
     BlockSparsityInfoBwd() = default;
@@ -815,6 +822,8 @@ struct BlockSparsityInfoBwd {
         full_block_cnt = params.full_block_cnt[flat_idx];
         full_block_offset = params.full_block_offset[flat_idx];
         full_block_idx = params.full_block_idx;
+        dq_write_order = params.dq_write_order;
+        dq_write_order_full = params.dq_write_order_full;
     }
 
     CUTLASS_DEVICE
@@ -838,6 +847,16 @@ struct BlockSparsityInfoBwd {
     CUTLASS_DEVICE
     int get_full_m_block(int idx) const {
         return full_block_idx[full_block_offset + idx];
+    }
+
+    CUTLASS_DEVICE
+    int get_mask_dq_write_order(int idx) const {
+        return dq_write_order[mask_block_offset + idx];
+    }
+
+    CUTLASS_DEVICE
+    int get_full_dq_write_order(int idx) const {
+        return dq_write_order_full[full_block_offset + idx];
     }
 };
 
@@ -1027,9 +1046,10 @@ void consume_block_sparse_mma_bwd(
  * Simply iterates through mask blocks and full blocks.
  *
  * @param info Block sparsity info for the current n_block
- * @param store_step Lambda to store dQ for one m_block: (m_block) -> void
+ * @param store_step Lambda to store dQ for one m_block:
+ *                   (m_block, compact_write_rank) -> void
  */
-template <typename StoreStep>
+template <bool Deterministic, typename StoreStep>
 CUTLASS_DEVICE
 void store_dq_block_sparse(
     BlockSparsityInfoBwd const& info,
@@ -1039,14 +1059,22 @@ void store_dq_block_sparse(
     CUTLASS_PRAGMA_NO_UNROLL
     for (int i = 0; i < info.mask_block_cnt; ++i) {
         int m_block = info.get_mask_m_block(i);
-        store_step(m_block);
+        int write_rank = 0;
+        if constexpr (Deterministic) {
+            write_rank = info.get_mask_dq_write_order(i);
+        }
+        store_step(m_block, write_rank);
     }
 
     // Process full_blocks
     CUTLASS_PRAGMA_NO_UNROLL
     for (int i = 0; i < info.full_block_cnt; ++i) {
         int m_block = info.get_full_m_block(i);
-        store_step(m_block);
+        int write_rank = 0;
+        if constexpr (Deterministic) {
+            write_rank = info.get_full_dq_write_order(i);
+        }
+        store_step(m_block, write_rank);
     }
 }
 

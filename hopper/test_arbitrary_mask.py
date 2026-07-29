@@ -4,6 +4,7 @@ import os
 import pytest
 import torch
 
+import flash_attn_interface as fai
 from flash_attn_interface import (
     LinearBlockSparseTensors,
     flash_attn_func,
@@ -59,6 +60,13 @@ def _compiled_nfunc(nfunc):
     if "FLASHATTENTION_NUM_FUNC" in flags:
         return nfunc in flags["FLASHATTENTION_NUM_FUNC"]
     return nfunc == 1
+
+
+def _first_compiled_hdim():
+    for head_dim in (64, 96, 128, 192, 256):
+        if _compiled_hdim(head_dim):
+            return head_dim
+    pytest.skip("no arbitrary-mask head-dimension kernel was compiled")
 
 
 def _require_arbitrary_hopper(head_dim=128, nfunc=1, backward=True):
@@ -162,6 +170,28 @@ def _dense_block_sparse_pair(seqlen_q, seqlen_k, head_dim, device):
         _ceildiv(seqlen_k, bwd_n), _ceildiv(seqlen_q, bwd_m), device
     )
     return q2k, k2q
+
+
+def _make_native_mask_rejection_case():
+    head_dim = _first_compiled_hdim()
+    _require_arbitrary_hopper(head_dim=head_dim, backward=False)
+    torch.manual_seed(20260729)
+    device = "cuda"
+    batch, seqlen_q, seqlen_k, heads = 1, 64, 64, 2
+    q = torch.randn(
+        batch, seqlen_q, heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        batch, seqlen_k, heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    arbitrary_func = _make_arbitrary_func(
+        1, 1, seqlen_q, seqlen_k, device
+    )
+    q2k, k2q = _dense_block_sparse_pair(
+        seqlen_q, seqlen_k, head_dim, device
+    )
+    return q, k, v, arbitrary_func, q2k, k2q
 
 
 def _kv_heads_for_mode(kv_mode, heads):
@@ -341,6 +371,140 @@ def test_arbitrary_mask_explicit_linear_block_sparse():
         explicit_block_sparse=True,
         seed=53,
     )
+
+
+@pytest.mark.parametrize(
+    "mode_kwargs",
+    [
+        pytest.param({"causal": True}, id="causal"),
+        pytest.param({"window_size": (16, 16)}, id="local-window"),
+        pytest.param({"attention_chunk": 16}, id="attention-chunk"),
+    ],
+)
+def test_arbitrary_mask_rejects_native_causal_local_in_forward_only(mode_kwargs):
+    q, k, v, arbitrary_func, q2k, _ = _make_native_mask_rejection_case()
+    with pytest.raises(ValueError, match="cannot be combined with native causal/local"):
+        flash_attn_func(
+            q,
+            k,
+            v,
+            deterministic=False,
+            arbitrary_func=arbitrary_func,
+            q2k_block_sparse=q2k,
+            **mode_kwargs,
+        )
+
+
+def test_arbitrary_mask_fake_forward_rejects_native_causal_local():
+    q, k, v, arbitrary_func, _, _ = _make_native_mask_rejection_case()
+    for mode_kwargs in (
+        {"causal": True},
+        {"window_size_left": 16, "window_size_right": 16},
+        {"attention_chunk": 16},
+    ):
+        with pytest.raises(
+            ValueError, match="cannot be combined with native causal/local"
+        ):
+            fai._flash_attn_forward_fake(
+                q,
+                k,
+                v,
+                arbitrary_func=arbitrary_func,
+                **mode_kwargs,
+            )
+
+
+def test_arbitrary_mask_kvcache_with_explicit_csr_rejects_native_causal_local():
+    q, k_cache, v_cache, arbitrary_func, q2k, _ = (
+        _make_native_mask_rejection_case()
+    )
+    with pytest.raises(ValueError, match="cannot be combined with native causal/local"):
+        flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=k_cache.shape[1],
+            causal=True,
+            arbitrary_func=arbitrary_func,
+            q2k_block_sparse=q2k,
+            num_splits=1,
+        )
+
+
+def test_raw_cpp_forward_rejects_native_causal_local():
+    q, k, v, arbitrary_func, q2k, _ = _make_native_mask_rejection_case()
+    sparse_kwargs = {
+        "block_sparse_mask_cnt": q2k.mask_block_cnt,
+        "block_sparse_mask_offset": q2k.mask_block_offset,
+        "block_sparse_mask_idx": q2k.mask_block_idx,
+        "block_sparse_full_cnt": q2k.full_block_cnt,
+        "block_sparse_full_offset": q2k.full_block_offset,
+        "block_sparse_full_idx": q2k.full_block_idx,
+    }
+    for mode_kwargs in (
+        {"is_causal": True},
+        {"window_size_left": 16, "window_size_right": 16},
+        {"attention_chunk": 16},
+    ):
+        with pytest.raises(
+            (RuntimeError, ValueError),
+            match="cannot be combined with native causal/local",
+        ):
+            torch.ops.flash_attn_3.fwd(
+                q,
+                k,
+                v,
+                num_splits=1,
+                arbitrary_func=arbitrary_func,
+                **sparse_kwargs,
+                **mode_kwargs,
+            )
+
+
+def test_raw_cpp_backward_rejects_native_causal_local_when_nondeterministic():
+    q, k, v, arbitrary_func, q2k, k2q = _make_native_mask_rejection_case()
+    _require_arbitrary_hopper(head_dim=q.shape[-1], backward=True)
+    out, softmax_lse, *_ = torch.ops.flash_attn_3.fwd(
+        q,
+        k,
+        v,
+        num_splits=1,
+        block_sparse_mask_cnt=q2k.mask_block_cnt,
+        block_sparse_mask_offset=q2k.mask_block_offset,
+        block_sparse_mask_idx=q2k.mask_block_idx,
+        block_sparse_full_cnt=q2k.full_block_cnt,
+        block_sparse_full_offset=q2k.full_block_offset,
+        block_sparse_full_idx=q2k.full_block_idx,
+        arbitrary_func=arbitrary_func,
+    )
+    for mode_kwargs in (
+        {"is_causal": True},
+        {"window_size_left": 16, "window_size_right": 16},
+    ):
+        with pytest.raises(
+            (RuntimeError, ValueError),
+            match="cannot be combined with native causal/local",
+        ):
+            torch.ops.flash_attn_3.bwd(
+                torch.randn_like(out),
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                torch.empty_like(q),
+                torch.empty_like(k),
+                torch.empty_like(v),
+                deterministic=False,
+                arbitrary_func=arbitrary_func,
+                block_sparse_mask_cnt=k2q.mask_block_cnt,
+                block_sparse_mask_offset=k2q.mask_block_offset,
+                block_sparse_mask_idx=k2q.mask_block_idx,
+                block_sparse_full_cnt=k2q.full_block_cnt,
+                block_sparse_full_offset=k2q.full_block_offset,
+                block_sparse_full_idx=k2q.full_block_idx,
+                **mode_kwargs,
+            )
 
 
 def test_arbitrary_mask_softcap_backward():

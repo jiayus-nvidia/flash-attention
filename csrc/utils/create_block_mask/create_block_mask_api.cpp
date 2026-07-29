@@ -3,6 +3,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include "create_block_mask.h"
+#include "../../../hopper/tile_size.h"
 
 #define DIVUP(x, y) (((x) + (y) - 1) / (y))
 
@@ -115,17 +116,13 @@ inline std::pair<int, int> get_bwd_tile_sizes(
     } else if (arch >= 120) {
         return {128, 128};
     } else if (arch >= 90) {
-        if (headdim <= 64) {
-            return {128, 128};
-        } else if (headdim <= 96) {
-            return {64, 128};
-        } else if (headdim <= 128) {
-            return {(is_causal || is_local) ? 64 : 80, 128};
-        } else if (headdim <= 192) {
-            return {64, 96};
-        } else {
-            return {64, 64};
-        }
+        // Hopper C++ kernels round and specialize on max(Q/K dim, V dim).
+        // Keep this selector identical to hopper/tile_size.h, including the
+        // arbitrary/softcap cases that use a smaller M tile.
+        int const rounded_headdim = std::max(headdim, headdim_v);
+        auto const tile = tile_size_bwd_sm90(
+            rounded_headdim, is_causal, is_local, is_arbitrary, has_softcap);
+        return {std::get<0>(tile), std::get<1>(tile)};
     } else {
         (void)is_arbitrary;
         (void)has_softcap;
