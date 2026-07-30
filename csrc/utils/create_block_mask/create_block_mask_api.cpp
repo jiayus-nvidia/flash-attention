@@ -9,7 +9,7 @@
 
 // ============================================================================
 // Tile size computation helpers
-// Mirrors the current CuTe FA4 Python tile-size selection in flash_attn/cute/interface.py.
+// Hopper C++ kernels use hopper/tile_size.h as the single source of truth.
 // ============================================================================
 
 /**
@@ -47,7 +47,8 @@ inline int round_up_hopper_headdim(int head_size) {
 
 /**
  * Get forward pass tile sizes based on architecture.
- * Mirrors current CuTe FA4 Python tile-size selection.
+ * Uses Hopper C++ tile_size.h for SM8x/SM90 and the FA4 selector contract for
+ * Blackwell.
  *
  * @param arch GPU architecture (80, 86, 89, 90, 100). If -1, auto-detect.
  * @param headdim Head dimension
@@ -69,26 +70,33 @@ inline std::pair<int, int> get_fwd_tile_sizes(
     if (arch < 0) {
         arch = get_gpu_arch();
     }
+    int const hopper_rounded_headdim = round_up_hopper_headdim(headdim);
 
     if (arch >= 100) {
         return {128, 128};
     } else if (arch >= 90) {
-        if (headdim <= 64) {
-            return {192, 128};
-        } else if (headdim <= 96) {
-            return {192, (is_causal || is_local) ? 128 : 144};
-        } else if (headdim <= 128) {
-            return {128, 128};
-        } else if (headdim <= 192) {
-            return {128, is_local ? 96 : 112};
-        } else {
-            return {128, is_local ? 64 : 80};
-        }
+        auto const tile = tile_size_fwd_sm90(
+            hopper_rounded_headdim,
+            hopper_rounded_headdim,
+            is_causal,
+            is_local,
+            is_arbitrary,
+            /*element_size=*/2,
+            /*v_colmajor=*/false,
+            /*paged_kv_non_TMA=*/paged_kv);
+        return {std::get<0>(tile), std::get<1>(tile)};
     } else {
-        (void)is_arbitrary;
-        (void)paged_kv;
-        (void)varlen_and_split;
-        return {128, 64};
+        auto const tile = tile_size_fwd_sm8x(
+            arch == 86 || arch == 89,
+            hopper_rounded_headdim,
+            hopper_rounded_headdim,
+            is_causal,
+            is_local,
+            is_arbitrary,
+            /*element_size=*/2,
+            paged_kv,
+            varlen_and_split);
+        return {std::get<0>(tile), std::get<1>(tile)};
     }
 }
 

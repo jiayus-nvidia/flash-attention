@@ -408,6 +408,48 @@ def test_sm100_k2q_auto_tile_sizes(headdim, headdim_v, expected):
 
 @pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
 @pytest.mark.parametrize("arch", [80, 86, 89])
+@pytest.mark.parametrize("headdim", [64, 96, 128, 192, 256])
+def test_sm8x_q2k_auto_tile_sizes(arch, headdim):
+    rounded_headdim = create_block_mask_cuda.round_up_hopper_headdim(headdim)
+    if rounded_headdim <= 64:
+        expected = (128, 96)
+    elif rounded_headdim <= 96:
+        expected = (128, 48)
+    elif rounded_headdim <= 128:
+        expected = (128, 96) if arch in (86, 89) else (128, 48)
+    elif rounded_headdim <= 192:
+        expected = (128, 64)
+    else:
+        expected = (128, 48) if arch in (86, 89) else (128, 64)
+    assert create_block_mask_cuda.get_fwd_tile_sizes(
+        headdim,
+        is_arbitrary=True,
+        arch=arch,
+    ) == expected
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("headdim", [64, 96, 128, 192, 256])
+def test_sm90_q2k_auto_tile_sizes(headdim):
+    rounded_headdim = create_block_mask_cuda.round_up_hopper_headdim(headdim)
+    expected = (
+        (192, 128)
+        if rounded_headdim <= 96
+        else (128, 128)
+        if rounded_headdim <= 128
+        else (128, 96)
+        if rounded_headdim <= 192
+        else (128, 64)
+    )
+    assert create_block_mask_cuda.get_fwd_tile_sizes(
+        headdim,
+        is_arbitrary=True,
+        arch=90,
+    ) == expected
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("arch", [80, 86, 89])
 @pytest.mark.parametrize(
     "headdim",
     [
@@ -464,6 +506,37 @@ def test_sm90_k2q_auto_tile_sizes(headdim):
         is_arbitrary=True,
         arch=90,
     ) == expected
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+def test_q2k_auto_csr_uses_queried_tile_sizes():
+    q_len, kv_len, headdim = 257, 289, 128
+    func_tensor = torch.full(
+        (1, 1, 1, q_len + 256),
+        kv_len,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    result = create_block_mask_cuda.create_q2k_csr_sparse_auto(
+        func_tensor,
+        q_len,
+        kv_len,
+        headdim,
+        is_arbitrary=True,
+        check_q_boundary=True,
+    )
+    queried_tile = create_block_mask_cuda.get_fwd_tile_sizes(
+        headdim,
+        is_arbitrary=True,
+    )
+    assert result[-2:] == queried_tile
+    mask_cnt, mask_offset, _, full_cnt, full_offset, _, block_m, _ = result
+    assert mask_cnt.shape == full_cnt.shape == (
+        1,
+        1,
+        math.ceil(q_len / block_m),
+    )
+    assert mask_offset.numel() == full_offset.numel() == mask_cnt.numel() + 1
 
 
 @pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
