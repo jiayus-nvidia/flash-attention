@@ -457,7 +457,10 @@ struct CollectiveEpilogueBwdGQA {
         // int const num_batch = get<2>(params.shape_dKaccum); // erroneously returns 1 for varlen
         int const num_head_kv = get<1>(params.shape_dKaccum);
         int *lock_ptr = !Deterministic ? nullptr : params.dv_semaphore + bidb * num_head_kv + bidh_kv;
-        using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
+        using Barrier = std::conditional_t<
+            Use_TMA,
+            cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>,
+            cutlass::GenericBarrier<cutlass::detail::SyncthreadsSync>>;
 
         // if (thread_idx == 0) { printf("blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d, bidb = %d, bidh_kv = %d, lock_ptr = %p, dv_semaphore = %p, num_batch = %d, num_head_kv = %d, n_block = %d, bihd_idx_in_group = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, bidb, bidh_kv, lock_ptr, params.dv_semaphore, num_batch, num_head_kv, n_block, bidh_idx_in_group);}
 

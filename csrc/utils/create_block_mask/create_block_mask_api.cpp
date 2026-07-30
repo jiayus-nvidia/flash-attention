@@ -24,6 +24,28 @@ inline int get_gpu_arch() {
 }
 
 /**
+ * Match hopper/flash_api{,_stable}.cpp for builds with disabled hdim buckets.
+ */
+inline int round_up_hopper_headdim(int head_size) {
+    #ifndef FLASHATTENTION_DISABLE_HDIM64
+    if (head_size <= 64) { return 64; }
+    #endif
+    #ifndef FLASHATTENTION_DISABLE_HDIM96
+    if (head_size <= 96) { return 96; }
+    #endif
+    #ifndef FLASHATTENTION_DISABLE_HDIM128
+    if (head_size <= 128) { return 128; }
+    #endif
+    #ifndef FLASHATTENTION_DISABLE_HDIM192
+    if (head_size <= 192) { return 192; }
+    #endif
+    #ifndef FLASHATTENTION_DISABLE_HDIM256
+    if (head_size <= 256) { return 256; }
+    #endif
+    return 256;
+}
+
+/**
  * Get forward pass tile sizes based on architecture.
  * Mirrors current CuTe FA4 Python tile-size selection.
  *
@@ -72,7 +94,8 @@ inline std::pair<int, int> get_fwd_tile_sizes(
 
 /**
  * Get backward pass tile sizes based on architecture.
- * Mirrors current CuTe FA4 Python tile-size selection.
+ * Uses Hopper C++ tile_size.h for SM8x/SM90 and the FA4 selector contract for
+ * Blackwell.
  *
  * @param arch GPU architecture (80, 86, 89, 90, 100). If -1, auto-detect.
  * @param headdim Head dimension
@@ -100,6 +123,8 @@ inline std::pair<int, int> get_bwd_tile_sizes(
     if (headdim_v < 0) {
         headdim_v = headdim;
     }
+    int const hopper_rounded_headdim =
+        round_up_hopper_headdim(std::max(headdim, headdim_v));
 
     if (arch >= 100 && arch < 120) {
         if (headdim == 256 && headdim_v == 256) {
@@ -119,14 +144,18 @@ inline std::pair<int, int> get_bwd_tile_sizes(
         // Hopper C++ kernels round and specialize on max(Q/K dim, V dim).
         // Keep this selector identical to hopper/tile_size.h, including the
         // arbitrary/softcap cases that use a smaller M tile.
-        int const rounded_headdim = std::max(headdim, headdim_v);
         auto const tile = tile_size_bwd_sm90(
-            rounded_headdim, is_causal, is_local, is_arbitrary, has_softcap);
+            hopper_rounded_headdim,
+            is_causal, is_local, is_arbitrary, has_softcap);
         return {std::get<0>(tile), std::get<1>(tile)};
     } else {
-        (void)is_arbitrary;
-        (void)has_softcap;
-        return {64, 128};
+        // SM86/SM89 share one tuned SM8x configuration, while SM80 uses a
+        // different tile for several head dimensions.
+        auto const tile = tile_size_bwd_sm8x(
+            arch == 86 || arch == 89,
+            hopper_rounded_headdim,
+            is_causal, is_local, is_arbitrary, has_softcap);
+        return {std::get<0>(tile), std::get<1>(tile)};
     }
 }
 
@@ -648,6 +677,9 @@ create_k2q_csr_sparse_auto(
     bool has_softcap = false,
     int headdim_v = -1
 ) {
+    TORCH_CHECK(func_tensor.is_cuda(), "func_tensor must be a CUDA tensor");
+    at::cuda::CUDAGuard device_guard(func_tensor.device());
+
     // Auto-detect tile sizes
     auto [Q_BLOCK_SIZE, KV_BLOCK_SIZE] = get_bwd_tile_sizes(
         -1,  // auto-detect arch
@@ -709,6 +741,10 @@ std::tuple<int, int> py_get_bwd_tile_sizes(
  */
 int py_get_gpu_arch() {
     return get_gpu_arch();
+}
+
+int py_round_up_hopper_headdim(int headdim) {
+    return round_up_hopper_headdim(headdim);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -826,7 +862,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("get_fwd_tile_sizes", &py_get_fwd_tile_sizes,
           "Get forward pass tile sizes (Q_BLOCK_SIZE, KV_BLOCK_SIZE) based on configuration.\n\n"
-          "This mirrors the CuTe FA4 Python forward tile-size selection logic.",
+          "Use this result when constructing Q2K CSR metadata for the selected backend.",
           py::arg("headdim"),
           py::arg("is_causal") = false,
           py::arg("is_local") = false,
@@ -835,7 +871,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("get_bwd_tile_sizes", &py_get_bwd_tile_sizes,
           "Get backward pass tile sizes (Q_BLOCK_SIZE, KV_BLOCK_SIZE) based on configuration.\n\n"
-          "This mirrors the CuTe FA4 Python backward tile-size selection logic.",
+          "Use this result when constructing K2Q CSR metadata for the selected backend.",
           py::arg("headdim"),
           py::arg("is_causal") = false,
           py::arg("is_local") = false,
@@ -846,4 +882,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("get_gpu_arch", &py_get_gpu_arch,
           "Get GPU architecture as int (e.g., 80, 86, 89, 90, 100).");
+
+    m.def("round_up_hopper_headdim", &py_round_up_hopper_headdim,
+          "Round a head dimension to the buckets compiled into the Hopper extension.",
+          py::arg("headdim"));
 }

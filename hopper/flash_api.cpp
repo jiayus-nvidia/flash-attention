@@ -1765,8 +1765,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     TORCH_CHECK(!is_arbitrary || use_block_sparsity,
                 "arbitrary backward requires all six K2Q block-sparse CSR tensors");
     if (deterministic && is_arbitrary) {
-        TORCH_CHECK(arch == 90,
-                    "C++ arbitrary deterministic backward is currently supported only on SM90");
+        TORCH_CHECK(arch == 80 || arch == 86 || arch == 89 || arch == 90,
+                    "C++ arbitrary deterministic backward is currently supported only on "
+                    "SM80, SM86, SM89, and SM90");
         TORCH_CHECK(!is_varlen,
                     "C++ arbitrary deterministic backward currently supports fixed-length tensors only");
         TORCH_CHECK(block_sparse_dq_write_order_.has_value(),
