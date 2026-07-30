@@ -15,12 +15,15 @@ from flash_attn_interface import (
 )
 
 
-def _is_sm90():
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
+def _is_supported_arch():
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability() in ((8, 0), (8, 6), (8, 9), (9, 0))
 
 
-pytestmark = pytest.mark.skipif(
-    not _is_sm90(), reason="SM90 arbitrary deterministic tests require an H100-class GPU"
+supported_arch_only = pytest.mark.skipif(
+    not _is_supported_arch(),
+    reason="arbitrary deterministic tests require an SM80, SM86, SM89, or SM90 GPU",
 )
 
 
@@ -40,10 +43,21 @@ def _env_true(*names):
 
 def _require_test_build():
     flags = _build_flags()
-    if _env_true("FLASHATTENTION_DISABLE_SM90", "FLASH_ATTENTION_DISABLE_SM90"):
-        pytest.skip("SM90 kernels were not compiled")
-    if flags.get("FLASHATTENTION_DISABLE_SM90", False):
-        pytest.skip("SM90 kernels were not compiled")
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) == (9, 0):
+        if _env_true("FLASHATTENTION_DISABLE_SM90", "FLASH_ATTENTION_DISABLE_SM90"):
+            pytest.skip("SM90 kernels were not compiled")
+        if flags.get("FLASHATTENTION_DISABLE_SM90", False):
+            pytest.skip("SM90 kernels were not compiled")
+    else:
+        if _env_true(
+            "FLASH_ATTENTION_DISABLE_SM80",
+            "FLASHATTENTION_DISABLE_SM80",
+            "FLASHATTENTION_DISABLE_SM8x",
+        ):
+            pytest.skip("SM8x kernels were not compiled")
+        if flags.get("FLASHATTENTION_DISABLE_SM8x", False):
+            pytest.skip("SM8x kernels were not compiled")
     if _env_true("FLASHATTENTION_DISABLE_ARBITRARY", "FLASH_ATTENTION_DISABLE_ARBITRARY"):
         pytest.skip("arbitrary kernels were not compiled")
     if flags.get("FLASHATTENTION_DISABLE_ARBITRARY", False):
@@ -56,7 +70,9 @@ def _require_test_build():
     for env_name in ("FLASH_ATTENTION_NUM_FUNC", "FLASHATTENTION_NUM_FUNC"):
         if env_name in os.environ:
             compiled_nfunc = {
-                int(value.strip()) for value in os.environ[env_name].split(",")
+                int(value.strip())
+                for value in os.environ[env_name].split(",")
+                if value.strip()
             }
             break
     if compiled_nfunc is None:
@@ -74,7 +90,65 @@ def _compiled_head_dim():
         ) or flags.get(f"FLASHATTENTION_DISABLE_HDIM{head_dim}", False)
         if not disabled:
             return head_dim
-    pytest.skip("no supported SM90 backward head-dimension bucket was compiled")
+    pytest.skip("no compatible arbitrary deterministic head-dimension bucket was compiled")
+
+
+def _bwd_block_size_for_arch(head_dim):
+    major, minor = torch.cuda.get_device_capability()
+    if major == 8:
+        return fai._dense_bwd_block_size_sm8x(
+            head_dim, sm86_or_89=minor in (6, 9)
+        )
+    return fai._dense_bwd_block_size_sm90(head_dim)
+
+
+def _arch_label():
+    major, minor = torch.cuda.get_device_capability()
+    return f"sm{major}{minor}"
+
+
+def test_raw_bwd_schema_keeps_validation_flag_last():
+    """K2Q tile/SPT are a caller-side contract, not duplicated scalar inputs."""
+    arguments = torch.ops.flash_attn_3.bwd.default._schema.arguments
+    tail = [
+        argument.name
+        for argument in arguments[-3:]
+    ]
+    assert tail == [
+        "block_sparse_dq_write_order",
+        "block_sparse_dq_write_order_full",
+        "unsafe_skip_block_sparse_semantic_validation",
+    ]
+    names = {argument.name for argument in arguments}
+    assert names.isdisjoint(
+        {"block_sparse_block_m", "block_sparse_block_n", "block_sparse_spt"}
+    )
+
+
+def test_python_metadata_contract_omits_tile_certificate():
+    assert LinearBlockSparseTensors._fields[-2:] == (
+        "dq_write_order",
+        "dq_write_order_full",
+    )
+    assert tuple(
+        argument.name
+        for argument in torch.ops.flash_attn_3._flash_attn_forward.default._schema.arguments[-3:]
+    ) == (
+        "k2q_block_sparse_dq_write_order",
+        "k2q_block_sparse_dq_write_order_full",
+        "deterministic",
+    )
+    assert set(
+        argument.name
+        for argument in torch.ops.flash_attn_3._flash_attn_forward.default._schema.arguments
+    ).isdisjoint(
+        {
+            "k2q_block_sparse_block_m",
+            "k2q_block_sparse_block_n",
+            "k2q_block_sparse_spt",
+        }
+    )
+    assert prepare_deterministic_k2q_metadata.__code__.co_argcount == 1
 
 
 def _linear_csr(partial_rows, full_rows, device):
@@ -120,20 +194,21 @@ def _make_prefix_mask(seqlen_q, block_n, device):
 def _make_runtime_sparse_pair(q, v, seqlen_q, seqlen_k):
     fwd_block_m, fwd_block_n = fai._dense_fwd_block_size(q, v)
     bwd_block_m, bwd_block_n = fai._dense_bwd_block_size(q, v)
-    assert fwd_block_n == bwd_block_n
     assert 2 * bwd_block_n < seqlen_k <= 3 * bwd_block_n
 
     num_fwd_m = math.ceil(seqlen_q / fwd_block_m)
+    num_fwd_n = math.ceil(seqlen_k / fwd_block_n)
     num_bwd_m = math.ceil(seqlen_q / bwd_block_m)
     num_n = math.ceil(seqlen_k / bwd_block_n)
     assert num_n == 3
 
-    # The func mask is [0, cutoff(q)): K block 0 is full, block 1 is
-    # partial, and block 2 is absent.  The same classification applies in
-    # both Q2K and K2Q orientations.
+    # Forward and backward can use different N tiles on SM8x.
+    # Marking every forward edge partial is conservative and lets the element
+    # mask decide validity, while backward retains the mixed/full/hole shape
+    # that exercises the deterministic turnstile.
     q2k = _linear_csr(
-        partial_rows=[[1] for _ in range(num_fwd_m)],
-        full_rows=[[0] for _ in range(num_fwd_m)],
+        partial_rows=[list(range(num_fwd_n)) for _ in range(num_fwd_m)],
+        full_rows=[[] for _ in range(num_fwd_m)],
         device=q.device,
     )
     k2q = _linear_csr(
@@ -260,7 +335,7 @@ def _make_case(kv_mode):
     batch, seqlen_q, heads = 1, 257, 4
     kv_heads = {"mha": heads, "gqa": heads // 2, "mqa": 1}[kv_mode]
     head_dim = _compiled_head_dim()
-    _, block_n = fai._dense_bwd_block_size_sm90(head_dim)
+    _, block_n = _bwd_block_size_for_arch(head_dim)
     seqlen_k = 2 * block_n + 65
     q = torch.randn(
         batch,
@@ -286,6 +361,7 @@ def _make_case(kv_mode):
     return q, k, v, arbitrary_func, q2k, k2q
 
 
+@supported_arch_only
 def test_rank_combines_partial_full_across_sparse_n_holes():
     """Ranks are compact per m across both CSR lists, not per list or raw n."""
     _require_test_build()
@@ -306,6 +382,232 @@ def test_rank_combines_partial_full_across_sparse_n_holes():
     )
 
 
+@pytest.mark.parametrize("capability", [(7, 5), (8, 7), (10, 0)])
+def test_python_entry_rejects_unsupported_deterministic_arch(monkeypatch, capability):
+    q = torch.empty(
+        1, 1, 1, 64, dtype=torch.bfloat16, device="meta", requires_grad=True
+    )
+    k = torch.empty_like(q, requires_grad=True)
+    v = torch.empty_like(q, requires_grad=True)
+    arbitrary_func = torch.zeros(
+        1, 1, 1, 257, dtype=torch.int32, device="meta"
+    )
+    monkeypatch.setattr(fai, "_device_capability_major", lambda _device: capability)
+    with pytest.raises(
+        NotImplementedError, match="only on SM80, SM86, SM89, and SM90"
+    ):
+        fai._prepare_arbitrary_block_sparse(
+            q,
+            k,
+            v,
+            arbitrary_func,
+            None,
+            None,
+            1,
+            1,
+            deterministic=True,
+        )
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (8, 6), (8, 9), (9, 0)])
+def test_python_entry_accepts_supported_deterministic_arch(monkeypatch, capability):
+    q = torch.empty(
+        1, 1, 1, 64, dtype=torch.bfloat16, device="meta", requires_grad=True
+    )
+    k = torch.empty_like(q, requires_grad=True)
+    v = torch.empty_like(q, requires_grad=True)
+    arbitrary_func = torch.zeros(
+        1, 1, 1, 257, dtype=torch.int32, device="meta"
+    )
+    monkeypatch.setattr(fai, "_device_capability_major", lambda _device: capability)
+    # Reaching the fixed-length check proves that the architecture gate passed.
+    with pytest.raises(NotImplementedError, match="fixed-length tensors only"):
+        fai._prepare_arbitrary_block_sparse(
+            q,
+            k,
+            v,
+            arbitrary_func,
+            None,
+            None,
+            1,
+            1,
+            deterministic=True,
+            is_varlen=True,
+        )
+
+
+@pytest.mark.parametrize("capability", [(7, 5), (8, 7), (10, 0)])
+def test_fake_backward_rejects_unsupported_deterministic_arch(
+    monkeypatch, capability
+):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        q = torch.empty(1, 1, 1, 64, dtype=torch.bfloat16, device="cuda")
+        arbitrary_func = torch.empty(
+            1, 1, 1, 257, dtype=torch.int32, device="cuda"
+        )
+        softmax_lse = torch.empty(
+            1, 1, 1, dtype=torch.float32, device="cuda"
+        )
+        # Construct CUDA FakeTensors before simulating a target architecture;
+        # on CPU-only hosts, advertising CUDA availability earlier makes
+        # FakeTensorMode attempt real device initialization.
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(
+            torch.cuda, "get_device_capability", lambda _device: capability
+        )
+        with pytest.raises(
+            NotImplementedError, match="only on SM80, SM86, SM89, and SM90"
+        ):
+            fai._flash_attn_backward_fake(
+                q,
+                q,
+                q,
+                q,
+                q,
+                softmax_lse,
+                deterministic=True,
+                arbitrary_func=arbitrary_func,
+            )
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (8, 6), (8, 9), (9, 0)])
+def test_fake_backward_accepts_supported_deterministic_arch(
+    monkeypatch, capability
+):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        q = torch.empty(1, 1, 1, 64, dtype=torch.bfloat16, device="cuda")
+        arbitrary_func = torch.empty(
+            1, 1, 1, 257, dtype=torch.int32, device="cuda"
+        )
+        softmax_lse = torch.empty(
+            1, 1, 1, dtype=torch.float32, device="cuda"
+        )
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(
+            torch.cuda, "get_device_capability", lambda _device: capability
+        )
+        # Reaching metadata validation proves that the architecture gate passed.
+        with pytest.raises(ValueError, match="requires all six"):
+            fai._flash_attn_backward_fake(
+                q,
+                q,
+                q,
+                q,
+                q,
+                softmax_lse,
+                deterministic=True,
+                arbitrary_func=arbitrary_func,
+            )
+
+
+def test_fake_backward_allows_unknown_cuda_arch_until_runtime(monkeypatch):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: (_ for _ in ()).throw(AssertionError("must not query CUDA")),
+    )
+    with FakeTensorMode():
+        q = torch.empty(1, 1, 1, 64, dtype=torch.bfloat16, device="cuda")
+        arbitrary_func = torch.empty(
+            1, 1, 1, 257, dtype=torch.int32, device="cuda"
+        )
+        softmax_lse = torch.empty(
+            1, 1, 1, dtype=torch.float32, device="cuda"
+        )
+        mask_cnt = torch.empty(1, 1, 1, dtype=torch.int32, device="cuda")
+        mask_offset = torch.empty(2, dtype=torch.int32, device="cuda")
+        mask_idx = torch.empty(1, dtype=torch.int32, device="cuda")
+        full_cnt = torch.empty_like(mask_cnt)
+        full_offset = torch.empty_like(mask_offset)
+        full_idx = torch.empty(0, dtype=torch.int32, device="cuda")
+        softmax_d = fai._flash_attn_backward_fake(
+            q,
+            q,
+            q,
+            q,
+            q,
+            softmax_lse,
+            deterministic=True,
+            arbitrary_func=arbitrary_func,
+            block_sparse_mask_cnt=mask_cnt,
+            block_sparse_mask_offset=mask_offset,
+            block_sparse_mask_idx=mask_idx,
+            block_sparse_full_cnt=full_cnt,
+            block_sparse_full_offset=full_offset,
+            block_sparse_full_idx=full_idx,
+            block_sparse_dq_write_order=torch.empty_like(mask_idx),
+            block_sparse_dq_write_order_full=torch.empty_like(full_idx),
+        )
+        assert softmax_d.shape == (0,)
+        assert softmax_d.dtype == torch.float32
+
+
+def test_fake_backward_requires_deterministic_metadata(monkeypatch):
+    q = torch.empty(1, 1, 1, 64, dtype=torch.bfloat16, device="meta")
+    arbitrary_func = torch.empty(1, 1, 1, 257, dtype=torch.int32, device="meta")
+    softmax_lse = torch.empty(1, 1, 1, dtype=torch.float32, device="meta")
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda _device: (8, 9)
+    )
+    with pytest.raises(ValueError, match="requires all six"):
+        fai._flash_attn_backward_fake(
+            q,
+            q,
+            q,
+            q,
+            q,
+            softmax_lse,
+            deterministic=True,
+            arbitrary_func=arbitrary_func,
+        )
+
+
+def test_fake_backward_meta_dispatch_returns_fixed_token():
+    q = torch.empty(1, 1, 1, 64, dtype=torch.bfloat16, device="meta")
+    arbitrary_func = torch.empty(1, 1, 1, 257, dtype=torch.int32, device="meta")
+    softmax_lse = torch.empty(1, 1, 1, dtype=torch.float32, device="meta")
+    mask_cnt = torch.empty(1, 1, 1, dtype=torch.int32, device="meta")
+    mask_offset = torch.empty(2, dtype=torch.int32, device="meta")
+    mask_idx = torch.empty(1, dtype=torch.int32, device="meta")
+    full_cnt = torch.empty_like(mask_cnt)
+    full_offset = torch.empty_like(mask_offset)
+    full_idx = torch.empty(0, dtype=torch.int32, device="meta")
+    mask_rank = torch.empty_like(mask_idx)
+    full_rank = torch.empty_like(full_idx)
+    softmax_d = fai._flash_attn_backward(
+        q,
+        q,
+        q,
+        q,
+        q,
+        softmax_lse,
+        dq=torch.empty_like(q),
+        dk=torch.empty_like(q),
+        dv=torch.empty_like(q),
+        deterministic=True,
+        arbitrary_func=arbitrary_func,
+        block_sparse_mask_cnt=mask_cnt,
+        block_sparse_mask_offset=mask_offset,
+        block_sparse_mask_idx=mask_idx,
+        block_sparse_full_cnt=full_cnt,
+        block_sparse_full_offset=full_offset,
+        block_sparse_full_idx=full_idx,
+        block_sparse_dq_write_order=mask_rank,
+        block_sparse_dq_write_order_full=full_rank,
+    )
+    assert softmax_d.shape == (0,)
+    assert softmax_d.dtype == torch.float32
+    assert softmax_d.device.type == "meta"
+
+
+@supported_arch_only
 @pytest.mark.parametrize(
     "malformation,match",
     [
@@ -372,7 +674,7 @@ def test_malformed_deterministic_metadata_fails_before_kernel(
                 partial_rows=[[], list(range(num_m_blocks))],
                 full_rows=[list(range(num_m_blocks)), []],
                 device=q.device,
-            )
+            ),
         )
     else:
         raise AssertionError(f"unknown malformation: {malformation}")
@@ -541,12 +843,18 @@ def _run_long_grid_case():
     device = "cuda"
     head_dim = _compiled_head_dim()
     heads, kv_heads = 4, 2
-    bwd_block_m, block_n = fai._dense_bwd_block_size_sm90(head_dim)
+    bwd_block_m, block_n = _bwd_block_size_for_arch(head_dim)
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    num_n_blocks = max(48, math.ceil((sm_count + 1) / heads))
+    # SM8x backward uses 256-thread CTAs.  Six CTAs/SM is the architectural
+    # thread-limit upper bound, so this grid is larger than full residency
+    # even before register and shared-memory limits are considered.
+    max_ctas_per_sm = 6
+    num_n_blocks = max(
+        48, math.ceil((sm_count * max_ctas_per_sm + 1) / heads)
+    )
     if num_n_blocks % 2:
         num_n_blocks += 1
-    assert num_n_blocks * heads > sm_count
+    assert num_n_blocks * heads > sm_count * max_ctas_per_sm
     seqlen_q = 8 * bwd_block_m + 1
     seqlen_k = num_n_blocks * block_n
 
@@ -573,14 +881,17 @@ def _run_long_grid_case():
         1, 1, 1, seqlen_q + 256, dtype=torch.int32, device=device
     )
     fwd_block_m, fwd_block_n = fai._dense_fwd_block_size(q, v)
-    assert fwd_block_n == block_n
-    selected_n = list(range(0, num_n_blocks, 2))
+    num_fwd_n_blocks = math.ceil(seqlen_k / fwd_block_n)
+    # Visit every K tile.  This keeps Q2K correct when SM8x forward/backward N
+    # tiles differ, while producing a turnstile chain longer than
+    # full-grid residency for every m block.
     q2k = _linear_csr(
         partial_rows=[
             [] for _ in range(math.ceil(seqlen_q / fwd_block_m))
         ],
         full_rows=[
-            selected_n for _ in range(math.ceil(seqlen_q / fwd_block_m))
+            list(range(num_fwd_n_blocks))
+            for _ in range(math.ceil(seqlen_q / fwd_block_m))
         ],
         device=device,
     )
@@ -588,8 +899,7 @@ def _run_long_grid_case():
     k2q = _linear_csr(
         partial_rows=[[] for _ in range(num_n_blocks)],
         full_rows=[
-            list(range(num_m_blocks)) if n_block % 2 == 0 else []
-            for n_block in range(num_n_blocks)
+            list(range(num_m_blocks)) for _ in range(num_n_blocks)
         ],
         device=device,
     )
@@ -664,8 +974,36 @@ def _run_with_watchdog(target, args, name, timeout_s):
         pytest.fail(detail)
 
 
+@supported_arch_only
+def test_aot_autograd_preserves_arbitrary_deterministic_metadata():
+    """The registered custom-op path must carry CSR, ranks, and deterministic."""
+    q, k, v, arbitrary_func, q2k, k2q = _make_case("gqa")
+
+    def attention(q_, k_, v_):
+        return flash_attn_func(
+            q_,
+            k_,
+            v_,
+            deterministic=True,
+            arbitrary_func=arbitrary_func,
+            q2k_block_sparse=q2k,
+            k2q_block_sparse=k2q,
+        )
+
+    compiled_attention = torch.compile(
+        attention, backend="aot_eager", fullgraph=True
+    )
+    out = compiled_attention(q, k, v)
+    grads = torch.autograd.grad(
+        out, (q, k, v), torch.randn_like(out)
+    )
+    assert all(torch.isfinite(grad).all() for grad in grads)
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
-def test_sm90_arbitrary_deterministic_backward_is_bitwise_repeatable(kv_mode):
+@supported_arch_only
+def test_arbitrary_deterministic_backward_is_bitwise_repeatable(kv_mode):
     """Run spin-wait kernels in a spawned process so a deadlock cannot wedge pytest."""
     _require_test_build()
     _compiled_head_dim()
@@ -673,27 +1011,31 @@ def test_sm90_arbitrary_deterministic_backward_is_bitwise_repeatable(kv_mode):
     _run_with_watchdog(
         _repeatability_worker,
         (kv_mode,),
-        f"sm90-arbitrary-deterministic-{kv_mode}",
+        f"{_arch_label()}-arbitrary-deterministic-{kv_mode}",
         timeout_s,
     )
 
 
+@supported_arch_only
 def test_raw_cpp_op_rejects_malformed_semantics_before_launch():
     _require_test_build()
+    _compiled_head_dim()
     _run_with_watchdog(
         _raw_semantic_validation_worker,
         (),
-        "sm90-raw-cpp-semantic-validation",
+        f"{_arch_label()}-raw-cpp-semantic-validation",
         30,
     )
 
 
-def test_sm90_arbitrary_deterministic_long_grid_watchdog():
+@supported_arch_only
+def test_arbitrary_deterministic_long_grid_watchdog():
     _require_test_build()
+    _compiled_head_dim()
     timeout_s = float(os.getenv("FLASH_ATTENTION_DETERMINISM_TIMEOUT_S", "120"))
     _run_with_watchdog(
         _long_grid_worker,
         (),
-        "sm90-arbitrary-deterministic-long-grid",
+        f"{_arch_label()}-arbitrary-deterministic-long-grid",
         timeout_s,
     )

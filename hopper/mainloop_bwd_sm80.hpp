@@ -8,6 +8,7 @@
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
+#include <cutlass/barrier.h>
 
 #include "cute/tensor.hpp"
 
@@ -393,7 +394,8 @@ struct CollectiveMainloopBwdSm80 {
                 // Block sparsity params - convert from Arguments to Params (same structure)
                 {args.block_sparse.mask_block_cnt, args.block_sparse.mask_block_offset, args.block_sparse.mask_block_idx,
                  args.block_sparse.full_block_cnt, args.block_sparse.full_block_offset, args.block_sparse.full_block_idx,
-                 args.block_sparse.num_blocks, args.block_sparse.num_heads, args.block_sparse.num_batches},
+                 args.block_sparse.num_blocks, args.block_sparse.num_heads, args.block_sparse.num_batches,
+                 args.block_sparse.dq_write_order, args.block_sparse.dq_write_order_full},
                 // Arbitrary mask function params
                 args.mask_func_ptr, args.shape_mask_func, args.stride_mask_func};
     }
@@ -725,6 +727,13 @@ struct CollectiveMainloopBwdSm80 {
                 return info.get_full_m_block(idx - info.mask_block_cnt);
             }
         };
+        [[maybe_unused]] auto get_sparse_dq_write_order = [&](BlockSparsityInfoBwd const& info, int idx) {
+            if (idx < info.mask_block_cnt) {
+                return info.get_mask_dq_write_order(idx);
+            } else {
+                return info.get_full_dq_write_order(idx - info.mask_block_cnt);
+            }
+        };
 
         // For block sparse, we use a different preload strategy
         if constexpr (Use_block_sparsity) {
@@ -991,6 +1000,12 @@ struct CollectiveMainloopBwdSm80 {
 
             // Block sparse version of bwd_step that uses sparse iteration index for preloading
             auto bwd_step_sparse = [&](int m_block, auto mask_fn) {
+                [[maybe_unused]] int dq_write_rank = 0;
+                if constexpr (Deterministic) {
+                    // The consumer visits partial edges first and then full
+                    // edges, matching sparse_iter and the compact rank arrays.
+                    dq_write_rank = get_sparse_dq_write_order(block_sparse_info, sparse_iter);
+                }
                 Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
                 clear(tSrS);
                 flash::cp_async_wait<(kStages > 1) ? 1 : 0>();
@@ -1096,8 +1111,27 @@ struct CollectiveMainloopBwdSm80 {
                     Tensor tdQrdQ_atomic = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);
                     Tensor tdQgdQaccum_atomic = tdQgdQaccum(_, _, m_block);
                     static_assert(CUTE_STATIC_V(size(tdQrdQ_atomic)) == CUTE_STATIC_V(size(tdQgdQaccum_atomic)));
+                    if constexpr (Use_block_sparsity && Deterministic) {
+                        int const num_head = get<2>(params.shape_Q);
+                        int *lock_ptr = params.dq_semaphore + bidb * num_head + bidh;
+                        using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncthreadsSync>;
+                        Barrier::wait_eq(
+                            lock_ptr, thread_idx,
+                            m_block * params.num_batch * num_head,
+                            dq_write_rank
+                        );
+                    }
                     #pragma unroll
                     for (int i = 0; i < size(tdQrdQ_atomic); ++i) { atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i)); }
+                    if constexpr (Use_block_sparsity && Deterministic) {
+                        int const num_head = get<2>(params.shape_Q);
+                        int *lock_ptr = params.dq_semaphore + bidb * num_head + bidh;
+                        using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncthreadsSync>;
+                        Barrier::arrive_inc(
+                            lock_ptr, thread_idx,
+                            m_block * params.num_batch * num_head
+                        );
+                    }
                 };
                 if constexpr (kStages > 1) { do_mma_dQ_sparse(load_dO_next_sparse); }
                 Tensor tdKrQ = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sQt(_, _, _0{}));

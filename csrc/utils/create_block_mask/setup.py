@@ -1,5 +1,6 @@
 # Setup script for create_block_mask CUDA extension
 import os
+import runpy
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
@@ -65,6 +66,27 @@ disable_reg_cache = os.environ.get("DISABLE_REG_CACHE")
 disable_kv_range_opt = os.environ.get("DISABLE_KV_RANGE_OPT")
 disable_block_size_template = os.environ.get("DISABLE_BLOCK_SIZE_TEMPLATE")
 enable_warp_level_opt = os.environ.get("ENABLE_WARP_LEVEL_OPT")
+
+# Keep the auto K2Q tile selector in lockstep with a nearby Hopper extension
+# build, including intentionally cropped head-dimension builds.  Explicit
+# environment values take precedence; a generated config is used when present.
+flash_build_flags = {}
+flash_config_path = os.path.join(project_root, "hopper", "flash_attn_config.py")
+if os.path.exists(flash_config_path):
+    flash_build_flags = runpy.run_path(flash_config_path).get("CONFIG", {}).get(
+        "build_flags", {}
+    )
+for head_dim in (64, 96, 128, 192, 256):
+    env_name = f"FLASH_ATTENTION_DISABLE_HDIM{head_dim}"
+    config_name = f"FLASHATTENTION_DISABLE_HDIM{head_dim}"
+    env_value = os.environ.get(env_name)
+    disabled = (
+        env_value.upper() == "TRUE"
+        if env_value is not None
+        else flash_build_flags.get(config_name, False)
+    )
+    if disabled:
+        extra_defines.append(f"-DFLASHATTENTION_DISABLE_HDIM{head_dim}")
 
 if disable_reg_cache:
     extra_defines.append("-DDISABLE_REG_CACHE")

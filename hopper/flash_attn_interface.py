@@ -273,7 +273,9 @@ def _as_linear_block_sparse_tensors(tensors, name="block_sparse"):
             getattr(tensors, "dq_write_order_full", None),
         )
     if not isinstance(tensors, (tuple, list)) or len(tensors) not in (6, 8):
-        raise ValueError(f"{name} must be LinearBlockSparseTensors or a 6/8-item tuple")
+        raise ValueError(
+            f"{name} must be LinearBlockSparseTensors or a 6/8-item tuple"
+        )
     return LinearBlockSparseTensors(*tensors)
 
 
@@ -325,7 +327,7 @@ def compute_dq_write_order_from_linear_csr(tensors):
 
     Partial and full contributors are ranked together for each
     ``(metadata_batch, metadata_head, m_block)``.  The highest contributing
-    n_block receives rank 0, matching the C++ SM90 deterministic scheduler.
+    n_block receives rank 0, matching the C++ SM8x/SM90 deterministic scheduler.
     """
     tensors = _validate_linear_csr_structure(tensors)
     mask_cnt = tensors.mask_block_cnt
@@ -382,8 +384,10 @@ def compute_dq_write_order_from_linear_csr(tensors):
 
 
 def prepare_deterministic_k2q_metadata(tensors):
-    """Return validated K2Q CSR metadata for SM90 deterministic backward.
+    """Return validated K2Q CSR metadata for SM8x/SM90 deterministic backward.
 
+    The CSR is assumed to have been built with the backend's queried backward
+    tile size; the tile is derived again at launch and is not stored here.
     The returned CSR and rank tensors must be treated as immutable.  Normal
     in-place PyTorch mutations invalidate the cached validation certificate,
     but writes through ``.data`` or unregistered raw CUDA kernels cannot be
@@ -572,7 +576,7 @@ def _register_trusted_deterministic_k2q_semantics(tensors, max_m_block):
     if torch.compiler.is_compiling():
         return
     from torch._subclasses.fake_tensor import is_fake
-    if any(is_fake(tensor) for tensor in all_tensors):
+    if any(tensor.device.type == "meta" or is_fake(tensor) for tensor in all_tensors):
         return
     _cache_validated_metadata(
         _validation_cache_key(all_tensors), all_tensors, max_m_block
@@ -588,7 +592,6 @@ def _validate_deterministic_k2q_metadata(
     seqlen_k,
 ):
     tensors, all_tensors = _deterministic_k2q_certificate_tensors(tensors)
-    expected_block_size = _dense_bwd_block_size(q, v)
     for tensor in all_tensors:
         if tensor.device != q.device:
             raise ValueError("deterministic K2Q metadata must be on the same CUDA device as q")
@@ -599,12 +602,6 @@ def _validate_deterministic_k2q_metadata(
         raise ValueError("K2Q metadata batch dimension must be 1 or match q batch")
     if metadata_heads not in (1, num_heads):
         raise ValueError("K2Q metadata head dimension must be 1 or match q heads")
-    block_m, block_n = expected_block_size
-    expected_n_blocks = _ceildiv(seqlen_k, block_n)
-    if num_n_blocks != expected_n_blocks:
-        raise ValueError(
-            f"K2Q metadata has {num_n_blocks} n-block rows, expected {expected_n_blocks}"
-        )
 
     # Fake tensors have no values to inspect.  Real metadata is semantically
     # validated once per tensor version and then cached for repeated launches.
@@ -614,9 +611,21 @@ def _validate_deterministic_k2q_metadata(
         # public wrapper around it.
         return tensors
     from torch._subclasses.fake_tensor import is_fake
-    if any(is_fake(t) for t in all_tensors):
+    if (
+        q.device.type == "meta"
+        or is_fake(q)
+        or any(t.device.type == "meta" or is_fake(t) for t in all_tensors)
+    ):
         return tensors
     max_m_block = _certify_deterministic_k2q_semantics(tensors)
+    if q.device.type != "cuda":
+        return tensors
+    block_m, block_n = _dense_bwd_block_size(q, v)
+    expected_n_blocks = _ceildiv(seqlen_k, block_n)
+    if num_n_blocks != expected_n_blocks:
+        raise ValueError(
+            f"K2Q metadata has {num_n_blocks} n-block rows, expected {expected_n_blocks}"
+        )
     num_m_blocks = _ceildiv(seqlen_q, block_m)
     if max_m_block >= num_m_blocks:
         raise ValueError("K2Q CSR contains out-of-range m_block")
@@ -678,11 +687,13 @@ def _prepare_arbitrary_block_sparse(
     needs_backward_sparse = any(t is not None and t.requires_grad for t in (q, k, v))
     deterministic_backward = deterministic and needs_backward_sparse
     if deterministic_backward:
-        major, minor = _device_capability_major(q.device)
-        if (major, minor) != (9, 0):
-            raise NotImplementedError(
-                "C++ arbitrary deterministic backward is currently supported only on SM90"
-            )
+        if not torch.compiler.is_compiling():
+            major, minor = _device_capability_major(q.device)
+            if (major, minor) not in ((8, 0), (8, 6), (8, 9), (9, 0)):
+                raise NotImplementedError(
+                    "C++ arbitrary deterministic backward is currently supported only on "
+                    "SM80, SM86, SM89, and SM90"
+                )
         if is_varlen or q.ndim != 4 or k.ndim != 4:
             raise NotImplementedError(
                 "C++ arbitrary deterministic backward currently supports fixed-length tensors only"
@@ -1161,7 +1172,9 @@ def _flash_attn_backward(
         block_sparse_dq_write_order_full,
         metadata_prevalidated,
     )
-    return softmax_d
+    # The return is an internal autograd sequencing token; dq/dk/dv are
+    # produced through the declared mutations above.
+    return softmax_d.new_empty((0,))
 
 
 @torch.library.register_fake("flash_attn_3::_flash_attn_backward")
@@ -1202,83 +1215,78 @@ def _flash_attn_backward_fake(
 ) -> torch.Tensor:
 
     is_varlen_q = cu_seqlens_q is not None
-    is_varlen_k = cu_seqlens_q is not None
+    is_varlen_k = cu_seqlens_k is not None
     is_varlen = is_varlen_q or is_varlen_k or sequed_q is not None or sequed_k is not None
 
     if not is_varlen_q:
-        batch_size = q.size(0)
         seqlen_q = q.size(1)
-        seqlen_k = k.size(1)
-        total_q = batch_size * q.size(1)
     else:
-        batch_size = cu_seqlens_q.size(0) - 1
-        total_q = q.size(0)
+        if max_seqlen_q is None:
+            raise ValueError(
+                "max_seqlen_q must be provided if cu_seqlens_q is provided"
+            )
         seqlen_q = max_seqlen_q
+    if is_varlen_k:
+        if max_seqlen_k is None:
+            raise ValueError(
+                "max_seqlen_k must be provided if cu_seqlens_k is provided"
+            )
         seqlen_k = max_seqlen_k
-
-    if window_size_left >= seqlen_k - 1:
-        window_size_left = -1
-
-    if window_size_right >= seqlen_q - 1:
-        window_size_right = -1
-
-    if is_causal:
-        window_size_right = 0
-
-    is_causal = window_size_left < 0 and window_size_right == 0
+    else:
+        seqlen_k = k.size(1)
 
     head_size = q.size(-1)
     head_size_v = v.size(-1)
     head_size_rounded = round_up_headdim(max(head_size, head_size_v))
 
-    # Hopper gpus uses cuda compute capabilities 9.0
-    cap = torch.cuda.get_device_capability(q.device)
-    arch = cap[0] * 10 + cap[1]
-
-    is_local = (window_size_left >= 0 or window_size_right >= 0) and not is_causal
-
     is_arbitrary = arbitrary_func is not None
-    if is_arbitrary:
-        kBlockM_sm90 = _dense_bwd_block_size_sm90(head_size_rounded)[0]
-        kBlockM_sm80 = _dense_bwd_block_size_sm8x(head_size_rounded)[0]
-        kBlockM_sm86 = _dense_bwd_block_size_sm8x(
-            head_size_rounded, sm86_or_89=True
-        )[0]
-    elif head_size_rounded <= 64:
-        kBlockM_sm90 = 96 if (is_causal and softcap > 0.0) else 128
-    elif head_size_rounded <= 96:
-        kBlockM_sm90 = 64
-    elif head_size_rounded <= 128:
-        kBlockM_sm90 = 64 if (is_causal or is_local or softcap > 0.0) else 80
-    else:
-        kBlockM_sm90 = 64
-
-    if not is_arbitrary:
-        kBlockM_sm80 = 128 if head_size_rounded <= 64 else 64
-        kBlockM_sm86 = 64 if head_size_rounded <= 192 else 32
-
-    if arch >= 90:
-        kBlockM = kBlockM_sm90
-    elif arch == 86 or arch == 89:
-        kBlockM = kBlockM_sm86
-    else:
-        kBlockM = kBlockM_sm80
-
-    num_heads = q.shape[-2]
-    seqlen_q_rounded = round_multiple(seqlen_q, kBlockM)
-
-    total_q_padded_rounded = round_multiple(total_q + batch_size * kBlockM, kBlockM)
-
-    dq = torch.empty_like(q) if dq is None else dq
-    dk = torch.empty_like(k) if dk is None else dk
-    dv = torch.empty_like(v) if dv is None else dv
-
-    if not is_varlen:
-        softmax_d = torch.empty((batch_size, num_heads, seqlen_q_rounded), dtype=torch.float32, device=q.device)
-    else:
-        softmax_d = torch.empty((num_heads, total_q_padded_rounded), dtype=torch.float32, device=q.device)
-
-    return softmax_d
+    if is_arbitrary and deterministic:
+        # The output is a fixed internal token, so Fake/AOT shape inference
+        # does not need a target-specific tile.  A known target is still
+        # checked against the runtime support set.
+        if q.device.type == "meta" or not torch.cuda.is_available():
+            arch = None
+        else:
+            try:
+                cap = torch.cuda.get_device_capability(q.device)
+            except (AssertionError, RuntimeError):
+                # CUDA FakeTensors are valid on CPU-only tracing hosts.  Their
+                # target architecture is unknown until deployment/runtime.
+                arch = None
+            else:
+                arch = cap[0] * 10 + cap[1]
+        if arch is not None and arch not in (80, 86, 89, 90):
+            raise NotImplementedError(
+                "C++ arbitrary deterministic backward is currently supported only on "
+                "SM80, SM86, SM89, and SM90"
+            )
+        if is_varlen or q.ndim != 4 or k.ndim != 4:
+            raise NotImplementedError(
+                "C++ arbitrary deterministic backward currently supports fixed-length tensors only"
+            )
+        if head_size_rounded > 192:
+            raise ValueError(
+                "C++ arbitrary deterministic backward does not support the rounded hdim-256 bucket"
+            )
+        metadata = LinearBlockSparseTensors(
+            block_sparse_mask_cnt,
+            block_sparse_mask_offset,
+            block_sparse_mask_idx,
+            block_sparse_full_cnt,
+            block_sparse_full_offset,
+            block_sparse_full_idx,
+            block_sparse_dq_write_order,
+            block_sparse_dq_write_order_full,
+        )
+        _validate_deterministic_k2q_metadata(
+            metadata,
+            q,
+            k,
+            v,
+            seqlen_q,
+            seqlen_k,
+        )
+    return torch.empty((0,), dtype=torch.float32, device=q.device)
 
 
 def setup_context(ctx, inputs, output):
