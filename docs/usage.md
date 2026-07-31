@@ -360,14 +360,22 @@ The extension also exposes helper functions:
 
 ```text
 create_block_mask_cuda.get_gpu_arch()
-create_block_mask_cuda.get_fwd_tile_sizes(headdim, is_causal=False, is_local=False, is_arbitrary=True)
+create_block_mask_cuda.get_fwd_tile_sizes(
+    headdim, is_causal=False, is_local=False, is_arbitrary=True,
+    arch=-1, backend=None
+)
 create_block_mask_cuda.get_bwd_tile_sizes(
     headdim, is_causal=False, is_local=False, is_arbitrary=True,
-    has_softcap=False, arch=-1, headdim_v=-1
+    has_softcap=False, arch=-1, headdim_v=-1, backend=None
 )
-create_block_mask_cuda.create_q2k_csr_sparse_auto(...)
-create_block_mask_cuda.create_k2q_csr_sparse_auto(...)
+create_block_mask_cuda.create_q2k_csr_sparse_auto(..., backend=None)
+create_block_mask_cuda.create_k2q_csr_sparse_auto(..., backend=None)
 ```
+
+`backend` accepts `"cpp"` or `"dsl"`. It is required on SM90 because both
+implementations are available there. It may be omitted on SM8x, which defaults
+to C++, and on SM100+, which defaults to DSL. Unknown backends and
+backend/architecture combinations that are not supported raise an error.
 
 The `*_csr_sparse_auto` functions return the six CSR tensors followed by the
 selected `(Q_BLOCK_SIZE, KV_BLOCK_SIZE)`:
@@ -382,6 +390,7 @@ q2k_auto = create_block_mask_cuda.create_q2k_csr_sparse_auto(
     is_local=False,
     is_arbitrary=True,
     check_q_boundary=True,
+    backend="dsl",
 )
 q2k_csr, fwd_block_size = q2k_auto[:6], tuple(q2k_auto[6:8])
 linear_k = linear_from_csr_tuple(q2k_csr, fwd_block_size)
@@ -393,6 +402,7 @@ k2q_auto = create_block_mask_cuda.create_k2q_csr_sparse_auto(
     head_dim,
     is_arbitrary=True,
     headdim_v=head_dim_v,
+    backend="dsl",
 )
 k2q_csr, bwd_block_size = k2q_auto[:6], tuple(k2q_auto[6:8])
 linear_q = linear_from_csr_tuple(k2q_csr, bwd_block_size)
@@ -462,10 +472,11 @@ C++ CSR notes:
   `FLASH_ATTENTION_NUM_FUNC` value.
 - Enable the head dimensions you need with `HDIM64/96/128/192/256`; defaults
   only enable `HDIM128`.
-- Use explicit CSR block sizes that match `hopper/tile_size.h`. The
-  `create_block_mask_cuda.get_*_tile_sizes` and `*_csr_sparse_auto` helpers in
-  this branch mirror the CuTe FA4 Python tile selection, not the C++ `hopper/`
-  tile table.
+- On SM90, pass `backend="cpp"` to
+  `create_block_mask_cuda.get_*_tile_sizes` or `*_csr_sparse_auto` so CSR
+  generation uses the `hopper/tile_size.h` configuration. The forward query
+  currently assumes `head_dim_v == head_dim`, 16-bit input, and row-major V;
+  use explicit block sizes for other C++ forward configurations.
 - Forward expects Q2K CSR tensors indexed by Q blocks. Backward expects K2Q CSR
   tensors indexed by KV blocks.
 

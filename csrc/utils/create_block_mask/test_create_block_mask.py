@@ -408,6 +408,109 @@ def test_sm100_k2q_auto_tile_sizes(headdim, headdim_v, expected):
 
 @pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
 @pytest.mark.parametrize("arch", [80, 86, 89])
+@pytest.mark.parametrize("headdim", [64, 96, 128, 192, 256])
+def test_sm8x_q2k_auto_tile_sizes(arch, headdim):
+    rounded_headdim = create_block_mask_cuda.round_up_hopper_headdim(headdim)
+    if rounded_headdim <= 64:
+        expected = (128, 96)
+    elif rounded_headdim <= 96:
+        expected = (128, 48)
+    elif rounded_headdim <= 128:
+        expected = (128, 96) if arch in (86, 89) else (128, 48)
+    elif rounded_headdim <= 192:
+        expected = (128, 64)
+    else:
+        expected = (128, 48) if arch in (86, 89) else (128, 64)
+    assert create_block_mask_cuda.get_fwd_tile_sizes(
+        headdim,
+        is_arbitrary=True,
+        arch=arch,
+    ) == expected
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("query_name", ["get_fwd_tile_sizes", "get_bwd_tile_sizes"])
+@pytest.mark.parametrize("backend", [None, ""])
+def test_sm90_tile_backend_is_required(query_name, backend):
+    query = getattr(create_block_mask_cuda, query_name)
+    with pytest.raises(RuntimeError, match=r"backend is required for SM90"):
+        query(
+            128,
+            is_arbitrary=True,
+            arch=90,
+            backend=backend,
+        )
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("query_name", ["get_fwd_tile_sizes", "get_bwd_tile_sizes"])
+@pytest.mark.parametrize("arch", [90, 100])
+def test_tile_backend_rejects_unknown_values(query_name, arch):
+    query = getattr(create_block_mask_cuda, query_name)
+    with pytest.raises(RuntimeError, match=r"backend must be 'cpp' or 'dsl'"):
+        query(
+            128,
+            is_arbitrary=True,
+            arch=arch,
+            backend="unknown",
+        )
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize(
+    "arch,backend,error",
+    [
+        (80, "dsl", r"backend='dsl' is not supported on SM80"),
+        (100, "cpp", r"backend='cpp' is not supported on SM100"),
+    ],
+)
+def test_tile_backend_rejects_unsupported_arch_combinations(arch, backend, error):
+    with pytest.raises(RuntimeError, match=error):
+        create_block_mask_cuda.get_fwd_tile_sizes(
+            128,
+            is_arbitrary=True,
+            arch=arch,
+            backend=backend,
+        )
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("backend", ["cpp", "dsl"])
+@pytest.mark.parametrize("headdim", [64, 96, 128, 192, 256])
+def test_sm90_q2k_auto_tile_sizes(headdim, backend):
+    if backend == "cpp":
+        rounded_headdim = create_block_mask_cuda.round_up_hopper_headdim(headdim)
+        expected = (
+            (192, 128)
+            if rounded_headdim <= 96
+            else (128, 128)
+            if rounded_headdim <= 128
+            else (128, 96)
+            if rounded_headdim <= 192
+            else (128, 64)
+        )
+    else:
+        expected = (
+            (192, 128)
+            if headdim <= 64
+            else (192, 144)
+            if headdim <= 96
+            else (128, 128)
+            if headdim <= 128
+            else (128, 112)
+            if headdim <= 192
+            else (128, 80)
+        )
+    assert create_block_mask_cuda.get_fwd_tile_sizes(
+        headdim,
+        is_arbitrary=True,
+        arch=90,
+        backend=backend,
+    ) == expected
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("arch", [80, 86, 89])
 @pytest.mark.parametrize(
     "headdim",
     [
@@ -447,28 +550,76 @@ def test_sm8x_k2q_auto_tile_sizes(arch, headdim):
 
 
 @pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
-@pytest.mark.parametrize("headdim", [64, 96, 128, 192])
-def test_sm90_k2q_auto_tile_sizes(headdim):
-    rounded_headdim = create_block_mask_cuda.round_up_hopper_headdim(headdim)
-    expected = (
-        (128, 128)
-        if rounded_headdim <= 64
-        else (64, 128)
-        if rounded_headdim <= 128
-        else (64, 96)
-        if rounded_headdim <= 192
-        else (64, 80)
-    )
+@pytest.mark.parametrize("backend", ["cpp", "dsl"])
+@pytest.mark.parametrize("headdim", [64, 96, 128, 192, 256])
+def test_sm90_k2q_auto_tile_sizes(headdim, backend):
+    if backend == "cpp":
+        rounded_headdim = create_block_mask_cuda.round_up_hopper_headdim(headdim)
+        expected = (
+            (128, 128)
+            if rounded_headdim <= 64
+            else (64, 128)
+            if rounded_headdim <= 128
+            else (64, 96)
+            if rounded_headdim <= 192
+            else (64, 80)
+        )
+    else:
+        expected = (
+            (128, 128)
+            if headdim <= 128
+            else (128, 96)
+            if headdim <= 192
+            else (128, 64)
+        )
     assert create_block_mask_cuda.get_bwd_tile_sizes(
         headdim,
         is_arbitrary=True,
         arch=90,
+        backend=backend,
     ) == expected
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+def test_q2k_auto_csr_uses_queried_tile_sizes():
+    q_len, kv_len, headdim = 257, 289, 128
+    arch = create_block_mask_cuda.get_gpu_arch()
+    backend = "cpp" if arch == 90 else None
+    func_tensor = torch.full(
+        (1, 1, 1, q_len + 256),
+        kv_len,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    result = create_block_mask_cuda.create_q2k_csr_sparse_auto(
+        func_tensor,
+        q_len,
+        kv_len,
+        headdim,
+        is_arbitrary=True,
+        check_q_boundary=True,
+        backend=backend,
+    )
+    queried_tile = create_block_mask_cuda.get_fwd_tile_sizes(
+        headdim,
+        is_arbitrary=True,
+        backend=backend,
+    )
+    assert result[-2:] == queried_tile
+    mask_cnt, mask_offset, _, full_cnt, full_offset, _, block_m, _ = result
+    assert mask_cnt.shape == full_cnt.shape == (
+        1,
+        1,
+        math.ceil(q_len / block_m),
+    )
+    assert mask_offset.numel() == full_offset.numel() == mask_cnt.numel() + 1
 
 
 @pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
 def test_k2q_auto_csr_uses_queried_tile_sizes():
     q_len, kv_len, headdim = 257, 289, 128
+    arch = create_block_mask_cuda.get_gpu_arch()
+    backend = "cpp" if arch == 90 else None
     func_tensor = torch.full(
         (1, 1, 1, q_len + 256),
         kv_len,
@@ -481,10 +632,12 @@ def test_k2q_auto_csr_uses_queried_tile_sizes():
         kv_len,
         headdim,
         is_arbitrary=True,
+        backend=backend,
     )
     queried_tile = create_block_mask_cuda.get_bwd_tile_sizes(
         headdim,
         is_arbitrary=True,
+        backend=backend,
     )
     assert result[-2:] == queried_tile
     mask_cnt, mask_offset, _, full_cnt, full_offset, _, _, block_n = result
@@ -494,6 +647,91 @@ def test_k2q_auto_csr_uses_queried_tile_sizes():
         math.ceil(kv_len / block_n),
     )
     assert mask_offset.numel() == full_offset.numel() == mask_cnt.numel() + 1
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize(
+    "auto_name",
+    ["create_q2k_csr_sparse_auto", "create_k2q_csr_sparse_auto"],
+)
+def test_sm90_auto_csr_backend_is_required(auto_name):
+    if create_block_mask_cuda.get_gpu_arch() != 90:
+        pytest.skip("SM90 auto backend validation requires an SM90 GPU")
+    q_len, kv_len, headdim = 65, 97, 128
+    func_tensor = torch.full(
+        (1, 1, 1, q_len + 256),
+        kv_len,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    auto = getattr(create_block_mask_cuda, auto_name)
+    with pytest.raises(RuntimeError, match=r"backend is required for SM90"):
+        auto(func_tensor, q_len, kv_len, headdim)
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("backend", ["cpp", "dsl"])
+def test_sm90_q2k_auto_csr_forwards_backend(backend):
+    if create_block_mask_cuda.get_gpu_arch() != 90:
+        pytest.skip("SM90 auto backend dispatch requires an SM90 GPU")
+    q_len, kv_len, headdim = 193, 257, 96
+    func_tensor = torch.full(
+        (1, 1, 1, q_len + 256),
+        kv_len,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    result = create_block_mask_cuda.create_q2k_csr_sparse_auto(
+        func_tensor,
+        q_len,
+        kv_len,
+        headdim,
+        is_arbitrary=True,
+        check_q_boundary=True,
+        backend=backend,
+    )
+    assert result[-2:] == create_block_mask_cuda.get_fwd_tile_sizes(
+        headdim,
+        is_arbitrary=True,
+        arch=90,
+        backend=backend,
+    )
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("backend", ["cpp", "dsl"])
+def test_sm90_k2q_auto_csr_forwards_backend(backend):
+    if create_block_mask_cuda.get_gpu_arch() != 90:
+        pytest.skip("SM90 auto backend dispatch requires an SM90 GPU")
+    q_len, kv_len, headdim = 193, 257, 256
+    func_tensor = torch.full(
+        (1, 1, 1, q_len + 256),
+        kv_len,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    result = create_block_mask_cuda.create_k2q_csr_sparse_auto(
+        func_tensor,
+        q_len,
+        kv_len,
+        headdim,
+        is_arbitrary=True,
+        headdim_v=headdim,
+        backend=backend,
+    )
+    assert result[-2:] == create_block_mask_cuda.get_bwd_tile_sizes(
+        headdim,
+        is_arbitrary=True,
+        arch=90,
+        headdim_v=headdim,
+        backend=backend,
+    )
+    mask_cnt, _, _, full_cnt, _, _, _, block_n = result
+    assert mask_cnt.shape == full_cnt.shape == (
+        1,
+        1,
+        math.ceil(kv_len / block_n),
+    )
 
 
 # =============================================================================
