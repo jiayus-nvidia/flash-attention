@@ -1,6 +1,10 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <optional>
+#include <string>
+
+#include <pybind11/stl.h>
 
 #include "create_block_mask.h"
 #include "../../../hopper/tile_size.h"
@@ -9,8 +13,12 @@
 
 // ============================================================================
 // Tile size computation helpers
-// Hopper C++ kernels use hopper/tile_size.h as the single source of truth.
 // ============================================================================
+
+enum class TileBackend {
+    Cpp,
+    Dsl,
+};
 
 /**
  * Get GPU architecture as int (80, 86, 89, 90, 100, etc.)
@@ -21,6 +29,49 @@ inline int get_gpu_arch() {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device);
     return prop.major * 10 + prop.minor;
+}
+
+inline bool is_sm90_arch(int arch) {
+    return arch >= 90 && arch < 100;
+}
+
+/**
+ * Resolve the backend used to construct CSR block sizes.
+ *
+ * SM8x only has the C++ arbitrary-CSR backend and SM100+ only has the DSL
+ * arbitrary-CSR backend, so backend can be omitted there. SM90 supports both
+ * implementations and therefore requires an explicit choice.
+ */
+inline TileBackend resolve_tile_backend(
+    int arch,
+    const std::optional<std::string>& backend
+) {
+    if (!backend.has_value() || backend->empty()) {
+        TORCH_CHECK(
+            !is_sm90_arch(arch),
+            "backend is required for SM90; pass backend='cpp' or backend='dsl'"
+        );
+        return arch < 90 ? TileBackend::Cpp : TileBackend::Dsl;
+    }
+
+    TORCH_CHECK(
+        *backend == "cpp" || *backend == "dsl",
+        "backend must be 'cpp' or 'dsl', got '", *backend, "'"
+    );
+    TileBackend const resolved =
+        *backend == "cpp" ? TileBackend::Cpp : TileBackend::Dsl;
+
+    TORCH_CHECK(
+        !(arch < 90 && resolved == TileBackend::Dsl),
+        "backend='dsl' is not supported on SM", arch,
+        "; use backend='cpp' or omit backend"
+    );
+    TORCH_CHECK(
+        !(arch >= 100 && resolved == TileBackend::Cpp),
+        "backend='cpp' is not supported on SM", arch,
+        "; use backend='dsl' or omit backend"
+    );
+    return resolved;
 }
 
 /**
@@ -46,6 +97,48 @@ inline int round_up_hopper_headdim(int head_size) {
 }
 
 /**
+ * CuTeDSL SM90 forward CSR block-size selection.
+ *
+ * This mirrors flash_attn/cute/interface.py::_tile_size_fwd_sm90 for the
+ * inputs currently exposed by this extension. The public API does not yet
+ * expose head_dim_v or sparse_block_size_q.
+ */
+inline std::pair<int, int> get_fwd_tile_sizes_sm90_dsl(
+    int headdim,
+    bool is_causal,
+    bool is_local
+) {
+    if (headdim <= 64) {
+        return {192, 128};
+    } else if (headdim <= 96) {
+        return {192, (is_causal || is_local) ? 128 : 144};
+    } else if (headdim <= 128) {
+        return {128, 128};
+    } else if (headdim <= 192) {
+        return {128, is_local ? 96 : 112};
+    } else {
+        return {128, is_local ? 64 : 80};
+    }
+}
+
+/**
+ * CuTeDSL SM90 backward block sizes used to generate K2Q CSR.
+ *
+ * The CSR sparse Q block is 128 rows and may cover multiple compute tiles.
+ * This matches the explicit SM90 path in docs/usage.md and
+ * tests/cute/test_arbitrary_mask_port.py.
+ */
+inline std::pair<int, int> get_bwd_tile_sizes_sm90_dsl(int headdim) {
+    if (headdim <= 128) {
+        return {128, 128};
+    } else if (headdim <= 192) {
+        return {128, 96};
+    } else {
+        return {128, 64};
+    }
+}
+
+/**
  * Get forward pass tile sizes based on architecture.
  * Uses Hopper C++ tile_size.h for SM8x/SM90 and the FA4 selector contract for
  * Blackwell.
@@ -55,6 +148,7 @@ inline int round_up_hopper_headdim(int head_size) {
  * @param is_causal Whether using causal attention
  * @param is_local Whether using local attention
  * @param is_arbitrary Whether using arbitrary mask
+ * @param backend "cpp" or "dsl"; required for SM90
  *
  * @return Pair of (Q_BLOCK_SIZE, KV_BLOCK_SIZE) for forward pass
  */
@@ -65,16 +159,22 @@ inline std::pair<int, int> get_fwd_tile_sizes(
     bool is_local = false,
     bool is_arbitrary = false,
     bool paged_kv = false,
-    bool varlen_and_split = false
+    bool varlen_and_split = false,
+    std::optional<std::string> backend = std::nullopt
 ) {
     if (arch < 0) {
         arch = get_gpu_arch();
     }
+    TileBackend const resolved_backend = resolve_tile_backend(arch, backend);
     int const hopper_rounded_headdim = round_up_hopper_headdim(headdim);
 
     if (arch >= 100) {
         return {128, 128};
     } else if (arch >= 90) {
+        if (resolved_backend == TileBackend::Dsl) {
+            return get_fwd_tile_sizes_sm90_dsl(
+                headdim, is_causal, is_local);
+        }
         auto const tile = tile_size_fwd_sm90(
             hopper_rounded_headdim,
             hopper_rounded_headdim,
@@ -112,6 +212,7 @@ inline std::pair<int, int> get_fwd_tile_sizes(
  * @param is_arbitrary Whether using arbitrary mask
  * @param has_softcap Whether using softcap
  * @param headdim_v Value head dimension; negative means the same as headdim
+ * @param backend "cpp" or "dsl"; required for SM90
  *
  * @return Pair of (Q_BLOCK_SIZE, KV_BLOCK_SIZE) for backward pass
  */
@@ -122,11 +223,13 @@ inline std::pair<int, int> get_bwd_tile_sizes(
     bool is_local = false,
     bool is_arbitrary = false,
     bool has_softcap = false,
-    int headdim_v = -1
+    int headdim_v = -1,
+    std::optional<std::string> backend = std::nullopt
 ) {
     if (arch < 0) {
         arch = get_gpu_arch();
     }
+    TileBackend const resolved_backend = resolve_tile_backend(arch, backend);
 
     if (headdim_v < 0) {
         headdim_v = headdim;
@@ -149,6 +252,9 @@ inline std::pair<int, int> get_bwd_tile_sizes(
     } else if (arch >= 120) {
         return {128, 128};
     } else if (arch >= 90) {
+        if (resolved_backend == TileBackend::Dsl) {
+            return get_bwd_tile_sizes_sm90_dsl(headdim);
+        }
         // Hopper C++ kernels round and specialize on max(Q/K dim, V dim).
         // Keep this selector identical to hopper/tile_size.h, including the
         // arbitrary/softcap cases that use a smaller M tile.
@@ -616,6 +722,7 @@ create_k2q_csr_sparse_from_func(
  * @param is_local: whether using local attention
  * @param is_arbitrary: whether using arbitrary mask (default: true since using func_tensor)
  * @param check_q_boundary: if true, partial q_blocks cannot have FULL kv_blocks
+ * @param backend: "cpp" or "dsl"; required on SM90
  *
  * @return tuple of (mask_block_cnt, mask_block_offset, mask_block_idx,
  *                   full_block_cnt, full_block_offset, full_block_idx,
@@ -630,15 +737,22 @@ create_q2k_csr_sparse_auto(
     bool is_causal = false,
     bool is_local = false,
     bool is_arbitrary = true,
-    bool check_q_boundary = false
+    bool check_q_boundary = false,
+    std::optional<std::string> backend = std::nullopt
 ) {
+    TORCH_CHECK(func_tensor.is_cuda(), "func_tensor must be a CUDA tensor");
+    at::cuda::CUDAGuard device_guard(func_tensor.device());
+
     // Auto-detect tile sizes
     auto [Q_BLOCK_SIZE, KV_BLOCK_SIZE] = get_fwd_tile_sizes(
         -1,  // auto-detect arch
         headdim,
         is_causal,
         is_local,
-        is_arbitrary
+        is_arbitrary,
+        /*paged_kv=*/false,
+        /*varlen_and_split=*/false,
+        backend
     );
 
     // Create CSR sparse tensors
@@ -668,6 +782,7 @@ create_q2k_csr_sparse_auto(
  * @param is_local: whether using local attention
  * @param is_arbitrary: whether using arbitrary mask (default: true since using func_tensor)
  * @param has_softcap: whether using softcap
+ * @param backend: "cpp" or "dsl"; required on SM90
  *
  * @return tuple of (mask_block_cnt, mask_block_offset, mask_block_idx,
  *                   full_block_cnt, full_block_offset, full_block_idx,
@@ -683,7 +798,8 @@ create_k2q_csr_sparse_auto(
     bool is_local = false,
     bool is_arbitrary = true,
     bool has_softcap = false,
-    int headdim_v = -1
+    int headdim_v = -1,
+    std::optional<std::string> backend = std::nullopt
 ) {
     TORCH_CHECK(func_tensor.is_cuda(), "func_tensor must be a CUDA tensor");
     at::cuda::CUDAGuard device_guard(func_tensor.device());
@@ -696,7 +812,8 @@ create_k2q_csr_sparse_auto(
         is_local,
         is_arbitrary,
         has_softcap,
-        headdim_v
+        headdim_v,
+        backend
     );
 
     // Create CSR sparse tensors
@@ -720,10 +837,18 @@ std::tuple<int, int> py_get_fwd_tile_sizes(
     bool is_causal = false,
     bool is_local = false,
     bool is_arbitrary = true,
-    int arch = -1
+    int arch = -1,
+    std::optional<std::string> backend = std::nullopt
 ) {
     auto [Q_BLOCK_SIZE, KV_BLOCK_SIZE] = get_fwd_tile_sizes(
-        arch, headdim, is_causal, is_local, is_arbitrary);
+        arch,
+        headdim,
+        is_causal,
+        is_local,
+        is_arbitrary,
+        /*paged_kv=*/false,
+        /*varlen_and_split=*/false,
+        backend);
     return std::make_tuple(Q_BLOCK_SIZE, KV_BLOCK_SIZE);
 }
 
@@ -737,10 +862,18 @@ std::tuple<int, int> py_get_bwd_tile_sizes(
     bool is_arbitrary = true,
     bool has_softcap = false,
     int arch = -1,
-    int headdim_v = -1
+    int headdim_v = -1,
+    std::optional<std::string> backend = std::nullopt
 ) {
     auto [Q_BLOCK_SIZE, KV_BLOCK_SIZE] = get_bwd_tile_sizes(
-        arch, headdim, is_causal, is_local, is_arbitrary, has_softcap, headdim_v);
+        arch,
+        headdim,
+        is_causal,
+        is_local,
+        is_arbitrary,
+        has_softcap,
+        headdim_v,
+        backend);
     return std::make_tuple(Q_BLOCK_SIZE, KV_BLOCK_SIZE);
 }
 
@@ -836,7 +969,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("create_q2k_csr_sparse_auto", &create_q2k_csr_sparse_auto,
           "Q2K CSR Auto (Forward): Convert with AUTOMATIC tile size detection.\n\n"
           "RECOMMENDED: This function automatically detects GPU architecture and "
-          "computes the correct tile sizes based on headdim and mask configuration.\n\n"
+          "computes the correct tile sizes based on headdim and mask configuration. "
+          "backend must be 'cpp' or 'dsl' on SM90; it can be omitted on other architectures.\n\n"
           "Returns (mask_block_cnt, mask_block_offset, mask_block_idx, "
           "full_block_cnt, full_block_offset, full_block_idx, Q_BLOCK_SIZE, KV_BLOCK_SIZE).",
           py::arg("func_tensor"),
@@ -846,12 +980,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("is_causal") = false,
           py::arg("is_local") = false,
           py::arg("is_arbitrary") = true,
-          py::arg("check_q_boundary") = false);
+          py::arg("check_q_boundary") = false,
+          py::arg("backend") = py::none());
 
     m.def("create_k2q_csr_sparse_auto", &create_k2q_csr_sparse_auto,
           "K2Q CSR Auto (Backward): Convert with AUTOMATIC tile size detection.\n\n"
           "RECOMMENDED: This function automatically detects GPU architecture and "
-          "computes the correct tile sizes based on headdim and mask configuration.\n\n"
+          "computes the correct tile sizes based on headdim and mask configuration. "
+          "backend must be 'cpp' or 'dsl' on SM90; it can be omitted on other architectures.\n\n"
           "Returns (mask_block_cnt, mask_block_offset, mask_block_idx, "
           "full_block_cnt, full_block_offset, full_block_idx, Q_BLOCK_SIZE, KV_BLOCK_SIZE).",
           py::arg("func_tensor"),
@@ -862,7 +998,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("is_local") = false,
           py::arg("is_arbitrary") = true,
           py::arg("has_softcap") = false,
-          py::arg("headdim_v") = -1);
+          py::arg("headdim_v") = -1,
+          py::arg("backend") = py::none());
 
     // ========================================================================
     // Helper functions for tile size queries
@@ -870,23 +1007,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("get_fwd_tile_sizes", &py_get_fwd_tile_sizes,
           "Get forward pass tile sizes (Q_BLOCK_SIZE, KV_BLOCK_SIZE) based on configuration.\n\n"
-          "Use this result when constructing Q2K CSR metadata for the selected backend.",
+          "Use this result when constructing Q2K CSR metadata for the selected backend. "
+          "backend must be 'cpp' or 'dsl' on SM90; it can be omitted on other architectures.",
           py::arg("headdim"),
           py::arg("is_causal") = false,
           py::arg("is_local") = false,
           py::arg("is_arbitrary") = true,
-          py::arg("arch") = -1);
+          py::arg("arch") = -1,
+          py::arg("backend") = py::none());
 
     m.def("get_bwd_tile_sizes", &py_get_bwd_tile_sizes,
           "Get backward pass tile sizes (Q_BLOCK_SIZE, KV_BLOCK_SIZE) based on configuration.\n\n"
-          "Use this result when constructing K2Q CSR metadata for the selected backend.",
+          "Use this result when constructing K2Q CSR metadata for the selected backend. "
+          "backend must be 'cpp' or 'dsl' on SM90; it can be omitted on other architectures.",
           py::arg("headdim"),
           py::arg("is_causal") = false,
           py::arg("is_local") = false,
           py::arg("is_arbitrary") = true,
           py::arg("has_softcap") = false,
           py::arg("arch") = -1,
-          py::arg("headdim_v") = -1);
+          py::arg("headdim_v") = -1,
+          py::arg("backend") = py::none());
 
     m.def("get_gpu_arch", &py_get_gpu_arch,
           "Get GPU architecture as int (e.g., 80, 86, 89, 90, 100).");

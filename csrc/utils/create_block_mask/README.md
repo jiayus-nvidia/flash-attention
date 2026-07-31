@@ -81,3 +81,30 @@ Use `create_q2k_csr_sparse_auto` and `create_k2q_csr_sparse_auto` to get the
 selected tile sizes back with the CSR tensors. Pass `headdim_v` to the backward
 helper when it differs from `headdim`; the default SM100/SM110 2-CTA linear CSR
 paths for `128/128` and `192/128` use K2Q blocks of `128x256`.
+
+All public APIs that query tile sizes accept an optional `backend` argument:
+
+```text
+get_fwd_tile_sizes(..., backend=None)
+get_bwd_tile_sizes(..., backend=None)
+create_q2k_csr_sparse_auto(..., backend=None)
+create_k2q_csr_sparse_auto(..., backend=None)
+```
+
+On SM90, both the Hopper C++ and CuTeDSL implementations are available, so
+`backend` is required and must be either `"cpp"` or `"dsl"`. On SM8x the
+backend defaults to C++, and on SM100+ it defaults to DSL.
+
+```python
+fwd_block_size = create_block_mask_cuda.get_fwd_tile_sizes(
+    headdim,
+    is_arbitrary=True,
+    backend="cpp",  # Hopper C++ on SM90
+)
+bwd_block_size = create_block_mask_cuda.get_bwd_tile_sizes(
+    headdim,
+    is_arbitrary=True,
+    headdim_v=headdim_v,
+    backend="cpp",
+)
+```
