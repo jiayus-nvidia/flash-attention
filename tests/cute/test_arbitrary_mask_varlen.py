@@ -17,6 +17,7 @@ from flash_attn_cute.sm90_bwd_config import (
     sm90_native_bwd_can_implement,
 )
 from flash_attn_cute.sm90_fwd_config import (
+    _num_sm90_fwd_mask_payload_groups,
     resolve_sm90_fwd_consumer_config,
     sm90_native_fwd_can_implement,
 )
@@ -113,6 +114,102 @@ def _resolve_fwd_config(
         hmask=1,
         pack_gqa=pack_gqa,
     )
+
+
+def _mask_payload_group_idx(consumer_tidx, qratio):
+    warp_group_idx, tidx_in_warp_group = divmod(consumer_tidx, 128)
+    a = tidx_in_warp_group % 4
+    b = tidx_in_warp_group // 4 % 8
+    c = tidx_in_warp_group // 32
+    if qratio <= 8:
+        return (
+            warp_group_idx * (128 // qratio) + c * (32 // qratio) + b // qratio * 4 + a
+        )
+    logical_q = (warp_group_idx * 64 + c * 16 + b) // qratio
+    return logical_q * 4 + a
+
+
+def _mask_payload_representative_tidx(group_idx, qratio):
+    a = group_idx % 4
+    if qratio <= 8:
+        groups_per_warp_group = 128 // qratio
+        warp_group_idx, group_in_warp_group = divmod(group_idx, groups_per_warp_group)
+        c, group_in_c = divmod(group_in_warp_group, 32 // qratio)
+        b = group_in_c // 4 * qratio
+        return warp_group_idx * 128 + c * 32 + b * 4 + a
+    logical_q = group_idx // 4
+    physical_q = logical_q * qratio
+    warp_group_idx, q_in_warp_group = divmod(physical_q, 64)
+    c = q_in_warp_group // 16
+    return warp_group_idx * 128 + c * 32 + a
+
+
+def _wgmma_logical_qk_signature(consumer_tidx, tile_n, qratio):
+    warp_group_idx, tidx_in_warp_group = divmod(consumer_tidx, 128)
+    a = tidx_in_warp_group % 4
+    b = tidx_in_warp_group // 4 % 8
+    c = tidx_in_warp_group // 32
+    row_base = warp_group_idx * 64 + c * 16 + b
+    values_per_thread = 64 * tile_n // 128
+    signature = []
+    for value_idx in range(values_per_thread):
+        col_pair = value_idx % 2
+        row_pair = value_idx // 2 % 2
+        col_group = value_idx // 4
+        row = row_base + row_pair * 8
+        col = a * 2 + col_pair + col_group * 8
+        signature.append((row // qratio, col))
+    return tuple(signature)
+
+
+def _reference_pack_gqa_payload(plan, func, q_len, k_len, config):
+    qratio = config.qhead_per_kvhead
+    func_cpu = func.cpu()
+    expected = torch.zeros(
+        (
+            plan.mask_block_idx.numel(),
+            1,
+            config.num_mma_threads,
+            config.payload_padded_words,
+        ),
+        dtype=torch.uint32,
+    )
+    offsets = plan.mask_block_offset.cpu()
+    block_indices = plan.mask_block_idx.cpu()
+    for plan_row in range(plan.mask_block_cnt.numel()):
+        for payload_idx in range(int(offsets[plan_row]), int(offsets[plan_row + 1])):
+            n_block = int(block_indices[payload_idx])
+            for consumer_tidx in range(config.num_mma_threads):
+                warp_group_idx, tidx_in_warp_group = divmod(consumer_tidx, 128)
+                a = tidx_in_warp_group % 4
+                b = tidx_in_warp_group // 4 % 8
+                c = tidx_in_warp_group // 32
+                row_base = warp_group_idx * 64 + c * 16 + b
+                packed_words = [0] * config.payload_padded_words
+                for value_idx in range(config.payload_values_per_thread):
+                    col_pair = value_idx % 2
+                    row_pair = value_idx // 2 % 2
+                    col_group = value_idx // 4
+                    physical_q = plan_row * config.tile_m + row_base + row_pair * 8
+                    q_local = physical_q // qratio
+                    k_local = n_block * config.tile_n + a * 2 + col_pair + col_group * 8
+                    keep = False
+                    if physical_q < q_len * qratio and k_local < k_len:
+                        interval_begin = 0
+                        for endpoint_idx in range(0, func_cpu.shape[1], 2):
+                            interval_end = int(func_cpu[0, endpoint_idx, q_local])
+                            if interval_begin <= k_local < interval_end:
+                                keep = True
+                            if endpoint_idx + 1 < func_cpu.shape[1]:
+                                interval_begin = int(
+                                    func_cpu[0, endpoint_idx + 1, q_local]
+                                )
+                    if keep:
+                        word_idx, bit_idx = divmod(value_idx, 32)
+                        packed_words[word_idx] |= 1 << bit_idx
+                for word_idx, packed in enumerate(packed_words):
+                    expected[payload_idx, 0, consumer_tidx, word_idx] = packed
+    return expected
 
 
 def _assert_compact_bwd_plan_invariants(plan):
@@ -335,6 +432,105 @@ def test_varlen_arbitrary_mask_plan_compile_keys_only_specialize_generated_layou
     assert dv128.topology_planner_compile_key == fp16.topology_planner_compile_key
     assert dv128.payload_planner_compile_key != fp16.payload_planner_compile_key
     assert dv128.topology_planner_compile_key != packed.topology_planner_compile_key
+
+
+@pytest.mark.parametrize("tile_m", [128, 192])
+def test_sm90_arbitrary_mask_pack_gqa_payload_groups_match_wgmma_layout(tile_m):
+    num_mma_threads = tile_m * 2
+    for qratio in (1, 2, 4, 8, 16, 32, 64, 128):
+        if tile_m % qratio != 0:
+            continue
+        num_groups = _num_sm90_fwd_mask_payload_groups(
+            num_mma_threads=num_mma_threads,
+            qhead_per_kvhead=qratio,
+            pack_gqa=True,
+        )
+        expected_compression = qratio if qratio <= 8 else qratio // 2
+        assert num_groups * expected_compression == num_mma_threads
+
+        groups = [[] for _ in range(num_groups)]
+        for consumer_tidx in range(num_mma_threads):
+            group_idx = _mask_payload_group_idx(consumer_tidx, qratio)
+            assert 0 <= group_idx < num_groups
+            groups[group_idx].append(consumer_tidx)
+
+        for group_idx, members in enumerate(groups):
+            representative_tidx = _mask_payload_representative_tidx(group_idx, qratio)
+            assert representative_tidx in members
+            representative_signature = _wgmma_logical_qk_signature(
+                representative_tidx, 128, qratio
+            )
+            assert all(
+                _wgmma_logical_qk_signature(tidx, 128, qratio)
+                == representative_signature
+                for tidx in members
+            )
+
+
+@pytest.mark.parametrize(
+    "head_dim,num_q_heads,num_kv_heads,requested_pack_gqa,expected_pack_gqa,error",
+    [
+        (128, 4, 1, None, True, None),
+        (128, 6, 1, None, False, None),
+        (128, 6, 1, True, None, "power of two"),
+        (64, 128, 1, None, False, None),
+        (64, 128, 1, True, None, "divisible by qratio"),
+        (128, 4, 1, False, False, None),
+    ],
+)
+def test_sm90_arbitrary_mask_pack_gqa_resolution(
+    head_dim,
+    num_q_heads,
+    num_kv_heads,
+    requested_pack_gqa,
+    expected_pack_gqa,
+    error,
+):
+    kwargs = dict(
+        arch=90,
+        dtype=torch.bfloat16,
+        head_dim=head_dim,
+        head_dim_v=128,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        is_varlen=True,
+        hmask=1,
+        pack_gqa=requested_pack_gqa,
+    )
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            resolve_sm90_fwd_consumer_config(**kwargs)
+    else:
+        assert resolve_sm90_fwd_consumer_config(**kwargs).pack_gqa is expected_pack_gqa
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90-only test")
+def test_fixed_arbitrary_mask_pack_gqa_payload_matches_per_thread_layout():
+    torch.manual_seed(0)
+    q_len, k_len, hq, hkv, head_dim = 65, 289, 4, 1, 128
+    q = torch.randn(1, q_len, hq, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, k_len, hkv, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    func = torch.zeros(1, 3, q_len + 256, dtype=torch.int32, device="cuda")
+    q_idx = torch.arange(q_len, dtype=torch.int32, device="cuda")
+    func[0, 0, :q_len] = q_idx + 1
+    func[0, 1, :q_len] = 128
+    func[0, 2, :q_len] = 256 + q_idx % 33
+
+    plan = create_arbitrary_block_sparse_tensors(func, q, k, v, pack_gqa=True)
+    config = _resolve_fwd_config(pack_gqa=True)
+    assert plan.mask_block_masks.shape[2] == config.num_mask_payload_groups
+    assert plan.mask_block_masks.shape[2] * 4 == config.num_mma_threads
+
+    group_indices = torch.tensor(
+        [
+            _mask_payload_group_idx(consumer_tidx, config.qhead_per_kvhead)
+            for consumer_tidx in range(config.num_mma_threads)
+        ],
+    )
+    expanded = plan.mask_block_masks.cpu()[:, :, group_indices, :]
+    expected = _reference_pack_gqa_payload(plan, func, q_len, k_len, config)
+    assert torch.equal(expanded, expected)
 
 
 @pytest.mark.parametrize(

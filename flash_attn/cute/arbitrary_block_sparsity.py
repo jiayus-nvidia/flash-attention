@@ -19,6 +19,7 @@ from flash_attn_cute.cache_utils import get_jit_cache
 from flash_attn_cute.cute_dsl_utils import to_cute_tensor
 from flash_attn_cute.sm90_fwd_config import (
     _ResolvedSm90FwdConsumerConfig,
+    _sm90_fwd_mask_payload_representative_tidx,
     make_sm90_fwd_tiled_mma_qk,
     resolve_sm90_fwd_consumer_config,
 )
@@ -69,6 +70,10 @@ class _ResolvedSm90BwdTopologyConfig:
 
     @property
     def num_mma_threads(self) -> int:
+        return self.consumer.num_mma_threads
+
+    @property
+    def num_mask_payload_groups(self) -> int:
         return self.consumer.num_mma_threads
 
     @property
@@ -136,7 +141,9 @@ class _ArbitraryPlanCommonSm90:
         self.tile_n = config.tile_n
         self.pack_gqa = config.pack_gqa
         self.qhead_per_kvhead = config.qhead_per_kvhead
+        self.payload_qhead_per_kvhead = config.qhead_per_kvhead if config.pack_gqa else 1
         self.num_mma_threads = config.num_mma_threads
+        self.num_mask_payload_groups = config.num_mask_payload_groups
         self.payload_values_per_thread = config.payload_values_per_thread
         self.payload_valid_words = config.payload_valid_words
         self.payload_padded_words = config.payload_padded_words
@@ -432,8 +439,15 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
             mCuSeqlensK,
             mCuTotalMBlocks,
         )
-        q_global, _, q_valid = self._physical_q_info(local_m_block, tidx, q_begin, q_len)
-        q_valid = q_valid & valid_m_block & (tidx < Int32(self.tile_m))
+        logical_q_rows = self.tile_m // self.payload_qhead_per_kvhead
+        physical_row = tidx * Int32(self.payload_qhead_per_kvhead)
+        q_global, _, q_valid = self._physical_q_info(
+            local_m_block,
+            physical_row,
+            q_begin,
+            q_len,
+        )
+        q_valid = q_valid & valid_m_block & (tidx < Int32(logical_q_rows))
 
         if q_valid:
             previous_begin = Int32(-1)
@@ -473,23 +487,29 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
                     )
 
         smem = cutlass_utils.SmemAllocator()
-        sWarpVisible = smem.allocate_tensor(
-            element_type=Uint32,
+        sWarpPartial = smem.allocate_tensor(
+            element_type=Int32,
             layout=cute.make_layout((8,)),
             byte_alignment=16,
         )
         sWarpFull = smem.allocate_tensor(
-            element_type=Uint32,
+            element_type=Int32,
+            layout=cute.make_layout((8,)),
+            byte_alignment=16,
+        )
+        sWarpAnchor = smem.allocate_tensor(
+            element_type=Int32,
             layout=cute.make_layout((8,)),
             byte_alignment=16,
         )
         cute.arch.sync_threads()
 
-        partial_count = Int32(0)
-        full_count = Int32(0)
-        anchor_full_word = Int32(0)
-        anchor_full_mask = Uint32(0)
-        word_idx = Int32(0)
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        warp_partial_count = Int32(0)
+        warp_full_count = Int32(0)
+        warp_anchor_full = Int32(-1)
+        word_idx = warp_idx
         num_words = cute.ceil_div(max_n_blocks, 32)
         while word_idx < num_words:
             candidate_word = Uint32(0)
@@ -501,51 +521,65 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
                     (candidate_word & Uint32(1 << bit_idx)) != Uint32(0)
                 )
                 if candidate:
-                    row_visible = Boolean(False)
-                    row_full = Boolean(True)
-                    if q_valid:
-                        row_visible, row_full = self._row_block_state(
-                            mArbitraryFunc,
-                            mask_head,
-                            q_global,
-                            block_id,
-                            nfunc,
-                            k_begin,
-                            k_len,
-                            total_k,
+                    lane_visible = Boolean(False)
+                    lane_full = Boolean(True)
+                    logical_row = lane_idx
+                    while logical_row < Int32(logical_q_rows):
+                        row_in_tile = logical_row * Int32(self.payload_qhead_per_kvhead)
+                        row_q_global, _, row_q_valid = self._physical_q_info(
+                            local_m_block,
+                            row_in_tile,
+                            q_begin,
+                            q_len,
                         )
-                    warp_idx = cute.arch.warp_idx()
-                    lane_idx = cute.arch.lane_idx()
-                    warp_visible = cute.arch.vote_ballot_sync(row_visible)
-                    warp_full = cute.arch.vote_ballot_sync(row_full)
+                        if row_q_valid & valid_m_block:
+                            row_visible, row_full = self._row_block_state(
+                                mArbitraryFunc,
+                                mask_head,
+                                row_q_global,
+                                block_id,
+                                nfunc,
+                                k_begin,
+                                k_len,
+                                total_k,
+                            )
+                            lane_visible |= row_visible
+                            lane_full &= row_full
+                        logical_row += Int32(32)
+                    warp_visible = cute.arch.vote_ballot_sync(lane_visible)
+                    warp_full = cute.arch.vote_ballot_sync(lane_full)
                     if lane_idx == Int32(0):
-                        sWarpVisible[warp_idx] = Uint32(warp_visible)
-                        sWarpFull[warp_idx] = Uint32(warp_full)
-                    cute.arch.sync_threads()
-                    if tidx == Int32(0):
-                        any_visible = Uint32(0)
-                        all_full = Uint32(0xFFFF_FFFF)
-                        for warp in cutlass.range_constexpr(8):
-                            any_visible |= sWarpVisible[warp]
-                            all_full &= sWarpFull[warp]
-                        is_full = all_full == Uint32(0xFFFF_FFFF)
+                        is_full = Uint32(warp_full) == Uint32(0xFFFF_FFFF)
                         if (block_id + Int32(1)) * Int32(self.tile_n) > k_len:
                             is_full = Boolean(False)
-                        if any_visible != Uint32(0):
+                        if Uint32(warp_visible) != Uint32(0):
                             if is_full:
                                 mFullBits[mask_head, compact_outer_row, word_idx] |= Uint32(
                                     1 << bit_idx
                                 )
-                                full_count += Int32(1)
-                                anchor_full_word = word_idx
-                                anchor_full_mask = Uint32(1 << bit_idx)
+                                warp_full_count += Int32(1)
+                                warp_anchor_full = block_id
                             else:
-                                partial_count += Int32(1)
-                    cute.arch.sync_threads()
-            word_idx += Int32(1)
+                                warp_partial_count += Int32(1)
+            word_idx += Int32(8)
+
+        if lane_idx == Int32(0):
+            sWarpPartial[warp_idx] = warp_partial_count
+            sWarpFull[warp_idx] = warp_full_count
+            sWarpAnchor[warp_idx] = warp_anchor_full
+        cute.arch.sync_threads()
 
         if tidx == Int32(0) and valid_m_block:
+            partial_count = Int32(0)
+            full_count = Int32(0)
+            anchor_full = Int32(-1)
+            for warp in cutlass.range_constexpr(8):
+                partial_count += sWarpPartial[warp]
+                full_count += sWarpFull[warp]
+                anchor_full = cutlass.max(anchor_full, sWarpAnchor[warp])
             if partial_count == Int32(0) and full_count > Int32(0):
+                anchor_full_word = anchor_full // Int32(32)
+                anchor_full_mask = Uint32(1) << Uint32(anchor_full % Int32(32))
                 mFullBits[mask_head, compact_outer_row, anchor_full_word] &= (
                     Uint32(0xFFFF_FFFF) ^ anchor_full_mask
                 )
@@ -633,8 +667,12 @@ class _ArbitraryPlanMaterializeSm90(_ArbitraryPlanCommonSm90):
         k_len: Int32,
         nfunc: Int32,
     ) -> None:
-        consumer_tidx = planner_tidx
-        while consumer_tidx < Int32(self.num_mma_threads):
+        payload_group_idx = planner_tidx
+        while payload_group_idx < Int32(self.num_mask_payload_groups):
+            consumer_tidx = _sm90_fwd_mask_payload_representative_tidx(
+                payload_group_idx,
+                self.payload_qhead_per_kvhead,
+            )
             thr_mma_qk = tiled_mma_qk.get_slice(consumer_tidx)
             cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
             tScS = thr_mma_qk.partition_C(cS)
@@ -666,7 +704,7 @@ class _ArbitraryPlanMaterializeSm90(_ArbitraryPlanCommonSm90):
                         packed |= Uint32(1) << Uint32(bit_idx)
                 rMask[word_idx] = packed
             mask_iter = mPartialMasks.iterator + cute.crd2idx(
-                (payload_idx, Int32(0), consumer_tidx, Int32(0)),
+                (payload_idx, Int32(0), payload_group_idx, Int32(0)),
                 mPartialMasks.layout,
             )
             mask_ptr = cute.make_ptr(
@@ -680,7 +718,7 @@ class _ArbitraryPlanMaterializeSm90(_ArbitraryPlanCommonSm90):
             )
             gMask = cute.make_tensor(mask_ptr, (self.payload_padded_words,))
             cute.autovec_copy(rMask, gMask)
-            consumer_tidx += Int32(_PLAN_THREADS)
+            payload_group_idx += Int32(_PLAN_THREADS)
 
     @cute.kernel
     def kernel(
@@ -1895,7 +1933,7 @@ def create_arbitrary_block_sparse_tensors(
         (
             partial_nnz,
             fwd_config.physical_subtiles,
-            fwd_config.num_mma_threads,
+            fwd_config.num_mask_payload_groups,
             fwd_config.payload_padded_words,
         ),
         dtype=torch.uint32,

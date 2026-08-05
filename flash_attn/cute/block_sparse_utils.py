@@ -21,6 +21,7 @@ from flash_attn_cute import barrier
 from flash_attn_cute.block_sparsity import BlockSparseTensors
 from flash_attn_cute.named_barrier import NamedBarrierBwd
 from flash_attn_cute.seqlen_info import SeqlenInfoQK
+from flash_attn_cute.sm90_fwd_config import _sm90_fwd_mask_payload_group_idx
 
 
 @dsl_user_op
@@ -314,16 +315,16 @@ def get_curr_arbitrary_block_counts_bwd_sm90(
 def load_packed_mask_payload(
     mask_payloads: Optional[cute.Tensor],
     payload_idx: Int32,
-    consumer_tidx: Int32,
+    payload_group_idx: Int32,
     subtile_idx: Int32 = Int32(0),
     payload_words: cutlass.Constexpr[int] = 4,
 ):
-    """Load one compact per-MMA-thread arbitrary-mask payload."""
+    """Load one compact consumer-native arbitrary-mask payload."""
     if const_expr(mask_payloads is None):
         return None
     payload_alignment = min(16, 4 * (payload_words & -payload_words))
     mask_iter = mask_payloads.iterator + cute.crd2idx(
-        (payload_idx, subtile_idx, consumer_tidx, Int32(0)),
+        (payload_idx, subtile_idx, payload_group_idx, Int32(0)),
         mask_payloads.layout,
     )
     mask_ptr = cute.make_ptr(
@@ -540,7 +541,7 @@ def apply_arbitrary_forward_mask(
     base_mask_fn: Callable,
     mask_payloads: cute.Tensor,
     payload_idx: Int32,
-    consumer_tidx: Int32,
+    payload_group_idx: Int32,
     payload_words: cutlass.Constexpr[int],
     mask_seqlen: cutlass.Constexpr[bool] = True,
     r_bitmask: Optional[cute.Tensor] = None,
@@ -551,7 +552,7 @@ def apply_arbitrary_forward_mask(
         r_bitmask = load_packed_mask_payload(
             mask_payloads,
             payload_idx,
-            consumer_tidx,
+            payload_group_idx,
             payload_words=payload_words,
         )
     base_mask_fn(
@@ -732,7 +733,7 @@ def consume_arbitrary_forward_nonoverlap(
     mma_pv_fn: Callable,
     mma_one_n_block: Callable,
     base_mask_fn: Callable,
-    consumer_tidx: Int32,
+    payload_group_idx: Int32,
     payload_words: cutlass.Constexpr[int],
     warp_scheduler_barrier_sync: Callable,
     warp_scheduler_barrier_arrive: Callable,
@@ -752,7 +753,7 @@ def consume_arbitrary_forward_nonoverlap(
                 base_mask_fn=base_mask_fn,
                 mask_payloads=mask_payloads,
                 payload_idx=payload_idx,
-                consumer_tidx=consumer_tidx,
+                payload_group_idx=payload_group_idx,
                 payload_words=payload_words,
             ),
             is_first_n_block=True,
@@ -768,7 +769,7 @@ def consume_arbitrary_forward_nonoverlap(
                     base_mask_fn=base_mask_fn,
                     mask_payloads=mask_payloads,
                     payload_idx=payload_idx,
-                    consumer_tidx=consumer_tidx,
+                    payload_group_idx=payload_group_idx,
                     payload_words=payload_words,
                 ),
                 is_first_n_block=False,
@@ -799,7 +800,7 @@ def consume_arbitrary_forward_overlap(
     process_last_half_block: Callable,
     base_mask_fn: Callable,
     score_mod_fn: Optional[Callable],
-    consumer_tidx: Int32,
+    payload_group_idx: Int32,
     payload_words: cutlass.Constexpr[int],
 ):
     """Consume anchored partial/full CSR loops with K/V overlap."""
@@ -816,7 +817,7 @@ def consume_arbitrary_forward_overlap(
                 base_mask_fn=base_mask_fn,
                 mask_payloads=mask_payloads,
                 payload_idx=payload_idx,
-                consumer_tidx=consumer_tidx,
+                payload_group_idx=payload_group_idx,
                 payload_words=payload_words,
             ),
             mask_prefetch_fn=None,
@@ -836,7 +837,7 @@ def consume_arbitrary_forward_overlap(
                     base_mask_fn=base_mask_fn,
                     mask_payloads=mask_payloads,
                     payload_idx=payload_idx,
-                    consumer_tidx=consumer_tidx,
+                    payload_group_idx=payload_group_idx,
                     payload_words=payload_words,
                 ),
                 mask_prefetch_fn=None,
@@ -1163,6 +1164,10 @@ def consume_block_sparse_loads(
     processed_any = curr_mask_block_cnt + curr_full_block_cnt > 0
 
     if const_expr(mask_payloads is not None):
+        payload_group_idx = _sm90_fwd_mask_payload_group_idx(
+            consumer_tidx,
+            qhead_per_kvhead,
+        )
         if const_expr(not intra_wg_overlap):
             kv_consumer_state, processed_any = consume_arbitrary_forward_nonoverlap(
                 curr_mask_block_cnt,
@@ -1173,7 +1178,7 @@ def consume_block_sparse_loads(
                 mma_pv_fn,
                 mma_one_n_block,
                 mask_fn,
-                consumer_tidx,
+                payload_group_idx,
                 payload_words,
                 warp_scheduler_barrier_sync,
                 warp_scheduler_barrier_arrive,
@@ -1192,7 +1197,7 @@ def consume_block_sparse_loads(
             process_last_half_block,
             mask_fn,
             score_mod_fn,
-            consumer_tidx,
+            payload_group_idx,
             payload_words,
         )
 

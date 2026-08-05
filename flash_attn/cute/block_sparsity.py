@@ -912,7 +912,7 @@ def normalize_arbitrary_block_sparse_config(
     is_varlen: bool,
     block_size: tuple[int, int],
     pack_gqa: bool,
-    num_mma_threads: int,
+    num_mask_payload_groups: int,
     payload_padded_words: int,
     expected_fixed_total_m_blocks: int | None = None,
 ) -> BlockSparseTensorsTorch:
@@ -979,7 +979,7 @@ def normalize_arbitrary_block_sparse_config(
     expected_payload_shape = (
         tensors.mask_block_idx.numel(),
         1,
-        num_mma_threads,
+        num_mask_payload_groups,
         payload_padded_words,
     )
     if tuple(tensors.mask_block_masks.shape) != expected_payload_shape:

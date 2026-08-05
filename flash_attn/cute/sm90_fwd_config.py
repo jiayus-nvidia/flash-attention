@@ -9,7 +9,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 import torch
-from cutlass import Float32
+from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import warpgroup
 
 
@@ -40,6 +40,7 @@ class _ResolvedSm90FwdConsumerConfig:
     swap_ab: bool
     physical_subtiles: int
     num_mma_threads: int
+    num_mask_payload_groups: int
     attention_num_threads: int
     num_stages: int
     payload_values_per_thread: int
@@ -144,18 +145,107 @@ def _resolve_pack_gqa(
     num_q_heads: int,
     num_kv_heads: int,
     hmask: int,
+    tile_m: int,
 ) -> bool:
-    """Resolve PackGQA without specializing on the runtime mask-head extent."""
+    """Resolve PackGQA for the selected SM90 forward tile."""
 
+    if num_q_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError("num_q_heads and num_kv_heads must be positive")
     if num_q_heads % num_kv_heads != 0:
         raise ValueError("num_q_heads must be divisible by num_kv_heads")
     if hmask not in (1, num_q_heads):
         raise ValueError(f"Hmask must be 1 or Hq ({num_q_heads}); got {hmask}")
-    if requested_pack_gqa is True and hmask != 1:
-        raise ValueError("pack_gqa=True requires Hmask=1 for arbitrary attention")
-    if requested_pack_gqa is not None:
-        return requested_pack_gqa
-    return num_q_heads > num_kv_heads and hmask == 1
+    qhead_per_kvhead = num_q_heads // num_kv_heads
+    qratio_is_power_of_two = (qhead_per_kvhead & (qhead_per_kvhead - 1)) == 0
+    can_pack = hmask == 1 and qratio_is_power_of_two and tile_m % qhead_per_kvhead == 0
+    if requested_pack_gqa is True:
+        if hmask != 1:
+            raise ValueError("pack_gqa=True requires Hmask=1 for arbitrary attention")
+        if not qratio_is_power_of_two:
+            raise ValueError(
+                f"pack_gqa=True requires qratio=Hq/Hkv to be a power of two; got {qhead_per_kvhead}"
+            )
+        if tile_m % qhead_per_kvhead != 0:
+            raise ValueError(
+                f"pack_gqa=True requires tile_m ({tile_m}) to be divisible by "
+                f"qratio ({qhead_per_kvhead})"
+            )
+        return True
+    if requested_pack_gqa is False:
+        return False
+    return num_q_heads > num_kv_heads and can_pack
+
+
+def _num_sm90_fwd_mask_payload_groups(
+    *,
+    num_mma_threads: int,
+    qhead_per_kvhead: int,
+    pack_gqa: bool,
+) -> int:
+    """Return the number of consumer-native forward payload equivalence classes."""
+
+    if not pack_gqa:
+        return num_mma_threads
+    if qhead_per_kvhead <= 8:
+        return num_mma_threads // qhead_per_kvhead
+    return 2 * num_mma_threads // qhead_per_kvhead
+
+
+@cute.jit
+def _sm90_fwd_mask_payload_group_idx(
+    consumer_tidx: cutlass.Int32,
+    qhead_per_kvhead: cutlass.Constexpr[int],
+) -> cutlass.Int32:
+    """Map one WGMMA consumer thread to its forward mask payload group."""
+
+    group_idx = consumer_tidx
+    if const_expr(qhead_per_kvhead != 1):
+        warp_group_idx = consumer_tidx // Int32(128)
+        tidx_in_warp_group = consumer_tidx - warp_group_idx * Int32(128)
+        a = tidx_in_warp_group % Int32(4)
+        b = (tidx_in_warp_group // Int32(4)) % Int32(8)
+        c = tidx_in_warp_group // Int32(32)
+        if const_expr(qhead_per_kvhead <= 8):
+            groups_per_warp_group = 128 // qhead_per_kvhead
+            group_idx = (
+                warp_group_idx * Int32(groups_per_warp_group)
+                + c * Int32(32 // qhead_per_kvhead)
+                + (b // Int32(qhead_per_kvhead)) * Int32(4)
+                + a
+            )
+        else:
+            logical_q = (warp_group_idx * Int32(64) + c * Int32(16) + b) // Int32(qhead_per_kvhead)
+            group_idx = logical_q * Int32(4) + a
+    return group_idx
+
+
+@cute.jit
+def _sm90_fwd_mask_payload_representative_tidx(
+    group_idx: cutlass.Int32,
+    qhead_per_kvhead: cutlass.Constexpr[int],
+) -> cutlass.Int32:
+    """Return a representative WGMMA thread for one forward payload group."""
+
+    consumer_tidx = group_idx
+    if const_expr(qhead_per_kvhead != 1):
+        a = group_idx % Int32(4)
+        if const_expr(qhead_per_kvhead <= 8):
+            groups_per_warp_group = 128 // qhead_per_kvhead
+            warp_group_idx = group_idx // Int32(groups_per_warp_group)
+            group_in_warp_group = group_idx - warp_group_idx * Int32(groups_per_warp_group)
+            groups_per_c = 32 // qhead_per_kvhead
+            c = group_in_warp_group // Int32(groups_per_c)
+            group_in_c = group_in_warp_group - c * Int32(groups_per_c)
+            b = (group_in_c // Int32(4)) * Int32(qhead_per_kvhead)
+            consumer_tidx = warp_group_idx * Int32(128) + c * Int32(32) + b * Int32(4) + a
+        else:
+            logical_q = group_idx // Int32(4)
+            physical_q = logical_q * Int32(qhead_per_kvhead)
+            warp_group_idx = physical_q // Int32(64)
+            q_in_warp_group = physical_q - warp_group_idx * Int32(64)
+            c = q_in_warp_group // Int32(16)
+            consumer_tidx = warp_group_idx * Int32(128) + c * Int32(32) + a
+    return consumer_tidx
 
 
 def resolve_sm90_fwd_consumer_config(
@@ -188,17 +278,23 @@ def resolve_sm90_fwd_consumer_config(
             f"got ({head_dim}, {head_dim_v})"
         )
 
-    qhead_per_kvhead = num_q_heads // num_kv_heads
+    # Match the native SM90 consumer configuration. Arbitrary masking changes
+    # only the block traversal and mask payload, not the dimension policy.
+    fwd = _tile_size_fwd_sm90(head_dim, head_dim_v, True, False)
     effective_pack_gqa = _resolve_pack_gqa(
         requested_pack_gqa=pack_gqa,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
         hmask=hmask,
+        tile_m=fwd.m_block_size,
     )
-    # Match the native SM90 consumer configuration. Arbitrary masking changes
-    # only the block traversal and mask payload, not the dimension policy.
-    fwd = _tile_size_fwd_sm90(head_dim, head_dim_v, True, False)
+    qhead_per_kvhead = num_q_heads // num_kv_heads
     num_mma_threads = 128 * (fwd.m_block_size // 64)
+    num_mask_payload_groups = _num_sm90_fwd_mask_payload_groups(
+        num_mma_threads=num_mma_threads,
+        qhead_per_kvhead=qhead_per_kvhead,
+        pack_gqa=effective_pack_gqa,
+    )
     payload_values_per_thread, remainder = divmod(
         fwd.m_block_size * fwd.n_block_size, num_mma_threads
     )
@@ -226,6 +322,7 @@ def resolve_sm90_fwd_consumer_config(
         swap_ab=False,
         physical_subtiles=1,
         num_mma_threads=num_mma_threads,
+        num_mask_payload_groups=num_mask_payload_groups,
         attention_num_threads=128 + num_mma_threads,
         num_stages=fwd.num_stages,
         payload_values_per_thread=payload_values_per_thread,
@@ -280,7 +377,10 @@ def make_sm90_fwd_tiled_mma(
 __all__ = [
     "FwdConfig",
     "_ResolvedSm90FwdConsumerConfig",
+    "_num_sm90_fwd_mask_payload_groups",
     "_resolve_pack_gqa",
+    "_sm90_fwd_mask_payload_group_idx",
+    "_sm90_fwd_mask_payload_representative_tidx",
     "_tile_size_fwd_sm90",
     "make_sm90_fwd_tiled_mma",
     "make_sm90_fwd_tiled_mma_qk",

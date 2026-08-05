@@ -653,7 +653,7 @@ def _flash_attn_fwd(
                 is_varlen=cu_seqlens_q is not None,
                 block_size=(tile_m, tile_n),
                 pack_gqa=pack_gqa,
-                num_mma_threads=arbitrary_config.num_mma_threads,
+                num_mask_payload_groups=arbitrary_config.num_mask_payload_groups,
                 payload_padded_words=arbitrary_config.payload_padded_words,
                 expected_fixed_total_m_blocks=expected_fixed_total_m_blocks,
             )
