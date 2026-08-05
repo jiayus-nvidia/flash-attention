@@ -1,10 +1,8 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
+# CuTe DSL implementation for Hopper and Blackwell. Requires nvidia-cutlass-dsl==4.6.1.
 
 import os
 import math
-import warnings
-from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Callable
 
@@ -55,8 +53,19 @@ from flash_attn_cute.block_sparsity import (
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
+    normalize_arbitrary_block_sparse_config,
+    normalize_arbitrary_block_sparse_config_bwd,
 )
-from flash_attn_cute.mask import cute_arbitrary_mask
+from flash_attn_cute.sm90_fwd_config import (
+    FwdConfig,
+    _tile_size_fwd_sm90,
+    resolve_sm90_fwd_consumer_config,
+)
+from flash_attn_cute.sm90_bwd_config import (
+    BwdConfig as BwdConfig,  # noqa: F401
+    _tile_size_bwd_sm90,
+    resolve_sm90_bwd_consumer_config,
+)
 
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
@@ -107,131 +116,6 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
         )
 
 
-@dataclass(frozen=True)
-class FwdConfig:
-    m_block_size: int
-    n_block_size: int
-    mma_pv_is_rs: bool
-    intra_wg_overlap: bool
-
-
-def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_size_q=None):
-    """Return FwdConfig for SM90 forward.
-
-    Tile sizes and flags based on tile_size_fwd_sm90 in hopper/tile_size.h, adjusted
-    for the Python kernel's different register/smem tradeoffs (benchmarked on H100 SXM).
-
-    When sparse_block_size_q is set, tile_m must divide it. For head_dim <= 96 the
-    optimal tile_m=192 is used when compatible, otherwise we fall back to 128.
-    """
-    if head_dim <= 64:
-        # C++: 192×192 non-causal, 192×128 causal/local.
-        # Python: 192×128 RS+OL is consistently best across seqlens.
-        if sparse_block_size_q is not None and sparse_block_size_q % 192 != 0:
-            return FwdConfig(128, 128, True, True)
-        return FwdConfig(192, 128, True, True)
-    elif head_dim <= 96:
-        # C++: 192×144 noRS+OL for all cases.
-        # Python: RS is catastrophic with 192× tiles (~300 vs ~600 TFLOPS).
-        # noRS+OL is always required. Causal: 192×128 slightly better short seqlen.
-        if sparse_block_size_q is not None and sparse_block_size_q % 192 != 0:
-            return FwdConfig(128, 128, False, True)
-        if is_causal or is_local:
-            return FwdConfig(192, 128, False, True)
-        else:
-            return FwdConfig(192, 144, False, True)
-    elif head_dim <= 128:
-        return FwdConfig(128, 128, True, True)
-    elif head_dim <= 192:
-        tile_n = 96 if is_local else (128 if head_dim_v <= 128 else 112)
-        return FwdConfig(128, tile_n, True, True)
-    else:  # hdim 256
-        tile_n = 64 if is_local else 80
-        return FwdConfig(128, tile_n, True, True)
-
-@dataclass(frozen=True)
-class BwdConfig:
-    m_block_size: int
-    n_block_size: int
-    num_stages_Q: int
-    num_stages_dO: int
-    num_stages_PdS: int
-    SdP_swapAB: bool
-    dKV_swapAB: bool
-    dQ_swapAB: bool
-    AtomLayoutMSdP: int
-    AtomLayoutNdKV: int
-    AtomLayoutMdQ: int
-    num_wg: int = 2  # MMA warp groups (total threads = (num_wg + 1) * 128)
-    dQ_single_wg: bool = False
-
-
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None):
-    """Return BwdConfig for SM90.
-
-    Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
-    benchmarked on H100 SXM.
-    """
-    if head_dim <= 64:
-        # C++ FA3: 128, 128, 64, ..., 2, 2, true, false, false, 2, 1, 2, 2
-        return BwdConfig(
-            m_block_size=128, n_block_size=128,
-            num_stages_Q=2, num_stages_dO=2, num_stages_PdS=2,
-            SdP_swapAB=True, dKV_swapAB=False, dQ_swapAB=False,
-            AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=2,
-        )
-    elif head_dim <= 96:
-        # C++ FA3: 64, 128, 96, dQ_swapAB=False
-        return BwdConfig(
-            m_block_size=64, n_block_size=128,
-            num_stages_Q=2, num_stages_dO=2, num_stages_PdS=2,
-            SdP_swapAB=True, dKV_swapAB=False, dQ_swapAB=False,
-            AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
-            dQ_single_wg=True,
-        )
-    elif head_dim <= 128:
-        # C++ FA3: causal/local: 64, 128; non-causal: 80, 128 with dQ_swapAB
-        is_causal_or_local = causal or local
-        m_block_size = 64 if is_causal_or_local else 80
-        if sparse_block_size_q is not None and sparse_block_size_q % m_block_size != 0:
-            m_block_size = 64
-        return BwdConfig(
-            m_block_size=m_block_size,
-            n_block_size=128,
-            num_stages_Q=2, num_stages_dO=2, num_stages_PdS=2,
-            SdP_swapAB=True, dKV_swapAB=False,
-            dQ_swapAB=m_block_size % 64 != 0,
-            AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
-        )
-    elif head_dim <= 192:
-        hdimv128 = head_dim_v <= 128
-        if hdimv128:
-            return BwdConfig(
-                m_block_size=64, n_block_size=96,
-                num_stages_Q=2, num_stages_dO=2, num_stages_PdS=1,
-                SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
-                AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
-                num_wg=2,
-            )
-        else:
-            return BwdConfig(
-                m_block_size=64, n_block_size=96,
-                num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
-                SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
-                AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
-                num_wg=2,
-            )
-    else:
-        # hdim 256
-        return BwdConfig(
-            m_block_size=64, n_block_size=64,
-            num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
-            SdP_swapAB=False, dKV_swapAB=False, dQ_swapAB=False,
-            AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
-        )
-
-
-
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -242,68 +126,6 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.device == expected_device, f"{name} device {t.device} != expected {expected_device}"
     if not is_fake_mode():
         assert t.is_cuda, f"{name} must be on CUDA"
-
-
-def _prepare_arbitrary_aux_tensors(
-    arbitrary: bool,
-    aux_tensors: Optional[list[torch.Tensor]],
-    batch_size: int,
-    num_head: int,
-    seqlen_q: Optional[int],
-) -> Tuple[Optional[list[torch.Tensor]], int]:
-    if not arbitrary:
-        return aux_tensors, 0
-    if seqlen_q is None:
-        raise ValueError("max_seqlen_q must be provided when arbitrary=True with varlen inputs")
-    if aux_tensors is None or len(aux_tensors) == 0:
-        raise ValueError("aux_tensors[0] must be provided when arbitrary=True")
-    aux_tensors = list(aux_tensors)
-    arbitrary_func = maybe_contiguous(aux_tensors[0])
-    if arbitrary_func.ndim != 4:
-        raise ValueError("arbitrary mask tensor must have shape [B or 1, H or 1, func_num, seqlen_q + padding]")
-    if arbitrary_func.dtype != torch.int32:
-        raise ValueError("arbitrary mask tensor must use torch.int32")
-    if arbitrary_func.shape[0] not in (1, batch_size):
-        raise ValueError(
-            f"arbitrary mask batch dimension must be 1 or batch_size={batch_size}, got {arbitrary_func.shape[0]}"
-        )
-    if arbitrary_func.shape[1] not in (1, num_head):
-        raise ValueError(
-            f"arbitrary mask head dimension must be 1 or num_head={num_head}, got {arbitrary_func.shape[1]}"
-        )
-    if arbitrary_func.shape[2] % 2 == 0:
-        raise ValueError("arbitrary mask func_num must be odd")
-    if arbitrary_func.shape[-1] < seqlen_q + 256:
-        raise ValueError(
-            "arbitrary mask tensor last dimension must be at least "
-            f"seqlen_q + 256 ({seqlen_q + 256}), got {arbitrary_func.shape[-1]}"
-        )
-    # Keep B/H/func_num static for CuTe code that unrolls over func_num.
-    arbitrary_func.__leading_dim__ = arbitrary_func.ndim - 1
-    aux_tensors[0] = arbitrary_func
-    return aux_tensors, arbitrary_func.shape[2]
-
-
-def _set_arbitrary_mask_metadata(
-    func_num: int,
-    batch_broadcast: bool,
-    head_broadcast: bool,
-) -> None:
-    cute_arbitrary_mask.__func_num__ = func_num
-    cute_arbitrary_mask.__batch_broadcast__ = batch_broadcast
-    cute_arbitrary_mask.__head_broadcast__ = head_broadcast
-
-
-def _warn_arbitrary_without_block_sparsity(direction: str):
-    warnings.warn(
-        f"arbitrary=True was provided without {direction} block sparsity metadata; "
-        "FlashAttention will use a dense arbitrary-mask path. This preserves correctness "
-        "but can be much slower because the kernel may visit blocks that the arbitrary mask "
-        "later rejects. For better performance, generate and pass block sparsity metadata "
-        "from the same mask.",
-        RuntimeWarning,
-        stacklevel=3,
-    )
 
 
 torch2cute_dtype_map = {
@@ -397,6 +219,7 @@ def _block_sparse_runtime_tuple(tensors):
             tensors.dq_write_order_full,
             tensors.mask_block_offset,
             tensors.full_block_offset,
+            tensors.mask_block_masks,
         )
         if tensors is not None
         else None
@@ -548,6 +371,7 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
+    requested_pack_gqa = pack_gqa
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
@@ -575,12 +399,6 @@ def _flash_attn_fwd(
         )
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
-
-    if seqlen_k == 0 or total_q == 0:
-        out.zero_()
-        if lse is not None:
-            lse.fill_(float("-inf"))
-        return out, lse
 
     if is_fp8:
         for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
@@ -611,39 +429,65 @@ def _flash_attn_fwd(
     )
     use_block_sparsity = block_sparse_tensors is not None
     use_dedicated_hd256_kernel = arch // 10 == 10 and head_dim == 256 and head_dim_v == 256
-    arbitrary_func_num = 0
-    arbitrary_batch_broadcast = False
-    arbitrary_head_broadcast = False
+    arbitrary_config = None
+    has_packed_arbitrary_plan = (
+        block_sparse_tensors is not None
+        and getattr(block_sparse_tensors, "mask_block_masks", None) is not None
+    )
+    if has_packed_arbitrary_plan and not arbitrary:
+        raise ValueError("a packed arbitrary plan requires arbitrary=True")
     if arbitrary:
+        no_window = (window_size_left is None and window_size_right is None) or (
+            window_size_left is not None
+            and window_size_right is not None
+            and window_size_left + window_size_right < 0
+        )
+        if causal or not no_window:
+            raise ValueError("arbitrary=True cannot be combined with causal or local/window masks")
         if mask_mod is not None:
             raise ValueError("arbitrary=True cannot be combined with mask_mod")
-        if arch // 10 not in [9, 10, 11]:
-            raise NotImplementedError("arbitrary mask is only supported on SM90/SM100/SM110")
+        if arch // 10 != 9:
+            raise NotImplementedError("Packed arbitrary attention currently supports SM90 only")
+        if not has_packed_arbitrary_plan:
+            raise ValueError(
+                "arbitrary=True requires block_sparse_tensors returned by "
+                "create_arbitrary_block_sparse_tensors"
+            )
         if qv is not None:
             raise NotImplementedError("arbitrary mask is not supported with MLA qv path")
         if is_fp8:
             raise NotImplementedError("arbitrary mask is not supported with FP8 kernels")
-        aux_tensors, arbitrary_func_num = _prepare_arbitrary_aux_tensors(
-            arbitrary,
-            aux_tensors,
-            batch_size,
-            num_head,
-            seqlen_q if seqlen_q is not None else max_seqlen_q,
+        if page_table is not None:
+            raise NotImplementedError("packed arbitrary attention does not support paged KV")
+        if num_splits != 1:
+            raise NotImplementedError("packed arbitrary attention does not support SplitKV")
+        if seqused_q is not None or seqused_k is not None:
+            raise NotImplementedError("packed arbitrary attention does not support seqused_q/k")
+        is_arbitrary_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
+        if is_arbitrary_varlen:
+            if cu_seqlens_q is None or cu_seqlens_k is None:
+                raise ValueError(
+                    "packed arbitrary varlen attention requires both cu_seqlens_q and cu_seqlens_k"
+                )
+            if max_seqlen_q is None or max_seqlen_k is None:
+                raise ValueError(
+                    "packed arbitrary varlen attention requires max_seqlen_q and max_seqlen_k"
+                )
+        arbitrary_config = resolve_sm90_fwd_consumer_config(
+            arch=arch,
+            dtype=q.dtype,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            num_q_heads=num_head,
+            num_kv_heads=num_head_kv,
+            is_varlen=is_arbitrary_varlen,
+            hmask=block_sparse_tensors.mask_block_cnt.shape[0],
+            pack_gqa=requested_pack_gqa,
         )
-        arbitrary_batch_broadcast = aux_tensors[0].shape[0] == 1
-        arbitrary_head_broadcast = aux_tensors[0].shape[1] == 1
-        _set_arbitrary_mask_metadata(
-            arbitrary_func_num,
-            arbitrary_batch_broadcast,
-            arbitrary_head_broadcast,
-        )
-        if not use_block_sparsity:
-            _warn_arbitrary_without_block_sparsity("forward")
+        pack_gqa = arbitrary_config.pack_gqa
         causal = False
         window_size_left = None
         window_size_right = None
-        if not use_dedicated_hd256_kernel:
-            mask_mod = cute_arbitrary_mask
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
@@ -659,7 +503,16 @@ def _flash_attn_fwd(
         num_threads = 128
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
-    if tile_mn is None:
+    if arbitrary_config is not None:
+        fwd_cfg = FwdConfig(
+            arbitrary_config.tile_m,
+            arbitrary_config.tile_n,
+            arbitrary_config.mma_pv_is_rs,
+            arbitrary_config.intra_wg_overlap,
+            arbitrary_config.num_stages,
+        )
+        num_threads = arbitrary_config.attention_num_threads
+    elif tile_mn is None:
         if arch // 10 == 12:
             # SM120 tile sizes tuned for 99 KB SMEM capacity:
             # D<=64:  128x128 → 48 KB (good occupancy)
@@ -676,9 +529,12 @@ def _flash_attn_fwd(
     else:
         fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
-    if mma_pv_is_rs is None:
+    if arbitrary_config is not None:
+        mma_pv_is_rs = arbitrary_config.mma_pv_is_rs
+        intra_wg_overlap = arbitrary_config.intra_wg_overlap
+    elif mma_pv_is_rs is None:
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
-    if intra_wg_overlap is None:
+    if arbitrary_config is None and intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
 
     # TODO: fix GQA + SplitKV + non-varlen
@@ -782,19 +638,53 @@ def _flash_attn_fwd(
     normalized_block_sparse_tensors = None
     q_subtile_factor = None
     if block_sparse_tensors is not None:
-        (
-            normalized_block_sparse_tensors,
-            block_sparse_broadcast_pattern,
-            q_subtile_factor,
-        ) = normalize_block_sparse_config(
-            block_sparse_tensors,
-            batch_size=batch_size,
-            num_head=num_head,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            block_size=(tile_m, tile_n),
-            q_stage=q_stage,
+        if arbitrary_config is not None:
+            qratio_plan = arbitrary_config.qhead_per_kvhead if pack_gqa else 1
+            expected_fixed_total_m_blocks = (
+                None
+                if cu_seqlens_q is not None
+                else batch_size * math.ceil(seqlen_q * qratio_plan / tile_m)
+            )
+            normalized_block_sparse_tensors = normalize_arbitrary_block_sparse_config(
+                block_sparse_tensors,
+                device=device,
+                batch_size=batch_size,
+                num_q_heads=num_head,
+                is_varlen=cu_seqlens_q is not None,
+                block_size=(tile_m, tile_n),
+                pack_gqa=pack_gqa,
+                num_mma_threads=arbitrary_config.num_mma_threads,
+                payload_padded_words=arbitrary_config.payload_padded_words,
+                expected_fixed_total_m_blocks=expected_fixed_total_m_blocks,
+            )
+            q_subtile_factor = 1
+        else:
+            (
+                normalized_block_sparse_tensors,
+                block_sparse_broadcast_pattern,
+                q_subtile_factor,
+            ) = normalize_block_sparse_config(
+                block_sparse_tensors,
+                batch_size=batch_size,
+                num_head=num_head,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
+                block_size=(tile_m, tile_n),
+                q_stage=q_stage,
+            )
+    if seqlen_k == 0 or total_q == 0:
+        out.zero_()
+        if lse is not None:
+            lse.fill_(float("-inf"))
+        return out, lse
+
+    scheduler_metadata = None
+    scheduler_tile_counter = None
+    if arch // 10 == 9 and (cu_seqlens_q is not None or seqused_q is not None):
+        scheduler_metadata = torch.empty(
+            (3, batch_size), dtype=torch.int32, device=device
         )
+        scheduler_tile_counter = torch.empty((1,), dtype=torch.int32, device=device)
     if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
@@ -850,9 +740,6 @@ def _flash_attn_fwd(
         block_sparse_broadcast_pattern,
         aux_tensor_metadata,
         arbitrary,
-        arbitrary_func_num,
-        arbitrary_batch_broadcast,
-        arbitrary_head_broadcast,
         lse is None,
         cu_seqlens_q is None,
         cu_seqlens_k is None,
@@ -948,6 +835,17 @@ def _flash_attn_fwd(
         if normalized_block_sparse_tensors is not None:
             sparse_tensors = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
 
+        scheduler_metadata_tensor = (
+            to_cute_tensor(scheduler_metadata, assumed_align=16, leading_dim=1)
+            if scheduler_metadata is not None
+            else None
+        )
+        scheduler_tile_counter_tensor = (
+            to_cute_tensor(scheduler_tile_counter, assumed_align=4, leading_dim=0)
+            if scheduler_tile_counter is not None
+            else None
+        )
+
         cute_aux_tensors = None
         aux_tensor_metadata = None
         if aux_tensors is not None:
@@ -989,7 +887,7 @@ def _flash_attn_fwd(
                 tile_m=tile_m,
                 tile_n=tile_n,
                 # num_stages=1,
-                num_stages=2,
+                num_stages=fwd_cfg.num_stages,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
@@ -1070,7 +968,6 @@ def _flash_attn_fwd(
                     fwd_kwargs["is_arbitrary"] = arbitrary
                 else:
                     fwd_kwargs["is_arbitrary"] = arbitrary
-                    fwd_kwargs["arbitrary_func_num"] = arbitrary_func_num
 
                 fa_fwd = flash_fwd_obj_cls(
                     head_dim,
@@ -1162,9 +1059,19 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 cute_aux_tensors,
             ])
+            if arch // 10 == 9:
+                compile_args.extend(
+                    [scheduler_metadata_tensor, scheduler_tile_counter_tensor, Int32(0)]
+                )
             compile_args.append(current_stream)
+            compile_options = "--enable-tvm-ffi"
+            if arch // 10 == 9:
+                register_usage_level = 0 if arbitrary else 10
+                compile_options += (
+                    f" --ptxas-options='--register-usage-level={register_usage_level}'"
+                )
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-                *compile_args, options="--enable-tvm-ffi"
+                *compile_args, options=compile_options
             )
 
     if not is_fake_mode():
@@ -1231,11 +1138,14 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.dq_write_order_full,
                     normalized_block_sparse_tensors.mask_block_offset,
                     normalized_block_sparse_tensors.full_block_offset,
+                    normalized_block_sparse_tensors.mask_block_masks,
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
                 aux_tensors,
             ])
+            if arch // 10 == 9:
+                call_args.extend([scheduler_metadata, scheduler_tile_counter, num_SMs])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -1298,7 +1208,7 @@ def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k):
 
 def _compile_bwd_preprocess(
     dtype, head_dim, head_dim_v, m_block_size, has_cuseqlens_q, has_seqused_q, has_dlse, has_dq_accum,
-    use_padded_offsets,
+    use_padded_offsets, accum_hdim_multiple,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
@@ -1311,10 +1221,16 @@ def _compile_bwd_preprocess(
     mdLSE = fake_tensor(Float32, mLSE.shape, divisibility=1) if has_dlse else None
     mdQaccum = mdQaccum if has_dq_accum else None
     fa_bwd_pre = FlashAttentionBackwardPreprocess(
-        dtype, head_dim, head_dim_v, m_block_size, use_padded_offsets=use_padded_offsets
+        dtype,
+        head_dim,
+        head_dim_v,
+        m_block_size,
+        use_padded_offsets=use_padded_offsets,
+        accum_hdim_multiple=accum_hdim_multiple,
     )
     return cute.compile(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
+        Int32(0),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1324,19 +1240,23 @@ def _bwd_preprocess(
     out, dout, dpsum, lse, lse_log2, dq_accum,
     cu_seqlens_q, seqused_q, dlse,
     dtype, head_dim, head_dim_v, m_block_size,
-    use_padded_offsets=True,
+    max_seqlen_q=None,
+    use_padded_offsets=True, accum_hdim_multiple=32,
 ):
     """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum."""
     is_varlen = cu_seqlens_q is not None
+    if max_seqlen_q is None:
+        max_seqlen_q = out.shape[0] if is_varlen else out.shape[1]
     compile_key = (
         dtype, head_dim, head_dim_v, m_block_size, is_varlen, seqused_q is not None, dlse is not None, dq_accum is not None,
-        use_padded_offsets,
+        use_padded_offsets, accum_hdim_multiple,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
     if not is_fake_mode():
         _bwd_preprocess.compile_cache[compile_key](
-            out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse
+            out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse,
+            max_seqlen_q,
         )
 
 
@@ -1345,6 +1265,7 @@ _bwd_preprocess.compile_cache = get_jit_cache("bwd_pre")
 
 def _compile_bwd_postprocess(
     dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
+    accum_row_major,
     has_cuseqlens_q, has_seqused_q,
     use_2cta_instrs, cluster_size, arch,
 ):
@@ -1358,11 +1279,13 @@ def _compile_bwd_postprocess(
     mSeqUsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
     fa_bwd_post = FlashAttentionBackwardPostprocess(
         dtype, hdim, arch, block_size, num_threads, atom_layout, swap_ab,
+        accum_row_major,
         use_2cta_instrs=use_2cta_instrs,
         cluster_size=cluster_size,
     )
     return cute.compile(
         fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
+        Int32(0),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1370,14 +1293,16 @@ def _compile_bwd_postprocess(
 
 def _bwd_postprocess_convert(
     accum, output, scale,
-    cu_seqlens, seqused,
+    cu_seqlens, seqused, max_seqlen,
     arch, dtype, hdim, block_size, num_threads,
     atom_layout, swap_ab,
+    accum_row_major=False,
     use_2cta_instrs=False, cluster_size=1,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
     compile_key = (
         dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
+        accum_row_major,
         cu_seqlens is not None, seqused is not None,
         use_2cta_instrs, cluster_size, arch,
     )
@@ -1385,7 +1310,7 @@ def _bwd_postprocess_convert(
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
     if not is_fake_mode():
         _bwd_postprocess_convert.compile_cache[compile_key](
-            accum, output, scale, cu_seqlens, seqused,
+            accum, output, scale, cu_seqlens, seqused, max_seqlen,
         )
 
 
@@ -1436,8 +1361,9 @@ def _flash_attn_bwd(
     linear_q_block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
     linear_k_block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
+    _arch: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    arch = _get_device_arch()
+    arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     if linear_q_block_sparse_tensors is not None:
         if block_sparse_tensors is not None:
@@ -1445,6 +1371,68 @@ def _flash_attn_bwd(
                 "Pass either block_sparse_tensors or linear_q_block_sparse_tensors, not both."
             )
         block_sparse_tensors = linear_q_block_sparse_tensors
+    arbitrary_config = None
+    arbitrary_hmask = None
+    arbitrary_is_varlen = False
+    if arbitrary:
+        no_window = (window_size_left is None and window_size_right is None) or (
+            window_size_left is not None
+            and window_size_right is not None
+            and window_size_left + window_size_right < 0
+        )
+        if causal or not no_window:
+            raise ValueError("arbitrary=True cannot be combined with causal or local/window masks")
+        if mask_mod is not None:
+            raise ValueError("arbitrary=True cannot be combined with mask_mod")
+        if arch // 10 != 9:
+            raise NotImplementedError("packed arbitrary backward only supports SM90")
+        if block_sparse_tensors is None:
+            raise ValueError("arbitrary backward requires a packed block_sparse_tensors plan")
+        outer_mask_block_cnt = getattr(block_sparse_tensors, "mask_block_cnt", None)
+        if outer_mask_block_cnt is None or outer_mask_block_cnt.ndim != 2:
+            raise ValueError("arbitrary backward requires the outer packed Q2K plan")
+        arbitrary_hmask = outer_mask_block_cnt.shape[0]
+        nested_bwd = getattr(block_sparse_tensors, "bwd_tensors", None)
+        if nested_bwd is None:
+            raise ValueError(
+                "arbitrary backward requires a plan built with "
+                "create_arbitrary_block_sparse_tensors(..., build_backward=True)"
+            )
+        block_sparse_tensors = nested_bwd
+        if (
+            getattr(block_sparse_tensors, "mask_block_masks", None) is None
+            or block_sparse_tensors.dq_write_order is None
+        ):
+            raise ValueError(
+                "arbitrary backward requires a plan built with "
+                "create_arbitrary_block_sparse_tensors(..., build_backward=True)"
+            )
+        if (cu_seqlens_q is None) != (cu_seqlens_k is None):
+            raise ValueError(
+                "arbitrary backward requires both cu_seqlens_q and cu_seqlens_k, "
+                "or neither for fixed-length attention"
+            )
+        arbitrary_is_varlen = cu_seqlens_q is not None
+        if arbitrary_is_varlen and (
+            max_seqlen_q is None or max_seqlen_k is None
+        ):
+            raise ValueError(
+                "varlen arbitrary backward requires max_seqlen_q and max_seqlen_k"
+            )
+        if seqused_q is not None or seqused_k is not None:
+            raise NotImplementedError("arbitrary backward does not support seqused_q/k")
+        arbitrary_config = resolve_sm90_bwd_consumer_config(
+            arch=arch,
+            dtype=q.dtype,
+            head_dim=q.shape[-1],
+            head_dim_v=v.shape[-1],
+            num_q_heads=q.shape[-2],
+            num_kv_heads=k.shape[-2],
+            is_varlen=arbitrary_is_varlen,
+        )
+        causal = False
+        window_size_left = None
+        window_size_right = None
     _validate_linear_csr_arbitrary_only(
         block_sparse_tensors,
         arbitrary=arbitrary,
@@ -1464,10 +1452,11 @@ def _flash_attn_bwd(
         tensor_name="linear_k_block_sparse_tensors",
     )
     sparse_q = None
-    if block_sparse_tensors is not None and block_sparse_tensors.block_size is not None:
-        sparse_q = block_sparse_tensors.block_size[0]
-    elif block_sparse_tensors is not None and arch // 10 == 9:
-        sparse_q = 128
+    if arbitrary_config is None:
+        if block_sparse_tensors is not None and block_sparse_tensors.block_size is not None:
+            sparse_q = block_sparse_tensors.block_size[0]
+        elif block_sparse_tensors is not None and arch // 10 == 9:
+            sparse_q = 128
 
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
@@ -1488,20 +1477,6 @@ def _flash_attn_bwd(
     use_sm100_2cta_linear_csr_bwd = (
         use_sm100_hdim192_linear_csr_bwd or use_sm100_hdim128_linear_csr_bwd
     )
-    arbitrary_func_num = 0
-    arbitrary_batch_broadcast = False
-    arbitrary_head_broadcast = False
-    if arbitrary:
-        if mask_mod is not None:
-            raise ValueError("arbitrary=True cannot be combined with mask_mod")
-        if arch // 10 not in [9, 10, 11]:
-            raise NotImplementedError("arbitrary mask is only supported on SM90/SM100/SM110")
-        causal = False
-        window_size_left = None
-        window_size_right = None
-        if not use_dedicated_hd256_kernel:
-            mask_mod = cute_arbitrary_mask
-
     window_size = [window_size_left, window_size_right]
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
@@ -1532,26 +1507,42 @@ def _flash_attn_bwd(
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
         assert deterministic is False, "deterministic backward not supported on SM 12.0"
     elif arch // 10 == 9:
-        cfg = _tile_size_bwd_sm90(
-            head_dim,
-            head_dim_v,
-            causal,
-            local,
-            sparse_block_size_q=sparse_q,
-        )
-        m_block_size = cfg.m_block_size
-        n_block_size = cfg.n_block_size
-        num_stages_Q = cfg.num_stages_Q
-        num_stages_dO = cfg.num_stages_dO
-        num_stages_PdS = cfg.num_stages_PdS
-        SdP_swapAB = cfg.SdP_swapAB
-        dKV_swapAB = cfg.dKV_swapAB
-        dQ_swapAB = cfg.dQ_swapAB
-        AtomLayoutMSdP = cfg.AtomLayoutMSdP
-        AtomLayoutNdKV = cfg.AtomLayoutNdKV
-        AtomLayoutMdQ = cfg.AtomLayoutMdQ
-        num_threads = (cfg.num_wg + 1) * 128
-        dQ_single_wg = cfg.dQ_single_wg
+        if arbitrary_config is not None:
+            cfg = arbitrary_config
+            m_block_size = cfg.tile_m
+            n_block_size = cfg.tile_n
+            num_stages_Q = cfg.num_stages_q
+            num_stages_dO = cfg.num_stages_do
+            num_stages_PdS = cfg.num_stages_pds
+            SdP_swapAB = cfg.sdp_swap_ab
+            dKV_swapAB = cfg.dkv_swap_ab
+            dQ_swapAB = cfg.dq_swap_ab
+            AtomLayoutMSdP = cfg.atom_layout_m_sdp
+            AtomLayoutNdKV = cfg.atom_layout_n_dkv
+            AtomLayoutMdQ = cfg.atom_layout_m_dq
+            num_threads = cfg.attention_num_threads
+            dQ_single_wg = cfg.dq_single_wg
+        else:
+            cfg = _tile_size_bwd_sm90(
+                head_dim,
+                head_dim_v,
+                causal,
+                local,
+                sparse_block_size_q=sparse_q,
+            )
+            m_block_size = cfg.m_block_size
+            n_block_size = cfg.n_block_size
+            num_stages_Q = cfg.num_stages_Q
+            num_stages_dO = cfg.num_stages_dO
+            num_stages_PdS = cfg.num_stages_PdS
+            SdP_swapAB = cfg.SdP_swapAB
+            dKV_swapAB = cfg.dKV_swapAB
+            dQ_swapAB = cfg.dQ_swapAB
+            AtomLayoutMSdP = cfg.AtomLayoutMSdP
+            AtomLayoutNdKV = cfg.AtomLayoutNdKV
+            AtomLayoutMdQ = cfg.AtomLayoutMdQ
+            num_threads = (cfg.num_wg + 1) * 128
+            dQ_single_wg = cfg.dQ_single_wg
         cluster_size = 1
         use_2cta_instrs = False
         is_varlen = (
@@ -1601,26 +1592,12 @@ def _flash_attn_bwd(
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
 
     num_head_kv = k.shape[-2]
-    aux_tensors, arbitrary_func_num = _prepare_arbitrary_aux_tensors(
-        arbitrary,
-        aux_tensors,
-        batch_size,
-        num_head,
-        seqlen_q,
-    )
-    if arbitrary:
-        arbitrary_batch_broadcast = aux_tensors[0].shape[0] == 1
-        arbitrary_head_broadcast = aux_tensors[0].shape[1] == 1
-        _set_arbitrary_mask_metadata(
-            arbitrary_func_num,
-            arbitrary_batch_broadcast,
-            arbitrary_head_broadcast,
-        )
-
     use_block_sparsity = block_sparse_tensors is not None
-    if arbitrary and not use_block_sparsity:
-        _warn_arbitrary_without_block_sparsity("backward")
-    subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
+    subtile_factor = (
+        arbitrary_config.subtile_factor
+        if arbitrary_config is not None
+        else (sparse_q // m_block_size if sparse_q is not None else 2)
+    )
     if use_sm100_2cta_linear_csr_bwd:
         if not use_2cta_instrs:
             raise NotImplementedError(
@@ -1717,9 +1694,10 @@ def _flash_attn_bwd(
         score_mod_bwd = utils.create_softcap_scoremod_bwd(softcap)
     if score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
-        assert cu_seqlens_q is None and cu_seqlens_k is None, (
-            "varlen + score_mod not supported in bwd yet"
-        )
+        if not arbitrary:
+            assert cu_seqlens_q is None and cu_seqlens_k is None, (
+                "varlen + score_mod is currently supported only by packed arbitrary backward"
+            )
         if arch // 10 == 8:
             raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
 
@@ -1741,7 +1719,18 @@ def _flash_attn_bwd(
     else:
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
 
-    head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
+    if total_q == 0 or total_k == 0:
+        dq.zero_()
+        dk.zero_()
+        dv.zero_()
+        return dq, dk, dv
+
+    accum_hdim_multiple = 16 if arch // 10 == 9 else 32
+    head_dim_rounded = (
+        (head_dim + accum_hdim_multiple - 1)
+        // accum_hdim_multiple
+        * accum_hdim_multiple
+    )
 
     if cu_seqlens_q is None:
         dq_accum = (
@@ -1781,7 +1770,11 @@ def _flash_attn_bwd(
     # hd=256 2CTA backward has its own internal postprocess for dK/dV.
     dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
     if dKV_postprocess:
-        head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
+        head_dim_v_rounded = (
+            (head_dim_v + accum_hdim_multiple - 1)
+            // accum_hdim_multiple
+            * accum_hdim_multiple
+        )
         if cu_seqlens_k is None:
             dk_accum = torch.zeros(
                 batch_size,
@@ -1836,7 +1829,9 @@ def _flash_attn_bwd(
         out, dout, dpsum, lse, lse_log2, dq_accum,
         cu_seqlens_q, seqused_q, dlse,
         dtype, head_dim, head_dim_v, m_block_size,
+        max_seqlen_q=seqlen_q,
         use_padded_offsets=use_dedicated_hd256_kernel,
+        accum_hdim_multiple=accum_hdim_multiple,
     )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
     # SM100/SM110 uses default from function signature (384).
@@ -1861,18 +1856,38 @@ def _flash_attn_bwd(
         block_sparse_n_block_size_bwd = (
             cluster_size * n_block_size if use_sm100_2cta_linear_csr_bwd else n_block_size
         )
-        (
-            normalized_block_sparse_tensors,
-            block_sparse_broadcast_pattern,
-        ) = normalize_block_sparse_config_bwd(
-            block_sparse_tensors,
-            batch_size=batch_size,
-            num_head=num_head,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            block_size=(m_block_size, block_sparse_n_block_size_bwd),
-            subtile_factor=subtile_factor,
-        )
+        if arbitrary_config is not None:
+            normalized_block_sparse_tensors = normalize_arbitrary_block_sparse_config_bwd(
+                block_sparse_tensors,
+                device=device,
+                batch_size=batch_size,
+                num_q_heads=num_head,
+                is_varlen=arbitrary_is_varlen,
+                block_size=arbitrary_config.block_size,
+                subtile_factor=arbitrary_config.subtile_factor,
+                num_mma_threads=arbitrary_config.num_mma_threads,
+                payload_padded_words=arbitrary_config.payload_padded_words,
+                expected_hmask=arbitrary_hmask,
+                expected_spt=arbitrary_config.spt,
+                expected_fixed_total_n_blocks=(
+                    None
+                    if arbitrary_is_varlen
+                    else batch_size * math.ceil(seqlen_k / arbitrary_config.tile_n)
+                ),
+            )
+        else:
+            (
+                normalized_block_sparse_tensors,
+                block_sparse_broadcast_pattern,
+            ) = normalize_block_sparse_config_bwd(
+                block_sparse_tensors,
+                batch_size=batch_size,
+                num_head=num_head,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
+                block_size=(m_block_size, block_sparse_n_block_size_bwd),
+                subtile_factor=subtile_factor,
+            )
         if use_sm100_2cta_linear_csr_bwd:
             if normalized_block_sparse_tensors.mask_block_offset is None:
                 raise NotImplementedError(
@@ -2010,9 +2025,6 @@ def _flash_attn_bwd(
             mask_mod_hash,
             num_aux_tensors,
             arbitrary,
-            arbitrary_func_num,
-            arbitrary_batch_broadcast,
-            arbitrary_head_broadcast,
             use_block_sparsity,
             subtile_factor,
             block_sparse_broadcast_pattern,
@@ -2047,9 +2059,6 @@ def _flash_attn_bwd(
             mask_mod_hash,
             num_aux_tensors,
             arbitrary,
-            arbitrary_func_num,
-            arbitrary_batch_broadcast,
-            arbitrary_head_broadcast,
             use_block_sparsity,
             subtile_factor,
             block_sparse_broadcast_pattern,
@@ -2083,7 +2092,16 @@ def _flash_attn_bwd(
             for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ]
         dQ_semaphore_tensor, dK_semaphore_tensor, dV_semaphore_tensor = [
-            utils.convert_from_dlpack_leading_static(t.detach(), leading_dim=3, alignment=4, stride_order=t.dim_order())
+            (
+                to_cute_tensor(t, assumed_align=4, leading_dim=3)
+                if is_fake_mode()
+                else utils.convert_from_dlpack_leading_static(
+                    t.detach(),
+                    leading_dim=3,
+                    alignment=4,
+                    stride_order=t.dim_order(),
+                )
+            )
             if t is not None else None
             for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
         ]
@@ -2193,7 +2211,6 @@ def _flash_attn_bwd(
                     score_mod_bwd=score_mod_bwd,
                     mask_mod=mask_mod,
                     is_arbitrary=arbitrary,
-                    arbitrary_func_num=arbitrary_func_num,
                     has_aux_tensors=aux_tensors is not None,
                     subtile_factor=subtile_factor,
                 )
@@ -2236,7 +2253,10 @@ def _flash_attn_bwd(
         ]
         if use_dedicated_hd256_kernel:
             compile_args.append(sparse_tensors_compile_dq)
-        compile_args.extend([sparse_tensors_compile, current_stream])
+        compile_args.append(sparse_tensors_compile)
+        if arch // 10 == 9:
+            compile_args.extend([Int32(0), Int32(0)])
+        compile_args.append(current_stream)
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
             *compile_args,
             options="--enable-tvm-ffi",
@@ -2268,6 +2288,8 @@ def _flash_attn_bwd(
         if use_dedicated_hd256_kernel:
             call_args.append(_block_sparse_runtime_tuple(normalized_block_sparse_tensors_dq))
         call_args.append(_block_sparse_runtime_tuple(normalized_block_sparse_tensors))
+        if arch // 10 == 9:
+            call_args.extend([seqlen_q, seqlen_k])
         _flash_attn_bwd.compile_cache[compile_key](*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
@@ -2282,9 +2304,10 @@ def _flash_attn_bwd(
 
         _bwd_postprocess_convert(
             dq_accum, dq, softmax_scale,
-            cu_seqlens_q, seqused_q,
+            cu_seqlens_q, seqused_q, seqlen_q,
             arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
             AtomLayoutMdQ, dQ_swapAB,
+            accum_row_major=False,
             use_2cta_instrs=use_2cta_instrs, cluster_size=1,
         )
 
@@ -2292,17 +2315,19 @@ def _flash_attn_bwd(
             # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
             _bwd_postprocess_convert(
                 dk_accum, dk, softmax_scale,
-                cu_seqlens_k, seqused_k,
+                cu_seqlens_k, seqused_k, seqlen_k,
                 arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
+                accum_row_major=(arch // 10 == 9 and AtomLayoutNdKV == 1),
                 cluster_size=cluster_size,
             )
             # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
             _bwd_postprocess_convert(
                 dv_accum, dv, 1.0,
-                cu_seqlens_k, seqused_k,
+                cu_seqlens_k, seqused_k, seqlen_k,
                 arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
+                accum_row_major=(arch // 10 == 9 and AtomLayoutNdKV == 1),
                 cluster_size=cluster_size,
             )
 
@@ -2340,6 +2365,14 @@ class FlashAttnFunc(torch.autograd.Function):
         linear_q_block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
         return_lse: bool = False,
     ):
+        if arbitrary and (
+            block_sparse_tensors_bwd is not None
+            or linear_q_block_sparse_tensors is not None
+        ):
+            raise ValueError(
+                "packed arbitrary attention stores backward tensors in "
+                "block_sparse_tensors.bwd_tensors; do not pass a second backward plan"
+            )
         if linear_q_block_sparse_tensors is not None and block_sparse_tensors_bwd is not None:
             raise ValueError(
                 "Pass either block_sparse_tensors_bwd or linear_q_block_sparse_tensors, not both."
@@ -2388,9 +2421,13 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.score_mod_bwd = score_mod_bwd
         ctx.mask_mod = mask_mod
         ctx.block_sparse_tensors_bwd = (
-            linear_q_block_sparse_tensors
-            if linear_q_block_sparse_tensors is not None
-            else block_sparse_tensors_bwd
+            block_sparse_tensors
+            if arbitrary
+            else (
+                linear_q_block_sparse_tensors
+                if linear_q_block_sparse_tensors is not None
+                else block_sparse_tensors_bwd
+            )
         )
         ctx.block_sparse_tensors_dq = (
             linear_k_block_sparse_tensors
@@ -2523,6 +2560,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
         ctx.mask_mod = mask_mod
+        ctx.block_sparse_tensors_bwd = (
+            block_sparse_tensors if arbitrary else None
+        )
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -2558,6 +2598,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod_bwd=ctx.score_mod_bwd,
             mask_mod=ctx.mask_mod,
             aux_tensors=aux_tensors,
+            block_sparse_tensors=ctx.block_sparse_tensors_bwd,
             dlse=dlse,
         )
 

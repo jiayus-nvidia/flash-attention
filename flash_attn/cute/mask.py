@@ -130,6 +130,31 @@ def row_to_r2p_idx(x: Int32, num_rep: int, num_wg: int) -> Int32:
 
 
 @cute.jit
+def apply_packed_mask_chunk(
+    X: cute.Tensor,
+    chunk_idx: cutlass.Constexpr[int],
+    mask: Uint32,
+) -> None:
+    """Apply one 32-bit keep mask to one 32-column chunk.
+
+    The one-iteration chunk loop keeps the same lowering pattern as
+    mask_r2p_lambda.
+    """
+    ncol = const_expr(cute.size(X.shape))
+    col_base = chunk_idx * MASK_R2P_CHUNK_SIZE
+    for s in cutlass.range_constexpr(1):
+        for i in cutlass.range_constexpr(
+            min(
+                MASK_R2P_CHUNK_SIZE,
+                ncol - col_base - s * MASK_R2P_CHUNK_SIZE,
+            )
+        ):
+            in_bound = cutlass.Boolean(mask & (Uint32(1) << i))
+            c = col_base + s * MASK_R2P_CHUNK_SIZE + i
+            X[c] = X[c] if in_bound else -Float32.inf
+
+
+@cute.jit
 def cute_arbitrary_mask(
     batch: cute.TensorSSA,
     head: cute.TensorSSA,
@@ -199,6 +224,7 @@ class AttentionMask:
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        rBitmask: Optional[cute.Tensor] = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.swap_AB)
@@ -219,7 +245,13 @@ class AttentionMask:
         if n_block < 0:
             n_block = 0
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
-        if const_expr(not mask_causal and not mask_local and mask_mod is None):
+        if const_expr(rBitmask is not None):
+            num_mask_words = const_expr(cute.ceil_div(cute.size(acc_S.shape), MASK_R2P_CHUNK_SIZE))
+            assert cute.size(rBitmask.shape) >= num_mask_words
+            for word_idx in cutlass.range_constexpr(num_mask_words):
+                apply_packed_mask_chunk(acc_S, word_idx, rBitmask[word_idx])
+
+        elif const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
                 r2p = const_expr(not self.swap_AB)
                 if const_expr(not r2p):
@@ -482,7 +514,9 @@ class AttentionMask:
                     mask = (curr_mask_val >> j) & 1
                     acc_S[curr_col] = acc_S[curr_col] if cutlass.Boolean(mask) else -Float32.inf
 
-        elif const_expr(not mask_causal and not mask_local and not mask_arbitrary and mask_mod is None):
+        elif const_expr(
+            not mask_causal and not mask_local and not mask_arbitrary and mask_mod is None
+        ):
             if const_expr(mask_seqlen):
                 if const_expr(not r2p):
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
@@ -498,10 +532,7 @@ class AttentionMask:
                     )
 
         elif const_expr(
-            not mask_causal
-            and not mask_local
-            and not mask_arbitrary
-            and mask_mod is not None
+            not mask_causal and not mask_local and not mask_arbitrary and mask_mod is not None
         ):
             # Block sparse case w/ mask_mod
             has_fastdiv = const_expr(
@@ -591,9 +622,7 @@ class AttentionMask:
                 if const_expr(self.qhead_per_kvhead_packgqa != 1):
                     assert head_divmod is not None
                     mask_row_2cta, head_offset_2cta = divmod(global_row_2cta, head_divmod)
-                    head_for_mask_2cta = (
-                        head_idx * self.qhead_per_kvhead_packgqa + head_offset_2cta
-                    )
+                    head_for_mask_2cta = head_idx * self.qhead_per_kvhead_packgqa + head_offset_2cta
                 else:
                     mask_row_2cta = global_row_2cta
                     head_for_mask_2cta = head_idx
@@ -609,9 +638,7 @@ class AttentionMask:
                         global_col_i = tScS_t2r[c][1] + n_block_offset
                         value_valid = (
                             global_col_i
-                            < arbitrary_func[
-                                batch_for_mask, head_for_mask_2cta, 0, mask_row_2cta
-                            ]
+                            < arbitrary_func[batch_for_mask, head_for_mask_2cta, 0, mask_row_2cta]
                         )
                         for j in cutlass.range_constexpr(func_num // 2, unroll_full=True):
                             col_min = arbitrary_func[
@@ -730,8 +757,6 @@ class AttentionMask:
                 col_limit_right = row_idx + causal_row_offset + 1
                 if const_expr(mask_seqlen):
                     col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
-                # if cute.arch.thread_idx()[0] % 32 == 0:
-                #     cute.printf("tidx = %d, tidx tmem = %d, row_idx = %d, col_limit_right = %d, causal_row_offset = %d\n", cute.arch.thread_idx()[0], thr_tmem_load.thr_idx, row_idx, col_limit_right, causal_row_offset)
                 ncol = const_expr(cute.size(tScS_t2r.shape))
                 if const_expr(not r2p):
                     for i in cutlass.range(ncol, unroll_full=True):
@@ -765,7 +790,6 @@ class AttentionMask:
                     else 0
                 )
                 if const_expr(not r2p):
-                    # if cute.arch.thread_idx()[0] == 0 or cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", m_block, n_block, row_idx, causal_row_offset, col_limit_right, col_limit_left)
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
                         col_idx = tScS_t2r[i][1]
                         acc_S[i] = (
@@ -823,7 +847,9 @@ class AttentionMask:
         thr_col_offset = tScS_t2r[0][COL]
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
 
-        if const_expr(not mask_causal and not mask_local and not mask_arbitrary and mask_mod is not None):
+        if const_expr(
+            not mask_causal and not mask_local and not mask_arbitrary and mask_mod is not None
+        ):
             # Block sparse case with mask_mod (backward)
             #
             # Coordinate convention: ROW → Q (m_block), COL → KV (n_block).
@@ -949,7 +975,9 @@ class AttentionMask:
                         q_idx_for_mod = global_q
                         if const_expr(wrap_aux_indices):
                             _, q_idx_for_mod = divmod(global_q, fastdiv_mods[0])
-                        col_max_0_frag[c] = arbitrary_func[batch_for_mask, head_for_mask, 0, q_idx_for_mod]
+                        col_max_0_frag[c] = arbitrary_func[
+                            batch_for_mask, head_for_mask, 0, q_idx_for_mod
+                        ]
                         for j in cutlass.range_constexpr(n_intervals):
                             col_min_frag[c * n_intervals + j] = arbitrary_func[
                                 batch_for_mask, head_for_mask, 2 * j + 1, q_idx_for_mod
@@ -989,9 +1017,6 @@ class AttentionMask:
             seqlenq_row_limit = self.seqlen_q - m_block * self.tile_m - thr_row_offset
             causal_offset = seqlenq_row_limit - seqlenk_col_limit
             if const_expr(mask_causal):
-                # tidx = cute.arch.thread_idx()[0] % 256
-                # if tidx < 32:
-                #     cute.printf("tidx = {}, {} {}, {} {}", tidx, tScS_t2r[0][0], tScS_t2r[0][1], tScS_t2r[1][0], tScS_t2r[1][1])
                 row_limit_top = causal_offset
                 if const_expr(mask_seqlen):
                     # If col is beyond the column limit, we want to mask out the entire

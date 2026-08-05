@@ -28,6 +28,7 @@ from quack.cute_dsl_utils import ParamsBase
 
 import flash_attn_cute.utils as utils
 from flash_attn_cute.fast_math import clz
+from flash_attn_cute.named_barrier import NamedBarrierFwd
 
 
 class SchedulingMode(IntEnum):
@@ -282,6 +283,108 @@ class SingleTileScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return SingleTileScheduler(*(tuple(obj_list)), loc=self._loc)
+
+
+class SingleTileMaxVarlenScheduler:
+    """Launch a max-size 3D grid and reject per-sample tail tiles in O(1)."""
+
+    @dataclass
+    class Params(ParamsBase):
+        num_block: Int32
+        num_head: Int32
+        num_batch: Int32
+        tile_size: cutlass.Constexpr[int]
+        mCuSeqlens: Optional[cute.Tensor] = None
+        mSeqUsed: Optional[cute.Tensor] = None
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> Params:
+        assert scheduling_mode == SchedulingMode.STATIC
+        assert args.mCuSeqlensQ is not None or args.mSeqUsedQ is not None
+        return SingleTileMaxVarlenScheduler.Params(
+            num_block=args.num_block,
+            num_head=args.num_head,
+            num_batch=args.num_batch,
+            tile_size=args.tile_shape_mn[0],
+            mCuSeqlens=args.mCuSeqlensQ,
+            mSeqUsed=args.mSeqUsedQ,
+        )
+
+    def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
+        self.params = params
+        self._blk_coord = blk_coord
+        self._is_first_block = True
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    @cute.jit
+    def create(params: Params, *, loc=None, ip=None) -> "SingleTileMaxVarlenScheduler":
+        return SingleTileMaxVarlenScheduler(
+            params, cute.arch.block_idx(), loc=loc, ip=ip
+        )
+
+    @staticmethod
+    def get_grid_shape(
+        params: Params, *, loc=None, ip=None
+    ) -> Tuple[Int32, Int32, Int32]:
+        return (params.num_block, params.num_head, params.num_batch)
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        block_idx, head_idx, batch_idx = self._blk_coord
+        seqlen = Int32(0)
+        if batch_idx < self.params.num_batch:
+            if const_expr(self.params.mSeqUsed is not None):
+                seqlen = self.params.mSeqUsed[batch_idx]
+            else:
+                assert self.params.mCuSeqlens is not None
+                seqlen = (
+                    self.params.mCuSeqlens[batch_idx + 1]
+                    - self.params.mCuSeqlens[batch_idx]
+                )
+        valid = (
+            self._is_first_block
+            and batch_idx < self.params.num_batch
+            and block_idx * self.params.tile_size < seqlen
+        )
+        return WorkTileInfo(
+            (Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(0)), valid
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._is_first_block = False
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def producer_tail(self, *, loc=None, ip=None):
+        pass
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._blk_coord]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        rebuilt = []
+        for obj, n_items in zip([self.params, self._blk_coord], self._values_pos):
+            rebuilt.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return self.__class__(*rebuilt, loc=self._loc, ip=self._ip)
 
 
 class StaticPersistentTileScheduler:
@@ -649,12 +752,16 @@ class SingleTileLPTBwdScheduler:
     class Params(ParamsBase):
         total_blocks: Int32
         num_block: Int32
+        seqlen: Int32
+        block_size: cutlass.Constexpr[int]
         l2_minor: Int32
         num_head_divmod: FastDivmodDivisorV2
         l2_minor_divmod: FastDivmodDivisorV2
         l2_major_divmod: FastDivmodDivisorV2
         l2_minor_residual_divmod: FastDivmodDivisorV2
         num_hb_quotient: Int32
+        mCuSeqlens: Optional[cute.Tensor] = None
+        mSeqUsed: Optional[cute.Tensor] = None
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
         spt: cutlass.Constexpr[bool] = True
 
@@ -663,9 +770,15 @@ class SingleTileLPTBwdScheduler:
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileLPTBwdScheduler.Params":
-            size_l2 = 50 * 1024 * 1024
-            size_one_qdo_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
-            size_one_dqaccum_head = args.seqlen_k * (args.headdim) * 4
+            size_l2 = 40 * 1024 * 1024
+            size_one_qdo_head = (
+                cutlass.Int64(args.seqlen_k)
+                * (args.headdim + args.headdim_v)
+                * args.element_size
+            )
+            size_one_dqaccum_head = (
+                cutlass.Int64(args.seqlen_k) * args.headdim * 4
+            )
             # size_one_dqaccum_head = 0
             size_one_head = size_one_qdo_head + size_one_dqaccum_head
             log2_floor = lambda n: 31 - clz(n)
@@ -685,6 +798,8 @@ class SingleTileLPTBwdScheduler:
                 * args.num_head
                 * args.num_batch,
                 num_block=num_block,
+                seqlen=args.num_block * args.tile_shape_mn[0],
+                block_size=args.tile_shape_mn[0],
                 l2_minor=Int32(swizzle),
                 num_head_divmod=FastDivmodDivisorV2(args.num_head),
                 l2_minor_divmod=FastDivmodDivisorV2(swizzle),
@@ -693,6 +808,8 @@ class SingleTileLPTBwdScheduler:
                     max(num_hb_remainder, 1)
                 ),  # don't divide by 0
                 num_hb_quotient=Int32(num_hb_quotient),
+                mCuSeqlens=args.mCuSeqlensQ,
+                mSeqUsed=args.mSeqUsedQ,
                 cluster_shape_mn=args.cluster_shape_mn,
                 spt=args.lpt,
             )
@@ -747,12 +864,21 @@ class SingleTileLPTBwdScheduler:
             block, bidhb_residual = divmod(l2_mod, params.l2_minor_residual_divmod)
         bidhb_actual = bidhb * params.l2_minor + bidhb_residual
         batch_idx, head_idx = divmod(bidhb_actual, params.num_head_divmod)
+        seqlen = params.seqlen
+        if const_expr(params.mSeqUsed is not None):
+            seqlen = params.mSeqUsed[batch_idx]
+        elif const_expr(params.mCuSeqlens is not None):
+            seqlen = params.mCuSeqlens[batch_idx + 1] - params.mCuSeqlens[batch_idx]
+        num_blocks_actual = cute.ceil_div(
+            cute.ceil_div(cutlass.max(seqlen, Int32(0)), params.block_size),
+            params.cluster_shape_mn[0],
+        )
+        is_valid = self._tile_idx < params.total_blocks and block < num_blocks_actual
         if cutlass.const_expr(params.spt):
-            block = params.num_block - 1 - block
+            block = num_blocks_actual - 1 - block
         if cutlass.const_expr(params.cluster_shape_mn[0] > 1):
             bidx_in_cluster = cute.arch.block_in_cluster_idx()
             block = block * params.cluster_shape_mn[0] + bidx_in_cluster[0]
-        is_valid = self._tile_idx < params.total_blocks
         return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid)
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
@@ -780,6 +906,308 @@ class SingleTileLPTBwdScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return self.__class__(*(tuple(obj_list)), loc=self._loc)
+
+
+class VarlenDynamicPersistentTileSchedulerSm90:
+    """Prepared SM90 varlen scheduler with producer-side dynamic work pulling."""
+
+    @dataclass
+    class Params(ParamsBase):
+        num_head: Int32
+        num_batch: Int32
+        mMetadata: cute.Tensor
+        mTileCounter: cute.Tensor
+        num_sm: Int32
+        num_sync_threads: cutlass.Constexpr[int]
+        lpt: cutlass.Constexpr[bool] = False
+
+    def __init__(
+        self,
+        params: Params,
+        sWork: cute.Tensor,
+        is_producer: cutlass.Constexpr[bool],
+        current_tile_idx: Int32,
+        group_start_tile: Int32,
+        virtual_batch: Int32,
+        next_tile_idx: Int32,
+        block: Int32,
+        head: Int32,
+        batch: Int32,
+        valid: Boolean,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self.params = params
+        self.sWork = sWork
+        self.is_producer = is_producer
+        self._current_tile_idx = current_tile_idx
+        self._group_start_tile = group_start_tile
+        self._virtual_batch = virtual_batch
+        self._next_tile_idx = next_tile_idx
+        self._block = block
+        self._head = head
+        self._batch = batch
+        self._valid = valid
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        mMetadata: cute.Tensor,
+        mTileCounter: cute.Tensor,
+        *,
+        num_sm: Int32,
+        num_mma_threads: int,
+        scheduling_mode: SchedulingMode = SchedulingMode.DYNAMIC,
+        loc=None,
+        ip=None,
+    ) -> Params:
+        assert scheduling_mode == SchedulingMode.DYNAMIC, (
+            "VarlenDynamicPersistentTileSchedulerSm90 requires DYNAMIC scheduling"
+        )
+        return VarlenDynamicPersistentTileSchedulerSm90.Params(
+            num_head=args.num_head,
+            num_batch=args.num_batch,
+            mMetadata=mMetadata,
+            mTileCounter=mTileCounter,
+            num_sm=num_sm,
+            num_sync_threads=num_mma_threads + cute.arch.WARP_SIZE,
+            lpt=args.lpt,
+        )
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: Params,
+        sWork: cute.Tensor,
+        is_producer: cutlass.Constexpr[bool],
+        *,
+        loc=None,
+        ip=None,
+    ) -> "VarlenDynamicPersistentTileSchedulerSm90":
+        return VarlenDynamicPersistentTileSchedulerSm90(
+            params,
+            sWork,
+            is_producer,
+            cute.arch.block_idx()[0],
+            Int32(0),
+            Int32(0),
+            Int32(0),
+            Int32(0),
+            Int32(0),
+            params.num_batch,
+            Boolean(False),
+            loc=loc,
+            ip=ip,
+        )
+
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        return (params.num_sm, Int32(1), Int32(1))
+
+    @cute.jit
+    def _get_num_m_blocks(self, lane: Int32, virtual_batch: Int32) -> Int32:
+        batch_idx = virtual_batch + lane
+        return (
+            self.params.mMetadata[0, batch_idx]
+            if batch_idx < self.params.num_batch and lane < cute.arch.WARP_SIZE - 1
+            else Int32(0)
+        )
+
+    @cute.jit
+    def _map_tile(self, tile_idx: Int32) -> WorkTileInfo:
+        params = self.params
+        lane = cute.arch.lane_idx()
+        virtual_batch = self._virtual_batch
+        group_start_tile = self._group_start_tile
+        num_m_blocks = self._get_num_m_blocks(lane, virtual_batch)
+        num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane)
+        m_blocks_in_group = cute.arch.shuffle_sync(
+            num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1
+        )
+        group_end_tile = group_start_tile + m_blocks_in_group * params.num_head
+
+        while group_end_tile <= tile_idx:
+            virtual_batch += cute.arch.WARP_SIZE - 1
+            group_start_tile = group_end_tile
+            if virtual_batch >= params.num_batch:
+                group_end_tile = tile_idx + Int32(1)
+            else:
+                num_m_blocks = self._get_num_m_blocks(lane, virtual_batch)
+                num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane)
+                m_blocks_in_group = cute.arch.shuffle_sync(
+                    num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1
+                )
+                group_end_tile += m_blocks_in_group * params.num_head
+
+        block = Int32(0)
+        head = Int32(0)
+        actual_batch = params.num_batch
+        valid = Boolean(False)
+        if virtual_batch < params.num_batch:
+            batch_in_group = cute.arch.popc(
+                cute.arch.vote_ballot_sync(
+                    group_start_tile + num_m_blocks_cumulative * params.num_head <= tile_idx
+                )
+            )
+            previous_m_blocks = (
+                Int32(0)
+                if batch_in_group == Int32(0)
+                else cute.arch.shuffle_sync(num_m_blocks_cumulative, batch_in_group - Int32(1))
+            )
+            virtual_batch += batch_in_group
+            group_start_tile += previous_m_blocks * params.num_head
+            num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_in_group)
+            mh_block = tile_idx - group_start_tile
+            nheads_in_l2 = params.mMetadata[1, virtual_batch]
+            mh_in_l2 = nheads_in_l2 * num_m_blocks
+            section_idx = mh_block // mh_in_l2
+            l2_mod = mh_block - section_idx * mh_in_l2
+            nheads_remainder = params.num_head - section_idx * nheads_in_l2
+            nheads_in_this_section = cutlass.min(nheads_in_l2, nheads_remainder)
+            block = l2_mod // nheads_in_this_section
+            head = section_idx * nheads_in_l2 + (
+                l2_mod - block * nheads_in_this_section
+            )
+            if const_expr(params.lpt):
+                block = num_m_blocks - Int32(1) - block
+            actual_batch = params.mMetadata[2, virtual_batch]
+            valid = (actual_batch < params.num_batch) & (num_m_blocks > Int32(0))
+
+        self._current_tile_idx = tile_idx
+        self._group_start_tile = group_start_tile
+        self._virtual_batch = virtual_batch
+        self._block = Int32(block)
+        self._head = Int32(head)
+        self._batch = Int32(actual_batch)
+        self._valid = valid
+        return self.get_current_work()
+
+    @cute.jit
+    def _publish_current_work(self) -> None:
+        if cute.arch.lane_idx() == Int32(0):
+            self.sWork[0] = self._block
+            self.sWork[1] = self._head
+            self.sWork[2] = self._batch
+            self.sWork[3] = Int32(1) if self._valid else Int32(0)
+        cute.arch.barrier_arrive(
+            barrier_id=int(NamedBarrierFwd.SchedulerFull),
+            number_of_threads=self.params.num_sync_threads,
+        )
+
+    @cute.jit
+    def _consume_current_work(self) -> WorkTileInfo:
+        cute.arch.barrier(
+            barrier_id=int(NamedBarrierFwd.SchedulerFull),
+            number_of_threads=self.params.num_sync_threads,
+        )
+        self._block = self.sWork[0]
+        self._head = self.sWork[1]
+        self._batch = self.sWork[2]
+        self._valid = self.sWork[3] != Int32(0)
+        cute.arch.barrier_arrive(
+            barrier_id=int(NamedBarrierFwd.SchedulerEmpty),
+            number_of_threads=self.params.num_sync_threads,
+        )
+        return self.get_current_work()
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        return WorkTileInfo(
+            (self._block, self._head, self._batch, Int32(0)), self._valid
+        )
+
+    @cute.jit
+    def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
+        if const_expr(self.is_producer):
+            self._map_tile(cute.arch.block_idx()[0])
+            self._publish_current_work()
+            return self.get_current_work()
+        return self._consume_current_work()
+
+    @cute.jit
+    def prefetch_next_work(self, *, loc=None, ip=None) -> None:
+        if const_expr(self.is_producer):
+            next_tile_idx = Int32(0)
+            if cute.arch.lane_idx() == Int32(0):
+                next_tile_idx = Int32(
+                    cute.arch.atomic_add(
+                        ptr=self.params.mTileCounter.iterator,
+                        val=Int32(1),
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                ) + cute.arch.grid_dim()[0]
+            self._next_tile_idx = next_tile_idx
+
+    @cute.jit
+    def advance_to_next_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        if const_expr(self.is_producer):
+            next_tile_idx = cute.arch.shuffle_sync(self._next_tile_idx, Int32(0))
+            self._map_tile(next_tile_idx)
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.SchedulerEmpty),
+                number_of_threads=self.params.num_sync_threads,
+            )
+            self._publish_current_work()
+            return self.get_current_work()
+        return self._consume_current_work()
+
+    def producer_tail(self, *, loc=None, ip=None):
+        pass
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        objects = [
+            self.params,
+            self.sWork,
+            self._current_tile_idx,
+            self._group_start_tile,
+            self._virtual_batch,
+            self._next_tile_idx,
+            self._block,
+            self._head,
+            self._batch,
+            self._valid,
+        ]
+        for obj in objects:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        objects = [
+            self.params,
+            self.sWork,
+            self._current_tile_idx,
+            self._group_start_tile,
+            self._virtual_batch,
+            self._next_tile_idx,
+            self._block,
+            self._head,
+            self._batch,
+            self._valid,
+        ]
+        rebuilt = []
+        for obj, n_items in zip(objects, self._values_pos):
+            rebuilt.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return self.__class__(
+            rebuilt[0],
+            rebuilt[1],
+            self.is_producer,
+            *rebuilt[2:],
+            loc=self._loc,
+            ip=self._ip,
+        )
 
 
 class SingleTileVarlenScheduler:

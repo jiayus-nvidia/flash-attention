@@ -8,6 +8,7 @@ import cutlass.cute as cute
 import torch
 
 from flash_attn_cute.cute_dsl_utils import get_broadcast_dims, to_cute_tensor
+from flash_attn_cute.testing import is_fake_mode
 
 
 def ceildiv(a: int, b: int) -> int:
@@ -25,6 +26,7 @@ class BlockSparseTensors(NamedTuple):
     dq_write_order_full: cute.Tensor | None = None
     mask_block_offset: cute.Tensor | None = None
     full_block_offset: cute.Tensor | None = None
+    mask_block_masks: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -51,6 +53,9 @@ class BlockSparseTensorsTorch(NamedTuple):
     spt: bool | None = None
     mask_block_offset: torch.Tensor | None = None
     full_block_offset: torch.Tensor | None = None
+    mask_block_masks: torch.Tensor | None = None
+    pack_gqa: bool | None = None
+    bwd_tensors: "BlockSparseTensorsTorch | None" = None
 
 
 class LinearBlockSparseTensors(NamedTuple):
@@ -375,7 +380,7 @@ def compute_dq_write_order_from_linear_csr(
     flat_rank = torch.empty(total, device=device, dtype=torch.int32)
     flat_rank[sorted_pos] = sorted_rank
     mask_rank = flat_rank[: mask_idx.numel()]
-    full_rank = flat_rank[mask_idx.numel():] if has_full else None
+    full_rank = flat_rank[mask_idx.numel() :] if has_full else None
     return mask_rank, full_rank
 
 
@@ -692,7 +697,9 @@ def infer_linear_block_sparse_expected_shapes(
     if sparse_block_size_kv is None:
         sparse_block_size_kv = base_n_block
     if sparse_block_size_kv != base_n_block:
-        raise ValueError(f"Linear block sparse tensors {context} require BLOCK_SIZE_KV={base_n_block}.")
+        raise ValueError(
+            f"Linear block sparse tensors {context} require BLOCK_SIZE_KV={base_n_block}."
+        )
 
     num_m_blocks = tensors.mask_block_cnt.shape[2]
     if sparse_block_size_q is None:
@@ -812,6 +819,11 @@ def normalize_block_sparse_tensors(
         dq_write_order=dq_write_order,
         dq_write_order_full=dq_write_order_full,
         spt=spt,
+        mask_block_offset=tensors.mask_block_offset,
+        full_block_offset=tensors.full_block_offset,
+        mask_block_masks=tensors.mask_block_masks,
+        pack_gqa=tensors.pack_gqa,
+        bwd_tensors=tensors.bwd_tensors,
     )
 
 
@@ -885,7 +897,247 @@ def normalize_linear_block_sparse_tensors(
         spt=spt,
         mask_block_offset=mask_offset,
         full_block_offset=full_offset,
+        mask_block_masks=getattr(tensors, "mask_block_masks", None),
+        pack_gqa=getattr(tensors, "pack_gqa", None),
+        bwd_tensors=getattr(tensors, "bwd_tensors", None),
     )
+
+
+def normalize_arbitrary_block_sparse_config(
+    tensors: BlockSparseTensorsTorch,
+    *,
+    device: torch.device,
+    batch_size: int,
+    num_q_heads: int,
+    is_varlen: bool,
+    block_size: tuple[int, int],
+    pack_gqa: bool,
+    num_mma_threads: int,
+    payload_padded_words: int,
+    expected_fixed_total_m_blocks: int | None = None,
+) -> BlockSparseTensorsTorch:
+    """Validate the compact arbitrary Q2K plan without synchronizing the device."""
+
+    if not isinstance(tensors, BlockSparseTensorsTorch):
+        raise TypeError(
+            "arbitrary attention requires BlockSparseTensorsTorch returned by "
+            "create_arbitrary_block_sparse_tensors"
+        )
+    if tensors.block_size != block_size:
+        raise ValueError(
+            f"arbitrary plan block_size={tensors.block_size} does not match "
+            f"the resolved consumer block_size={block_size}"
+        )
+    if tensors.pack_gqa is None or tensors.pack_gqa != pack_gqa:
+        raise ValueError(
+            f"arbitrary plan pack_gqa={tensors.pack_gqa} does not match "
+            f"the resolved consumer pack_gqa={pack_gqa}"
+        )
+
+    required = {
+        "mask_block_cnt": (tensors.mask_block_cnt, torch.int32, 2),
+        "mask_block_offset": (tensors.mask_block_offset, torch.int32, 1),
+        "mask_block_idx": (tensors.mask_block_idx, torch.int32, 1),
+        "full_block_cnt": (tensors.full_block_cnt, torch.int32, 2),
+        "full_block_offset": (tensors.full_block_offset, torch.int32, 1),
+        "full_block_idx": (tensors.full_block_idx, torch.int32, 1),
+        "mask_block_masks": (tensors.mask_block_masks, torch.uint32, 4),
+    }
+    for name, (tensor, dtype, ndim) in required.items():
+        if tensor is None:
+            raise ValueError(f"arbitrary plan requires {name}")
+        if tensor.dtype != dtype:
+            raise TypeError(f"{name} must have dtype {dtype}; got {tensor.dtype}")
+        if tensor.ndim != ndim:
+            raise ValueError(f"{name} must have rank {ndim}; got shape {tuple(tensor.shape)}")
+        if tensor.device != device:
+            raise ValueError(f"{name} must be on {device}; got {tensor.device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    mask_cnt = tensors.mask_block_cnt
+    full_cnt = tensors.full_block_cnt
+    hmask, total_m_blocks = mask_cnt.shape
+    if hmask not in (1, num_q_heads):
+        raise ValueError(f"arbitrary plan Hmask must be 1 or Hq ({num_q_heads}); got {hmask}")
+    if tuple(full_cnt.shape) != tuple(mask_cnt.shape):
+        raise ValueError("mask_block_cnt and full_block_cnt must have identical shapes")
+    num_plan_rows = hmask * total_m_blocks
+    if tensors.mask_block_offset.numel() != num_plan_rows + 1:
+        raise ValueError("mask_block_offset must have Hmask * total_m_blocks + 1 elements")
+    if tensors.full_block_offset.numel() != num_plan_rows + 1:
+        raise ValueError("full_block_offset must have Hmask * total_m_blocks + 1 elements")
+    if (
+        expected_fixed_total_m_blocks is not None
+        and total_m_blocks != expected_fixed_total_m_blocks
+    ):
+        raise ValueError(
+            f"fixed arbitrary plan has total_m_blocks={total_m_blocks}; "
+            f"expected {expected_fixed_total_m_blocks}"
+        )
+
+    expected_payload_shape = (
+        tensors.mask_block_idx.numel(),
+        1,
+        num_mma_threads,
+        payload_padded_words,
+    )
+    if tuple(tensors.mask_block_masks.shape) != expected_payload_shape:
+        raise ValueError(
+            "mask_block_masks has incompatible consumer layout: expected "
+            f"{expected_payload_shape}, got {tuple(tensors.mask_block_masks.shape)}"
+        )
+    if not is_fake_mode() and tensors.mask_block_masks.data_ptr() % 16 != 0:
+        raise ValueError("mask_block_masks must be 16-byte aligned")
+
+    if is_varlen:
+        cu_total_m_blocks = tensors.cu_total_m_blocks
+        if cu_total_m_blocks is None:
+            raise ValueError("varlen arbitrary plan requires cu_total_m_blocks")
+        if (
+            cu_total_m_blocks.dtype != torch.int32
+            or cu_total_m_blocks.device != device
+            or cu_total_m_blocks.ndim != 1
+            or cu_total_m_blocks.numel() != batch_size + 1
+            or not cu_total_m_blocks.is_contiguous()
+        ):
+            raise ValueError("cu_total_m_blocks must be contiguous int32 CUDA [B + 1]")
+    elif tensors.cu_total_m_blocks is not None:
+        raise ValueError("fixed arbitrary plan must not provide cu_total_m_blocks")
+
+    for name in (
+        "cu_block_idx_offsets",
+        "dq_write_order",
+        "dq_write_order_full",
+        "spt",
+    ):
+        if getattr(tensors, name) is not None:
+            raise ValueError(f"arbitrary forward plan requires {name}=None")
+    return tensors
+
+
+def normalize_arbitrary_block_sparse_config_bwd(
+    tensors: BlockSparseTensorsTorch,
+    *,
+    device: torch.device,
+    batch_size: int,
+    num_q_heads: int,
+    is_varlen: bool,
+    block_size: tuple[int, int],
+    subtile_factor: int,
+    num_mma_threads: int,
+    payload_padded_words: int,
+    expected_hmask: int | None = None,
+    expected_spt: bool = False,
+    expected_fixed_total_n_blocks: int | None = None,
+) -> BlockSparseTensorsTorch:
+    """Validate the compact arbitrary K2Q plan without synchronizing the device."""
+
+    if not isinstance(tensors, BlockSparseTensorsTorch):
+        raise TypeError(
+            "arbitrary backward requires BlockSparseTensorsTorch returned by "
+            "create_arbitrary_block_sparse_tensors(..., build_backward=True)"
+        )
+    if tensors.block_size != block_size:
+        raise ValueError(
+            f"arbitrary backward plan block_size={tensors.block_size} does not match "
+            f"the resolved consumer block_size={block_size}"
+        )
+    if tensors.pack_gqa is not None:
+        raise ValueError("arbitrary backward plan requires pack_gqa=None")
+    if tensors.bwd_tensors is not None:
+        raise ValueError("nested arbitrary backward plans are not supported")
+
+    required = {
+        "mask_block_cnt": (tensors.mask_block_cnt, torch.int32, 2),
+        "mask_block_offset": (tensors.mask_block_offset, torch.int32, 1),
+        "mask_block_idx": (tensors.mask_block_idx, torch.int32, 1),
+        "full_block_cnt": (tensors.full_block_cnt, torch.int32, 2),
+        "full_block_offset": (tensors.full_block_offset, torch.int32, 1),
+        "full_block_idx": (tensors.full_block_idx, torch.int32, 1),
+        "dq_write_order": (tensors.dq_write_order, torch.int32, 1),
+        "dq_write_order_full": (tensors.dq_write_order_full, torch.int32, 1),
+        "mask_block_masks": (tensors.mask_block_masks, torch.uint32, 4),
+    }
+    for name, (tensor, dtype, ndim) in required.items():
+        if tensor is None:
+            raise ValueError(f"arbitrary backward plan requires {name}")
+        if tensor.dtype != dtype:
+            raise TypeError(f"{name} must have dtype {dtype}; got {tensor.dtype}")
+        if tensor.ndim != ndim:
+            raise ValueError(f"{name} must have rank {ndim}; got shape {tuple(tensor.shape)}")
+        if tensor.device != device:
+            raise ValueError(f"{name} must be on {device}; got {tensor.device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    mask_cnt = tensors.mask_block_cnt
+    full_cnt = tensors.full_block_cnt
+    hmask, total_n_blocks = mask_cnt.shape
+    if hmask not in (1, num_q_heads):
+        raise ValueError(
+            f"arbitrary backward plan Hmask must be 1 or Hq ({num_q_heads}); got {hmask}"
+        )
+    if expected_hmask is not None and hmask != expected_hmask:
+        raise ValueError(
+            f"arbitrary backward plan Hmask={hmask} does not match forward plan Hmask={expected_hmask}"
+        )
+    if tuple(full_cnt.shape) != tuple(mask_cnt.shape):
+        raise ValueError("mask_block_cnt and full_block_cnt must have identical shapes")
+    if (
+        expected_fixed_total_n_blocks is not None
+        and total_n_blocks != expected_fixed_total_n_blocks
+    ):
+        raise ValueError(
+            f"fixed arbitrary backward plan has total_n_blocks={total_n_blocks}; "
+            f"expected {expected_fixed_total_n_blocks}"
+        )
+
+    num_plan_rows = hmask * total_n_blocks
+    if tensors.mask_block_offset.numel() != num_plan_rows + 1:
+        raise ValueError("mask_block_offset must have Hmask * total_n_blocks + 1 elements")
+    if tensors.full_block_offset.numel() != num_plan_rows + 1:
+        raise ValueError("full_block_offset must have Hmask * total_n_blocks + 1 elements")
+    if tensors.dq_write_order.shape != tensors.mask_block_idx.shape:
+        raise ValueError("dq_write_order must be parallel to mask_block_idx")
+    if tensors.dq_write_order_full.shape != tensors.full_block_idx.shape:
+        raise ValueError("dq_write_order_full must be parallel to full_block_idx")
+
+    expected_payload_shape = (
+        tensors.mask_block_idx.numel(),
+        subtile_factor,
+        num_mma_threads,
+        payload_padded_words,
+    )
+    if tuple(tensors.mask_block_masks.shape) != expected_payload_shape:
+        raise ValueError(
+            "mask_block_masks has incompatible backward consumer layout: expected "
+            f"{expected_payload_shape}, got {tuple(tensors.mask_block_masks.shape)}"
+        )
+    if not is_fake_mode() and tensors.mask_block_masks.data_ptr() % 16 != 0:
+        raise ValueError("mask_block_masks must be 16-byte aligned")
+
+    if is_varlen:
+        cu_total_m_blocks = tensors.cu_total_m_blocks
+        if cu_total_m_blocks is None:
+            raise ValueError("varlen arbitrary backward plan requires cu_total_m_blocks")
+        if (
+            cu_total_m_blocks.dtype != torch.int32
+            or cu_total_m_blocks.device != device
+            or cu_total_m_blocks.ndim != 1
+            or cu_total_m_blocks.numel() != batch_size + 1
+            or not cu_total_m_blocks.is_contiguous()
+        ):
+            raise ValueError("backward cu_total_m_blocks must be contiguous int32 CUDA [B + 1]")
+    elif tensors.cu_total_m_blocks is not None:
+        raise ValueError("fixed arbitrary backward plan must not provide cu_total_m_blocks")
+    if tensors.cu_block_idx_offsets is not None:
+        raise ValueError("arbitrary backward plan requires cu_block_idx_offsets=None")
+    if tensors.spt is None or tensors.spt != expected_spt:
+        raise ValueError(
+            f"arbitrary backward plan spt={tensors.spt} does not match consumer spt={expected_spt}"
+        )
+    return tensors
 
 
 def is_block_sparsity_enabled(
@@ -922,6 +1174,7 @@ def get_block_sparse_broadcast_pattern(
         tensors.dq_write_order_full,
         tensors.mask_block_offset,
         tensors.full_block_offset,
+        getattr(tensors, "mask_block_masks", None),
     ):
         if tensor is not None:
             if is_linear_block_sparse_tensors(tensors) and tensor.ndim == 3:
@@ -1120,6 +1373,16 @@ def to_cute_block_sparse_tensors(
         else None
         for t in (tensors.mask_block_offset, tensors.full_block_offset)
     ]
+    mask_block_masks_tensor = (
+        to_cute_tensor(
+            tensors.mask_block_masks,
+            assumed_align=16,
+            leading_dim=-1,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        if getattr(tensors, "mask_block_masks", None) is not None
+        else None
+    )
 
     return BlockSparseTensors(
         mask_block_cnt_tensor,
@@ -1132,6 +1395,7 @@ def to_cute_block_sparse_tensors(
         dq_write_order_full_tensor,
         mask_block_offset_tensor,
         full_block_offset_tensor,
+        mask_block_masks_tensor,
     )
 
 

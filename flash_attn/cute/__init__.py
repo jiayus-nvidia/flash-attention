@@ -11,8 +11,10 @@ from .interface import (
     flash_attn_func,
     flash_attn_varlen_func,
 )
+from .arbitrary_block_sparsity import create_arbitrary_block_sparse_tensors
 
 __all__ = [
     "flash_attn_func",
     "flash_attn_varlen_func",
+    "create_arbitrary_block_sparse_tensors",
 ]

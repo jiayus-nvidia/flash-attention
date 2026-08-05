@@ -21,6 +21,38 @@ import quack.activation
 
 _MIXER_ATTRS = ("__vec_size__",)
 
+
+@dsl_user_op
+def mask_f32_by_u32_bit(
+    value: Float32,
+    mask: cutlass.Uint32,
+    bit_idx: int,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
+    """Keep or zero one FP32 value using a bit without a predicate register."""
+
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(value).ir_value(loc=loc, ip=ip),
+                cutlass.Uint32(mask).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t"
+            ".reg .s32 keep_mask;\n\t"
+            f"bfe.s32 keep_mask, $2, {bit_idx}, 1;\n\t"
+            "and.b32 $0, $1, keep_mask;\n\t"
+            "}",
+            "=f,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 # Obtained from sollya:
 # fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);
 POLY_EX2 = {
@@ -368,7 +400,20 @@ def fmax(
 def fmax_reduce(
     x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
 ) -> Float32:
-    if const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
+    if const_expr(arch == 90):
+        # Match the Hopper C++ softmax reduction order. The serial chain lets
+        # ptxas interleave the next row's max work with the current row's exp2.
+        res = cute.make_rmem_tensor(x.shape, Float32)
+        res.store(x)
+        local_max = res[0]
+        for i in cutlass.range_constexpr(1, cute.size(x.shape)):
+            local_max = fmax(local_max, res[i], ftz=True)
+        return (
+            local_max
+            if const_expr(init_val is None)
+            else fmax(local_max, init_val, ftz=True)
+        )
+    elif const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
         # if const_expr(init_val is None):
         #     init_val = -cutlass.Float32.if
         # return x.reduce(cute.ReductionOp.MAX, init_val, 0)

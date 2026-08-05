@@ -134,9 +134,18 @@ class Softmax(ParamsBase):
             if cutlass.const_expr(sink_val is not None):
                 sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
                 LOG2_E = math.log2(math.e)
-                row_sum[r] += cute.math.exp2(
-                    sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True
-                )
+                if row_max[r] == -Float32.inf:
+                    # Avoid the indeterminate -inf + log(inf) form for an empty row.
+                    # Seeding the online-softmax state with the sink produces LSE=sink
+                    # while the independently zeroed output accumulator remains zero.
+                    if sink_val_cur != -Float32.inf:
+                        row_max[r] = sink_val_cur * LOG2_E / scale_log2
+                        row_sum[r] = 1.0
+                else:
+                    row_sum[r] += cute.math.exp2(
+                        sink_val_cur * LOG2_E - row_max[r] * scale_log2,
+                        fastmath=True,
+                    )
 
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]

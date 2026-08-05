@@ -13,7 +13,6 @@
 # So the main backward kernel is unchanged; we just replace D with D' = D - dLSE here.
 import math
 import operator
-from functools import partial
 from typing import Callable, Type, Optional
 
 import cuda.bindings.driver as cuda
@@ -30,7 +29,7 @@ from flash_attn_cute.seqlen_info import SeqlenInfo
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn_cute.tile_scheduler import (
     SingleTileScheduler,
-    SingleTileVarlenScheduler,
+    SingleTileMaxVarlenScheduler,
     TileSchedulerArguments,
 )
 
@@ -44,6 +43,7 @@ class FlashAttentionBackwardPreprocess:
         tile_m: int = 128,
         num_threads: int = 256,
         use_padded_offsets: bool = True,
+        accum_hdim_multiple: int = 32,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -59,10 +59,14 @@ class FlashAttentionBackwardPreprocess:
         self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
         self.dtype = dtype
         self.tile_m = tile_m
-        # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
-        self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
-        self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+        # Accumulator storage must use the same head-dimension padding as the
+        # main backward kernel and postprocess kernel.
+        self.head_dim_padded = int(
+            math.ceil(head_dim / accum_hdim_multiple) * accum_hdim_multiple
+        )
+        self.head_dim_v_padded = int(
+            math.ceil(head_dim_v / accum_hdim_multiple) * accum_hdim_multiple
+        )
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.num_threads = num_threads
         self.use_padded_offsets = use_padded_offsets
@@ -136,6 +140,7 @@ class FlashAttentionBackwardPreprocess:
         mCuSeqlensQ: Optional[cute.Tensor],  # (batch + 1,)
         mSeqUsedQ: Optional[cute.Tensor],  # (batch,)
         mdLSE: Optional[cute.Tensor],  # (batch, nheads, seqlen) or (nheads, total_q)
+        max_seqlen_q: cutlass.Int32 = 0,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -172,17 +177,23 @@ class FlashAttentionBackwardPreprocess:
         if const_expr(mdQaccum is not None):
             mdQaccum = layout_utils.select(mdQaccum, transpose)
 
-        if const_expr(mCuSeqlensQ is not None):
-            TileScheduler = SingleTileVarlenScheduler
-            num_head = mO.shape[1]
-            num_batch = mCuSeqlensQ.shape[0] - 1
+        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
+            TileScheduler = SingleTileMaxVarlenScheduler
+            num_head = mO.shape[1] if const_expr(mCuSeqlensQ is not None) else mO.shape[2]
+            num_batch = (
+                mCuSeqlensQ.shape[0] - 1
+                if const_expr(mCuSeqlensQ is not None)
+                else mO.shape[0]
+            )
+            num_block = cute.ceil_div(max_seqlen_q, self.tile_m)
         else:
             TileScheduler = SingleTileScheduler
             num_head = mO.shape[2]
             num_batch = mO.shape[0]
+            num_block = cute.ceil_div(mO.shape[1], self.tile_m)
 
         tile_sched_args = TileSchedulerArguments(
-            num_block=cute.ceil_div(mO.shape[1], self.tile_m),
+            num_block=num_block,
             num_head=num_head,
             num_batch=num_batch,
             num_splits=1,
@@ -279,7 +290,7 @@ class FlashAttentionBackwardPreprocess:
                 mLSE_cur = seqlen.offset_batch(mLSE, batch_idx, dim=2)[None, head_idx]
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
                 lse = Float32.inf
-                if tidx < seqlen_limit:
+                if tidx < self.tile_m and tidx < seqlen_limit:
                     lse = gLSE[tidx]
 
             blk_shape = (self.tile_m, self.head_dim_v_padded)
@@ -295,9 +306,6 @@ class FlashAttentionBackwardPreprocess:
             tOpO = None
             if const_expr(self.check_hdim_v_oob):
                 tOpO = copy_utils.predicate_k(tOcO, limit=headdim_v)
-            # Each copy will use the same predicate
-            copy = partial(copy_utils.copy, pred=tOpO)
-
             tOrO = cute.make_rmem_tensor_like(tOgO)
             tOrdO = cute.make_rmem_tensor_like(tOgdO)
             if const_expr(self.check_hdim_v_oob):
@@ -307,13 +315,21 @@ class FlashAttentionBackwardPreprocess:
             for m in cutlass.range(cute.size(tOrO.shape[1]), unroll_full=True):
                 # Instead of using tOcO, we using t0OcO and subtract the offset from the limit.
                 # This is bc the entries of t0OcO are known at compile time.
-                if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
-                    copy(tOgO[None, m, None], tOrO[None, m, None])
-                    copy(tOgdO[None, m, None], tOrdO[None, m, None])
-            # O and dO loads are done; signal that the next kernel can start.
-            # Correctness is ensured by griddepcontrol_wait() in bwd_sm90 before it reads our outputs.
-            if const_expr(self.use_pdl):
-                cute.arch.griddepcontrol_launch_dependents()
+                if (
+                    tOcO[0, m, 0][0] < self.tile_m
+                    and t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]
+                ):
+                    pred = (
+                        tOpO[None, m, None]
+                        if const_expr(self.check_hdim_v_oob)
+                        else None
+                    )
+                    copy_utils.copy(
+                        tOgO[None, m, None], tOrO[None, m, None], pred=pred
+                    )
+                    copy_utils.copy(
+                        tOgdO[None, m, None], tOrdO[None, m, None], pred=pred
+                    )
             # Sum across the "k" dimension
             pdpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
                 cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
@@ -336,12 +352,15 @@ class FlashAttentionBackwardPreprocess:
             if tOcO[0, 0, 0][1] == 0:
                 for m in cutlass.range(cute.size(PdP_sum), unroll_full=True):
                     row = tOcO[0, m, 0][0]
-                    PdPsum_val = 0.0
-                    if row < seqlen_limit:
-                        PdPsum_val = PdP_sum[m]
-                        if const_expr(mdLSE is not None):
-                            PdPsum_val -= gdLSE[row]
-                    gPdPsum[row] = PdPsum_val
+                    # Small Dv can map more copy threads than rows in tile_m.
+                    # Never let those inactive rows overwrite the next tile.
+                    if row < self.tile_m:
+                        PdPsum_val = 0.0
+                        if row < seqlen_limit:
+                            PdPsum_val = PdP_sum[m]
+                            if const_expr(mdLSE is not None):
+                                PdPsum_val -= gdLSE[row]
+                        gPdPsum[row] = PdPsum_val
 
             # Clear dQaccum
             if const_expr(mdQaccum is not None):
@@ -366,5 +385,14 @@ class FlashAttentionBackwardPreprocess:
                 )[None, head_idx]
                 gLSElog2 = cute.local_tile(mLSElog2_cur, (self.tile_m,), (m_block,))
                 LOG2_E = math.log2(math.e)
-                if tidx < seqlen_q_rounded - m_block * self.tile_m:
+                if (
+                    tidx < self.tile_m
+                    and tidx < seqlen_q_rounded - m_block * self.tile_m
+                ):
                     gLSElog2[tidx] = lse * LOG2_E if lse != -Float32.inf else 0.0
+
+            # Publish the dependency only after every thread has written dPsum,
+            # lse_log2, and the zeroed dQ accumulator consumed by backward.
+            if const_expr(self.use_pdl):
+                cute.arch.barrier()
+                cute.arch.griddepcontrol_launch_dependents()

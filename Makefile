@@ -1,5 +1,5 @@
 
-.PHONY: clean_dist create_dist upload_package setup create_block_mask install_create_block_mask test_create_block_mask test_arbitrary_mask_csr
+.PHONY: clean_dist create_dist upload_package setup create_block_mask install_create_block_mask test_create_block_mask test_arbitrary_mask_varlen
 
 PYTHON ?= python
 PIP ?= $(PYTHON) -m pip
@@ -33,5 +33,5 @@ create_block_mask install_create_block_mask:
 test_create_block_mask:
 	$(MAKE) -C csrc/utils test_create_block_mask
 
-test_arbitrary_mask_csr: create_block_mask
-	pytest tests/cute/test_arbitrary_mask_port.py -k "linear_block_sparse" -v
+test_arbitrary_mask_varlen:
+	$(PYTHON) -m pytest tests/cute/test_arbitrary_mask_varlen.py -v

@@ -163,6 +163,9 @@ class JITCache:
     def __contains__(self, key: CompileKeyType) -> bool:
         return key in self.cache
 
+    def __len__(self) -> int:
+        return len(self.cache)
+
     def clear(self) -> None:
         """
         Clear in-memory cache of compiled functions

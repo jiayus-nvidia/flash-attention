@@ -336,6 +336,7 @@ class FlashAttentionForwardBase:
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        sO_empty_mbar_ptr: Optional[cute.Pointer] = None,
     ):
         # store acc_O
         rO = cute.make_fragment_like(acc_O, self.dtype)
@@ -408,6 +409,9 @@ class FlashAttentionForwardBase:
                 store_O()
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
+                if const_expr(sO_empty_mbar_ptr is not None):
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(sO_empty_mbar_ptr)
         else:
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwd.Epilogue),
@@ -418,6 +422,14 @@ class FlashAttentionForwardBase:
             tOrO = cute.make_fragment_like(tOsO, self.dtype)
             # load acc O from smem to rmem for wider vectorization
             cute.autovec_copy(tOsO, tOrO)
+            if const_expr(sO_empty_mbar_ptr is not None):
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.Epilogue),
+                    number_of_threads=self.num_epilogue_threads,
+                )
+                if tidx < cute.arch.WARP_SIZE:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(sO_empty_mbar_ptr)
             if const_expr(not self.pack_gqa):
                 gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
                 tOgO = gmem_thr_copy_O.partition_D(gO)
