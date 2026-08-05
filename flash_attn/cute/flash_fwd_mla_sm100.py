@@ -202,12 +202,12 @@ class FlashAttentionMLAForwardSm100:
             self.hdimv // self.num_hdimv_splits,
             self.tile_n,
         )
-        self.major_mode_Q = tcgen05.OperandMajorMode.K
-        self.major_mode_Qvi = tcgen05.OperandMajorMode.K
-        self.major_mode_K = tcgen05.OperandMajorMode.K
-        self.major_mode_Vi = tcgen05.OperandMajorMode.K
-        self.major_mode_Vti = tcgen05.OperandMajorMode.MN
-        self.major_mode_P = tcgen05.OperandMajorMode.K
+        self.major_mode_Q = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Qvi = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_K = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Vi = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Vti = cute.nvgpu.OperandMajorMode.MN
+        self.major_mode_P = cute.nvgpu.OperandMajorMode.K
         self.operand_source_Q = tcgen05.OperandSource.SMEM
         self.operand_source_Qvi = tcgen05.OperandSource.SMEM
         self.operand_source_P = tcgen05.OperandSource.SMEM

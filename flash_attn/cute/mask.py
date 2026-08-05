@@ -652,7 +652,7 @@ class AttentionMask:
                         )
                     else:
                         num_limits = const_expr(func_num + 1)
-                        col_limits = cute.make_fragment((num_limits,), Int32)
+                        col_limits = cute.make_rmem_tensor((num_limits,), Int32)
                         col_limits[0] = max(
                             arbitrary_func[batch_for_mask, head_for_mask, 0, mask_row_for_mod]
                             - n_block_offset,
@@ -938,10 +938,10 @@ class AttentionMask:
                 # register pressure of staging all ncol values at once.
                 n_intervals = const_expr(func_num // 2)
                 CHUNK = const_expr(8)
-                col_max_0_frag = cute.make_fragment(CHUNK, Int32)
+                col_max_0_frag = cute.make_rmem_tensor(CHUNK, Int32)
                 if const_expr(n_intervals > 0):
-                    col_min_frag = cute.make_fragment(CHUNK * n_intervals, Int32)
-                    col_max_frag = cute.make_fragment(CHUNK * n_intervals, Int32)
+                    col_min_frag = cute.make_rmem_tensor(CHUNK * n_intervals, Int32)
+                    col_max_frag = cute.make_rmem_tensor(CHUNK * n_intervals, Int32)
                 for base in cutlass.range_constexpr(0, ncol, CHUNK):
                     chunk = const_expr(min(CHUNK, ncol - base))
                     for c in cutlass.range_constexpr(chunk):

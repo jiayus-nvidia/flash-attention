@@ -43,7 +43,7 @@ from flash_attn_cute.tile_scheduler import (
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
 )
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 
 from flash_attn_cute.flash_fwd import FlashAttentionForwardBase
 
@@ -96,8 +96,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             Float32,
             atom_layout_mnk=(self.tile_m // 64, 1, 1),
             tiler_mn=(64, self.tile_n),
@@ -105,8 +105,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
             Float32,
             atom_layout_mnk=(self.tile_m // 64, 1, 1),  # Might need (1, 2, 1) for hdim 512
             tiler_mn=(64, self.tile_hdimv),
@@ -722,7 +722,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         mPageTable,
                         mK,
                         mV,
-                        FastDivmodDivisor(mK.shape[0]),
+                        FastDivmodDivisorV2(mK.shape[0]),
                         batch_idx,
                         head_idx_kv,
                         tidx,
@@ -1058,10 +1058,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 fastdiv_mods = (
                     seqlen_q_divmod
                     if not recompute_fastdiv_mods_q
-                    else FastDivmodDivisor(seqlen.seqlen_q),
+                    else FastDivmodDivisorV2(seqlen.seqlen_q),
                     seqlen_k_divmod
                     if not recompute_fastdiv_mods_k
-                    else FastDivmodDivisor(seqlen.seqlen_k),
+                    else FastDivmodDivisorV2(seqlen.seqlen_k),
                 )
 
             mask = AttentionMaskCls(seqlen)

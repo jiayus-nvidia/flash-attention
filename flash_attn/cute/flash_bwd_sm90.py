@@ -8,7 +8,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass.cute.nvgpu import cpasync, warpgroup
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
@@ -256,8 +256,8 @@ class FlashAttentionBackwardSm90:
         tiled_mma_SdP = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             Float32,
             atom_layout_mnk=maybe_swap_mn(atom_layout_SdP, self.SdP_swapAB),
             tiler_mn=(64, tiler_mn_SdP[1] if not self.SdP_swapAB else tiler_mn_SdP[0]),
@@ -270,10 +270,10 @@ class FlashAttentionBackwardSm90:
             sm90_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
                 self.dtype,
-                warpgroup.OperandMajorMode.MN
+                cute.nvgpu.OperandMajorMode.MN
                 if not self.mma_dkv_is_rs
-                else warpgroup.OperandMajorMode.K,
-                warpgroup.OperandMajorMode.MN,
+                else cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.MN,
                 Float32,
                 atom_layout_mnk=maybe_swap_mn(atom_layout_dKV, self.dKV_swapAB),
                 tiler_mn=(64, tiler_mn_d[1] if not self.dKV_swapAB else tiler_mn_d[0]),
@@ -290,8 +290,8 @@ class FlashAttentionBackwardSm90:
         tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K if not self.dQ_swapAB else warpgroup.OperandMajorMode.MN,
-            warpgroup.OperandMajorMode.MN if not self.dQ_swapAB else warpgroup.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K if not self.dQ_swapAB else cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.MN if not self.dQ_swapAB else cute.nvgpu.OperandMajorMode.K,
             Float32,
             atom_layout_mnk=maybe_swap_mn(atom_layout_dQ, self.dQ_swapAB),
             tiler_mn=(64, tiler_mn_dQ[1] if not self.dQ_swapAB else tiler_mn_dQ[0]),
@@ -557,13 +557,13 @@ class FlashAttentionBackwardSm90:
         if const_expr(aux_tensors is not None):
             seqlen_q = cute.size(mQ.shape[0])
             seqlen_k = cute.size(mK.shape[0])
-            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
-            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
+            seqlen_q_divmod = FastDivmodDivisorV2(seqlen_q)
+            seqlen_k_divmod = FastDivmodDivisorV2(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
 
         qhead_per_kvhead_divmod = None
         if const_expr(self.qhead_per_kvhead > 1):
-            qhead_per_kvhead_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
+            qhead_per_kvhead_divmod = FastDivmodDivisorV2(self.qhead_per_kvhead)
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
 
@@ -666,7 +666,7 @@ class FlashAttentionBackwardSm90:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        qhead_per_kvhead_divmod: Optional[FastDivmodDivisorV2] = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
@@ -874,7 +874,7 @@ class FlashAttentionBackwardSm90:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        qhead_per_kvhead_divmod: Optional[FastDivmodDivisorV2] = None,
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
@@ -1021,7 +1021,7 @@ class FlashAttentionBackwardSm90:
     def apply_score_mod(
         self,
         acc_S: cute.Tensor,
-        thr_mma_SdP: cute.core.ThrMma,
+        thr_mma_SdP: cute.ThrMma,
         batch_idx,
         head_idx,
         m_block,
@@ -1065,7 +1065,7 @@ class FlashAttentionBackwardSm90:
         self,
         grad_tensor: cute.Tensor,
         score_tensor: cute.Tensor,
-        thr_mma_SdP: cute.core.ThrMma,
+        thr_mma_SdP: cute.ThrMma,
         batch_idx,
         head_idx,
         m_block,
@@ -1140,7 +1140,7 @@ class FlashAttentionBackwardSm90:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        qhead_per_kvhead_divmod: Optional[FastDivmodDivisorV2] = None,
         is_dQ_wg: cutlass.Constexpr[bool] = True,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -1641,7 +1641,7 @@ class FlashAttentionBackwardSm90:
         n_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
-        qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        qhead_per_kvhead_divmod: Optional[FastDivmodDivisorV2] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
     ):
