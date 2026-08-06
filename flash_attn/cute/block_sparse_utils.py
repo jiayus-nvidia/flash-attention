@@ -409,7 +409,7 @@ def load_block_list(
     Q is loaded separately on its own mbarrier before this function is called.
 
     Note:
-        we iterate along the block_n indices in reverse.
+        we iterate along the n_block indices in reverse.
 
     Returns:
         Updated kv_producer_state after processing the block list.
@@ -523,18 +523,6 @@ def prefetch_arbitrary_forward_mask(
 
 
 @cute.jit
-def stage_arbitrary_forward_n_block(
-    s_block_n: Optional[cute.Tensor],
-    kv_producer_state,
-    n_block: Int32,
-):
-    """Publish the selected block index with its K pipeline stage."""
-    if const_expr(s_block_n is not None):
-        with cute.arch.elect_one():
-            s_block_n[kv_producer_state.index] = n_block
-
-
-@cute.jit
 def apply_arbitrary_forward_mask(
     acc_S: cute.Tensor,
     n_block: Int32,
@@ -573,7 +561,6 @@ def produce_arbitrary_forward_nonoverlap(
     partial_payload_base: Int32,
     mask_payloads: cute.Tensor,
     payload_words: cutlass.Constexpr[int],
-    s_block_n: cute.Tensor,
     kv_producer_state,
     load_K: Callable,
     load_V: Callable,
@@ -598,7 +585,6 @@ def produce_arbitrary_forward_nonoverlap(
             iteration + Int32(1) < partial_block_cnt,
         )
         pipeline_k.producer_acquire(kv_producer_state)
-        stage_arbitrary_forward_n_block(s_block_n, kv_producer_state, n_block)
         load_K(src_idx=n_block, producer_state=kv_producer_state)
         pipeline_v.producer_acquire(kv_producer_state)
         load_V(src_idx=n_block, producer_state=kv_producer_state)
@@ -613,7 +599,6 @@ def produce_arbitrary_forward_nonoverlap(
             iteration + Int32(1) < full_block_cnt,
         )
         pipeline_k.producer_acquire(kv_producer_state)
-        stage_arbitrary_forward_n_block(s_block_n, kv_producer_state, n_block)
         load_K(src_idx=n_block, producer_state=kv_producer_state)
         pipeline_v.producer_acquire(kv_producer_state)
         load_V(src_idx=n_block, producer_state=kv_producer_state)
@@ -630,7 +615,6 @@ def produce_arbitrary_forward_overlap(
     partial_payload_base: Int32,
     mask_payloads: cute.Tensor,
     payload_words: cutlass.Constexpr[int],
-    s_block_n: cute.Tensor,
     kv_producer_state,
     load_K: Callable,
     load_V: Callable,
@@ -665,7 +649,6 @@ def produce_arbitrary_forward_overlap(
             full_block_cnt > Int32(0),
         )
         pipeline_k.producer_acquire(kv_producer_state)
-        stage_arbitrary_forward_n_block(s_block_n, kv_producer_state, n_block_prev)
         load_K(src_idx=n_block_prev, producer_state=kv_producer_state)
 
     # K uses independent shared storage. Issue the first K TMA before waiting
@@ -693,7 +676,6 @@ def produce_arbitrary_forward_overlap(
             kv_producer_state_prev = kv_producer_state.clone()
             kv_producer_state.advance()
             pipeline_k.producer_acquire(kv_producer_state)
-            stage_arbitrary_forward_n_block(s_block_n, kv_producer_state, n_block)
             load_K(src_idx=n_block, producer_state=kv_producer_state)
             pipeline_v.producer_acquire(kv_producer_state_prev)
             load_V(src_idx=n_block_prev, producer_state=kv_producer_state_prev)
@@ -710,7 +692,6 @@ def produce_arbitrary_forward_overlap(
             kv_producer_state_prev = kv_producer_state.clone()
             kv_producer_state.advance()
             pipeline_k.producer_acquire(kv_producer_state)
-            stage_arbitrary_forward_n_block(s_block_n, kv_producer_state, n_block)
             load_K(src_idx=n_block, producer_state=kv_producer_state)
             pipeline_v.producer_acquire(kv_producer_state_prev)
             load_V(src_idx=n_block_prev, producer_state=kv_producer_state_prev)
@@ -726,7 +707,9 @@ def produce_arbitrary_forward_overlap(
 @cute.jit
 def consume_arbitrary_forward_nonoverlap(
     partial_block_cnt,
+    partial_block_idx: Optional[cute.Tensor],
     full_block_cnt,
+    full_block_idx: Optional[cute.Tensor],
     partial_payload_base: Int32,
     mask_payloads: cute.Tensor,
     kv_consumer_state,
@@ -743,10 +726,14 @@ def consume_arbitrary_forward_nonoverlap(
     processed_any = total_block_cnt > Int32(0)
     if processed_any:
         warp_scheduler_barrier_sync()
-        payload_idx = partial_payload_base + partial_block_cnt - Int32(1)
+        partial_list_idx = partial_block_cnt - Int32(1)
+        payload_idx = partial_payload_base + partial_list_idx
+        n_block = Int32(0)
+        if const_expr(partial_block_idx is not None):
+            n_block = partial_block_idx[partial_list_idx]
         kv_consumer_state = mma_one_n_block(
             kv_consumer_state,
-            n_block=Int32(0),
+            n_block=n_block,
             mma_pv_fn=partial(mma_pv_fn, zero_init=True),
             mask_fn=partial(
                 apply_arbitrary_forward_mask,
@@ -759,10 +746,14 @@ def consume_arbitrary_forward_nonoverlap(
             is_first_n_block=True,
         )
         for iteration in cutlass.range(1, partial_block_cnt, unroll=1):
-            payload_idx = partial_payload_base + partial_block_cnt - Int32(1) - iteration
+            partial_list_idx = partial_block_cnt - Int32(1) - iteration
+            payload_idx = partial_payload_base + partial_list_idx
+            n_block = Int32(0)
+            if const_expr(partial_block_idx is not None):
+                n_block = partial_block_idx[partial_list_idx]
             kv_consumer_state = mma_one_n_block(
                 kv_consumer_state,
-                n_block=Int32(0),
+                n_block=n_block,
                 mma_pv_fn=partial(mma_pv_fn, zero_init=False),
                 mask_fn=partial(
                     apply_arbitrary_forward_mask,
@@ -774,10 +765,14 @@ def consume_arbitrary_forward_nonoverlap(
                 ),
                 is_first_n_block=False,
             )
-        for _ in cutlass.range(full_block_cnt, unroll=1):
+        for iteration in cutlass.range(full_block_cnt, unroll=1):
+            full_list_idx = full_block_cnt - Int32(1) - iteration
+            n_block = Int32(0)
+            if const_expr(full_block_idx is not None):
+                n_block = full_block_idx[full_list_idx]
             kv_consumer_state = mma_one_n_block(
                 kv_consumer_state,
-                n_block=Int32(0),
+                n_block=n_block,
                 mma_pv_fn=partial(mma_pv_fn, zero_init=False),
                 mask_fn=None,
                 is_first_n_block=False,
@@ -789,7 +784,9 @@ def consume_arbitrary_forward_nonoverlap(
 @cute.jit
 def consume_arbitrary_forward_overlap(
     partial_block_cnt,
+    partial_block_idx: Optional[cute.Tensor],
     full_block_cnt,
+    full_block_idx: Optional[cute.Tensor],
     partial_payload_base: Int32,
     mask_payloads: cute.Tensor,
     seqlen_info,
@@ -807,9 +804,13 @@ def consume_arbitrary_forward_overlap(
     processed_any = partial_block_cnt + full_block_cnt > Int32(0)
     O_should_accumulate = False
     if processed_any:
-        payload_idx = partial_payload_base + partial_block_cnt - Int32(1)
+        partial_list_idx = partial_block_cnt - Int32(1)
+        payload_idx = partial_payload_base + partial_list_idx
+        n_block = Int32(0)
+        if const_expr(partial_block_idx is not None):
+            n_block = partial_block_idx[partial_list_idx]
         kv_consumer_state = process_first_half_block(
-            n_block=Int32(0),
+            n_block=n_block,
             seqlen=seqlen_info,
             kv_consumer_state=kv_consumer_state,
             mask_fn=partial(
@@ -820,16 +821,25 @@ def consume_arbitrary_forward_overlap(
                 payload_group_idx=payload_group_idx,
                 payload_words=payload_words,
             ),
-            mask_prefetch_fn=None,
-            next_mask_prefetch_fn=None,
+            mask_prefetch_fn=partial(
+                load_packed_mask_payload,
+                mask_payloads,
+                payload_idx,
+                payload_group_idx,
+                payload_words=payload_words,
+            ),
             score_mod_fn=score_mod_fn,
             is_first_block=True,
         )
         for iteration in cutlass.range(1, partial_block_cnt, unroll=1):
-            payload_idx = partial_payload_base + partial_block_cnt - Int32(1) - iteration
+            partial_list_idx = partial_block_cnt - Int32(1) - iteration
+            payload_idx = partial_payload_base + partial_list_idx
+            n_block = Int32(0)
+            if const_expr(partial_block_idx is not None):
+                n_block = partial_block_idx[partial_list_idx]
             kv_consumer_state = mma_one_n_block(
                 kv_consumer_state,
-                n_block=Int32(0),
+                n_block=n_block,
                 seqlen=seqlen_info,
                 mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                 mask_fn=partial(
@@ -840,20 +850,28 @@ def consume_arbitrary_forward_overlap(
                     payload_group_idx=payload_group_idx,
                     payload_words=payload_words,
                 ),
-                mask_prefetch_fn=None,
-                next_mask_prefetch_fn=None,
+                mask_prefetch_fn=partial(
+                    load_packed_mask_payload,
+                    mask_payloads,
+                    payload_idx,
+                    payload_group_idx,
+                    payload_words=payload_words,
+                ),
             )
             O_should_accumulate = True
 
-        for _ in cutlass.range(full_block_cnt, unroll=1):
+        for iteration in cutlass.range(full_block_cnt, unroll=1):
+            full_list_idx = full_block_cnt - Int32(1) - iteration
+            n_block = Int32(0)
+            if const_expr(full_block_idx is not None):
+                n_block = full_block_idx[full_list_idx]
             kv_consumer_state = mma_one_n_block(
                 kv_consumer_state,
-                n_block=Int32(0),
+                n_block=n_block,
                 seqlen=seqlen_info,
                 mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                 mask_fn=None,
                 mask_prefetch_fn=None,
-                next_mask_prefetch_fn=None,
             )
             O_should_accumulate = True
 
@@ -883,7 +901,6 @@ def produce_block_sparse_loads(
     q_subtile_factor: cutlass.Constexpr[int] = 1,
     o_empty_mbar_ptr: Optional[cute.Pointer] = None,
     o_empty_phase: Optional[Int32] = None,
-    s_block_n: Optional[cute.Tensor] = None,
 ):
     """Iterate over the mask and full block lists for a single tile.
 
@@ -943,7 +960,6 @@ def produce_block_sparse_loads(
                 mask_payload_base,
                 blocksparse_tensors.mask_block_masks,
                 blocksparse_tensors.mask_block_masks.shape[3],
-                s_block_n,
                 kv_producer_state,
                 load_K,
                 load_V,
@@ -961,7 +977,6 @@ def produce_block_sparse_loads(
                 mask_payload_base,
                 blocksparse_tensors.mask_block_masks,
                 blocksparse_tensors.mask_block_masks.shape[3],
-                s_block_n,
                 kv_producer_state,
                 load_K,
                 load_V,
@@ -1111,9 +1126,6 @@ def consume_block_sparse_loads(
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
     payload_words: cutlass.Constexpr[int] = 4,
-    staged_mask_block_cnt: Optional[Int32] = None,
-    staged_full_block_cnt: Optional[Int32] = None,
-    staged_mask_payload_base: Optional[Int32] = None,
 ):
     """Consume the mask and full block lists for a single tile on the consumer side.
 
@@ -1126,12 +1138,24 @@ def consume_block_sparse_loads(
     """
     mask_payloads = blocksparse_tensors.mask_block_masks
     if const_expr(mask_payloads is not None):
-        if const_expr(staged_mask_block_cnt is not None):
-            assert staged_full_block_cnt is not None
-            assert staged_mask_payload_base is not None
-            curr_mask_block_cnt = staged_mask_block_cnt
-            curr_full_block_cnt = staged_full_block_cnt
-            mask_payload_base = staged_mask_payload_base
+        # Packed payloads are self-contained for arbitrary-only attention.
+        # Only score_mod consumers need CSR indices to reconstruct logical K coordinates.
+        if const_expr(score_mod_fn is not None):
+            (
+                curr_mask_block_cnt,
+                curr_mask_block_idx,
+                curr_full_block_cnt,
+                curr_full_block_idx,
+                mask_payload_base,
+            ) = get_curr_arbitrary_blocksparse_tensors(
+                batch_idx,
+                head_idx,
+                m_block,
+                blocksparse_tensors,
+                seqlen_info,
+                tile_m,
+                qhead_per_kvhead,
+            )
         else:
             (
                 curr_mask_block_cnt,
@@ -1146,6 +1170,8 @@ def consume_block_sparse_loads(
                 tile_m,
                 qhead_per_kvhead,
             )
+            curr_mask_block_idx = None
+            curr_full_block_idx = None
     else:
         m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
         (
@@ -1171,7 +1197,9 @@ def consume_block_sparse_loads(
         if const_expr(not intra_wg_overlap):
             kv_consumer_state, processed_any = consume_arbitrary_forward_nonoverlap(
                 curr_mask_block_cnt,
+                curr_mask_block_idx,
                 curr_full_block_cnt,
+                curr_full_block_idx,
                 mask_payload_base,
                 mask_payloads,
                 kv_consumer_state,
@@ -1186,7 +1214,9 @@ def consume_block_sparse_loads(
             return kv_consumer_state, processed_any, processed_any
         return consume_arbitrary_forward_overlap(
             curr_mask_block_cnt,
+            curr_mask_block_idx,
             curr_full_block_cnt,
+            curr_full_block_idx,
             mask_payload_base,
             mask_payloads,
             seqlen_info,

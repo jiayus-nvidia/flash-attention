@@ -66,13 +66,15 @@ class Softmax(ParamsBase):
         # Change acc_S to M,N layout view.
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
         row_scale = cute.make_fragment_like(self.row_max, Float32)
+        row_max_scaled = cute.make_fragment_like(self.row_max, Float32)
 
         row_max = self.row_max
         row_sum = self.row_sum
         scale_log2 = self.scale_log2
         arch = self.arch
 
-        # Each iteration processes one row of acc_S
+        # Compute all row maxima first so the compiler can overlap the
+        # independent reduction chains before issuing exponentials.
         for r in cutlass.range(cute.size(row_max), unroll_full=True):
             acc_S_row = acc_S_mn[r, None].load()  # (n_block_size)
 
@@ -81,7 +83,6 @@ class Softmax(ParamsBase):
                 init_val=row_max[r] if cutlass.const_expr(not is_first) else None,
                 arch=arch,
             )
-
             row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
             # Update row_max before changing row_max_cur to safe value for -inf
             row_max_prev = row_max[r]
@@ -91,21 +92,21 @@ class Softmax(ParamsBase):
                 row_max_cur = 0.0 if row_max_cur == -Float32.inf else row_max_cur
 
             if cutlass.const_expr(is_first):
-                row_max_cur_scaled = row_max_cur * scale_log2
-                acc_S_row_exp = cute.math.exp2(
-                    acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
-                )
-                acc_S_row_sum = utils.fadd_reduce(acc_S_row_exp, init_val=None, arch=arch)
                 row_scale[r] = 1.0
             else:
-                row_max_cur_scaled = row_max_cur * scale_log2
-                acc_S_row_exp = cute.math.exp2(
-                    acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
-                )
-                # row_scale[r] = cute.math.exp2(row_max_prev * self.scale_log2 - row_max_cur_scaled)
                 row_scale[r] = cute.math.exp2(
                     (row_max_prev - row_max_cur) * scale_log2, fastmath=True
                 )
+            row_max_scaled[r] = row_max_cur * scale_log2
+
+        for r in cutlass.range(cute.size(row_max), unroll_full=True):
+            acc_S_row = acc_S_mn[r, None].load()
+            acc_S_row_exp = cute.math.exp2(
+                acc_S_row * scale_log2 - row_max_scaled[r], fastmath=True
+            )
+            if cutlass.const_expr(is_first):
+                acc_S_row_sum = utils.fadd_reduce(acc_S_row_exp, init_val=None, arch=arch)
+            else:
                 acc_S_row_sum = utils.fadd_reduce(
                     acc_S_row_exp, init_val=row_sum[r] * row_scale[r], arch=arch
                 )

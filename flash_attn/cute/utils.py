@@ -401,17 +401,21 @@ def fmax_reduce(
     x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
 ) -> Float32:
     if const_expr(arch == 90):
-        # Match the Hopper C++ softmax reduction order. The serial chain lets
-        # ptxas interleave the next row's max work with the current row's exp2.
+        # Keep four independent chains to expose enough ILP for Hopper's
+        # floating-point max pipeline across all native SM90 tile widths.
         res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
-        local_max = res[0]
-        for i in cutlass.range_constexpr(1, cute.size(x.shape)):
-            local_max = fmax(local_max, res[i], ftz=True)
+        local_max = [res[0], res[1], res[2], res[3]]
+        for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
+            local_max[0] = fmax(local_max[0], res[i + 0], ftz=True)
+            local_max[1] = fmax(local_max[1], res[i + 1], ftz=True)
+            local_max[2] = fmax(local_max[2], res[i + 2], ftz=True)
+            local_max[3] = fmax(local_max[3], res[i + 3], ftz=True)
+        local_max[0] = fmax(local_max[0], local_max[1], ftz=True)
+        local_max[2] = fmax(local_max[2], local_max[3], ftz=True)
+        local_max[0] = fmax(local_max[0], local_max[2], ftz=True)
         return (
-            local_max
-            if const_expr(init_val is None)
-            else fmax(local_max, init_val, ftz=True)
+            local_max[0] if const_expr(init_val is None) else fmax(local_max[0], init_val, ftz=True)
         )
     elif const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
         # if const_expr(init_val is None):

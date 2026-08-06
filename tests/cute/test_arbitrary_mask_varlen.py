@@ -1,3 +1,4 @@
+import cutlass
 import cutlass.cute as cute
 import pytest
 import torch
@@ -273,6 +274,7 @@ def _reference_attention(
     *,
     softcap=0.0,
     score_multiplier=1.0,
+    kv_bias_scale=0.0,
 ):
     hq = q.shape[1]
     hkv = k.shape[1]
@@ -297,6 +299,9 @@ def _reference_attention(
         )
         scores = torch.matmul(q_cur, k_cur.transpose(-1, -2)) * scale
         scores = scores * score_multiplier
+        if kv_bias_scale:
+            kv_idx = torch.arange(k_len, dtype=scores.dtype, device=scores.device)
+            scores = scores + kv_idx[None, None, :] * kv_bias_scale
         if softcap:
             scores = softcap * torch.tanh(scores / softcap)
 
@@ -1510,14 +1515,16 @@ def test_varlen_arbitrary_mask_bwd_deterministic_handles_partial_and_full_k2q_bl
 
 
 @cute.jit
-def _score_times_two(
+def _score_times_two_with_kv_bias(
     score, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
-    return score * cute.full_like(score, 2.0)
+    return score * cute.full_like(score, 2.0) + kv_idx.to(
+        cutlass.Float32
+    ) * cute.full_like(score, 1.0 / 256.0)
 
 
 @cute.jit
-def _score_times_two_bwd(
+def _score_times_two_with_kv_bias_bwd(
     grad, score, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
     return grad * cute.full_like(grad, 2.0)
@@ -1531,8 +1538,8 @@ def test_varlen_arbitrary_mask_bwd_score_modifiers(
     mode, deterministic, head_dim, head_dim_v
 ):
     torch.manual_seed(0)
-    q_lengths = [19, 11]
-    k_lengths = [23, 17]
+    q_lengths = [147, 131]
+    k_lengths = [257, 193]
     hq = hkv = 2
     q = torch.randn(sum(q_lengths), hq, head_dim, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(sum(k_lengths), hkv, head_dim, dtype=torch.bfloat16, device="cuda")
@@ -1544,8 +1551,8 @@ def test_varlen_arbitrary_mask_bwd_score_modifiers(
     )
     func = _causal_global_func(q_lengths, k_lengths, hmask=hq)
     softcap = 7.0 if mode == "softcap" else 0.0
-    score_mod = _score_times_two if mode == "score_mod" else None
-    score_mod_bwd = _score_times_two_bwd if mode == "score_mod" else None
+    score_mod = _score_times_two_with_kv_bias if mode == "score_mod" else None
+    score_mod_bwd = _score_times_two_with_kv_bias_bwd if mode == "score_mod" else None
 
     out, _, dq, dk, dv, _ = _run_arbitrary_backward(
         q,
@@ -1573,6 +1580,7 @@ def test_varlen_arbitrary_mask_bwd_score_modifiers(
         k_lengths,
         softcap=softcap,
         score_multiplier=2.0 if mode == "score_mod" else 1.0,
+        kv_bias_scale=1.0 / 256.0 if mode == "score_mod" else 0.0,
     )
     dq_ref, dk_ref, dv_ref = torch.autograd.grad(
         out_ref, (q_ref, k_ref, v_ref), dout.float()
