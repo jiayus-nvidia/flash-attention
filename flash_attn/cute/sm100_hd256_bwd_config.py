@@ -545,8 +545,8 @@ def make_sm100_hd256_dq_tiled_mma_qk(dtype: type[cutlass.Numeric]):
 
     return sm100_utils.make_trivial_tiled_mma(
         dtype,
-        cute.nvgpu.OperandMajorMode.K,
-        cute.nvgpu.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
         _HD256_ACC_DTYPE,
         tcgen05.CtaGroup.TWO,
         (_HD256_DQ_TILE_M * _HD256_CTA_GROUP_SIZE, _HD256_DQ_TILE_N),
@@ -593,8 +593,8 @@ def make_sm100_hd256_dkdv_tiled_mma_kq(dtype: type[cutlass.Numeric]):
 
     return sm100_utils.make_trivial_tiled_mma(
         dtype,
-        cute.nvgpu.OperandMajorMode.K,
-        cute.nvgpu.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
         _HD256_ACC_DTYPE,
         tcgen05.CtaGroup.TWO,
         (

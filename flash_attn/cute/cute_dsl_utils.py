@@ -1,7 +1,9 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Tuple
+import contextlib
 from functools import lru_cache
+import re
+from typing import Tuple
 
 import torch
 
@@ -12,10 +14,63 @@ except ImportError:
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import NumericMeta
+from cutlass.cutlass_dsl import NumericMeta, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
+
+
+def _cute_dsl_version() -> tuple[int, int, int]:
+    """Return the installed CUTLASS DSL version as a three-integer tuple."""
+    version = getattr(cutlass, "__version__", None)
+    try:
+        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+    except TypeError as exc:
+        raise RuntimeError(f"Cannot parse CUTLASS DSL version {version!r}") from exc
+    if match is None:
+        raise RuntimeError(f"Cannot parse CUTLASS DSL version {version!r}")
+    return tuple(int(part) for part in match.groups())
+
+
+_CUTE_DSL_VERSION = _cute_dsl_version()
+
+
+def _cute_dsl_bulk_copy_self_elects() -> bool:
+    """Return whether cute.copy elects a lane for bulk-async copies."""
+    return (4, 6, 0) <= _CUTE_DSL_VERSION < (4, 6, 2)
+
+
+_BULK_COPY_SELF_ELECTS = _cute_dsl_bulk_copy_self_elects()
+
+
+def bulk_copy_elect_one():
+    """Select a lane only when the installed DSL does not do so internally.
+
+    CUTLASS DSL 4.6.0 and 4.6.1 add an internal warp-collective election to
+    ``cute.copy`` for bulk-async atoms. Nesting that copy inside
+    ``cute.arch.elect_one()`` leaves one lane at the inner collective and
+    deadlocks the warp. Earlier versions and 4.6.2 or newer require the outer
+    guard.
+    """
+    if _BULK_COPY_SELF_ELECTS:
+        return contextlib.nullcontext()
+    return cute.arch.elect_one()
+
+
+@dsl_user_op
+def bulk_copy(atom, src, dst, *, loc=None, ip=None, **kwargs):
+    """Issue a bulk-async ``cute.copy`` with version-correct lane election."""
+    with bulk_copy_elect_one():
+        cute.copy(atom, src, dst, loc=loc, ip=ip, **kwargs)
+
+
+def struct_scalar_ptr(field):
+    """Return a pointer for a scalar shared-storage field across DSL versions.
+
+    CUTLASS DSL 4.6 wraps scalar fields and exposes their address through
+    ``.ptr``. Older releases return the pointer directly.
+    """
+    return field.ptr if hasattr(field, "ptr") else field
 
 
 load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data

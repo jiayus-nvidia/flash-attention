@@ -26,7 +26,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import flash_attn_cute.pipeline as pipeline_custom
 from cutlass import Boolean, Float32, Int32, Int64, const_expr, pipeline
 from cutlass.base_dsl.arch import Arch
-from cutlass.cute import FastDivmodDivisorV2
+from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -481,13 +481,13 @@ class FlashAttentionForwardSm100:
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("ex2_emu_freq", 10)
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
-        q_major_mode = cute.nvgpu.OperandMajorMode.K
-        k_major_mode = cute.nvgpu.OperandMajorMode.K
-        v_major_mode = cute.nvgpu.OperandMajorMode.MN
+        q_major_mode = tcgen05.OperandMajorMode.K
+        k_major_mode = tcgen05.OperandMajorMode.K
+        v_major_mode = tcgen05.OperandMajorMode.MN
         self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
-        p_major_mode = cute.nvgpu.OperandMajorMode.K
+        p_major_mode = tcgen05.OperandMajorMode.K
         if const_expr(self.is_arbitrary):
             # Keep the runtime consumer and payload materializer on the same
             # concrete 1CTA tcgen05 layout constructor.
@@ -749,7 +749,7 @@ class FlashAttentionForwardSm100:
 
         head_divmod = None
         if cutlass.const_expr(self.pack_gqa):
-            head_divmod = FastDivmodDivisorV2(self.qhead_per_kvhead)
+            head_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
@@ -1446,7 +1446,7 @@ class FlashAttentionForwardSm100:
                     mPageTable,
                     mK,
                     mV,
-                    FastDivmodDivisorV2(page_size),
+                    FastDivmodDivisor(page_size),
                     batch_idx,
                     head_idx_kv,
                     tidx,
@@ -2064,10 +2064,10 @@ class FlashAttentionForwardSm100:
                 fastdiv_mods = (
                     seqlen_q_divmod
                     if not recompute_fastdiv_mods_q
-                    else FastDivmodDivisorV2(seqlen.seqlen_q),
+                    else FastDivmodDivisor(seqlen.seqlen_q),
                     seqlen_k_divmod
                     if not recompute_fastdiv_mods_k
-                    else FastDivmodDivisorV2(seqlen.seqlen_k),
+                    else FastDivmodDivisor(seqlen.seqlen_k),
                 )
 
             mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None

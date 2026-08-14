@@ -553,15 +553,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.dV_major_mode = utils.LayoutEnum.from_tensor(dV).mma_major_mode()
         self.dO_major_mode = utils.LayoutEnum.from_tensor(dO).mma_major_mode()
 
-        if cutlass.const_expr(self.Q_major_mode != cute.nvgpu.OperandMajorMode.K):
+        if cutlass.const_expr(self.Q_major_mode != tcgen05.OperandMajorMode.K):
             raise RuntimeError(f"The layout of q is not supported: {self.Q_major_mode}")
-        if cutlass.const_expr(self.K_major_mode != cute.nvgpu.OperandMajorMode.K):
+        if cutlass.const_expr(self.K_major_mode != tcgen05.OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.dK_major_mode != cute.nvgpu.OperandMajorMode.K):
+        if cutlass.const_expr(self.dK_major_mode != tcgen05.OperandMajorMode.K):
             raise RuntimeError("The layout of dk is not supported")
-        if cutlass.const_expr(self.V_major_mode != cute.nvgpu.OperandMajorMode.K):
+        if cutlass.const_expr(self.V_major_mode != tcgen05.OperandMajorMode.K):
             raise RuntimeError("The layout of v is not supported")
-        if cutlass.const_expr(self.dV_major_mode != cute.nvgpu.OperandMajorMode.K):
+        if cutlass.const_expr(self.dV_major_mode != tcgen05.OperandMajorMode.K):
             raise RuntimeError("The layout of dv is not supported")
 
         self._setup_attributes()
@@ -572,8 +572,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # compute S
         KQ_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             K.element_type,
-            cute.nvgpu.OperandMajorMode.K,
-            cute.nvgpu.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.KQ_mma_tiler[:2],
@@ -581,8 +581,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # compute dP
         VdO_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             V.element_type,
-            cute.nvgpu.OperandMajorMode.K,
-            cute.nvgpu.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.VdO_mma_tiler[:2],
@@ -590,8 +590,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # compute dV
         PdO_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             dO.element_type,
-            cute.nvgpu.OperandMajorMode.K,
-            cute.nvgpu.OperandMajorMode.MN,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.PdO_mma_tiler[:2],
@@ -600,8 +600,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # compute dK
         dSQ_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             Q.element_type,
-            cute.nvgpu.OperandMajorMode.K,
-            cute.nvgpu.OperandMajorMode.MN,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.dSQ_mma_tiler[:2],
@@ -610,8 +610,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # dishengbin, need to remove, but used in dS_mem_layout_staged
         dSK_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             K.element_type,
-            cute.nvgpu.OperandMajorMode.MN,
-            cute.nvgpu.OperandMajorMode.MN,
+            tcgen05.OperandMajorMode.MN,
+            tcgen05.OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.dSK_mma_tiler[:2],
@@ -662,9 +662,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             self.compute_mma_dS_stage,
         )
         tiled_mma = dSQ_tiled_mma
-        is_k_major = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.K
+        is_k_major = tiled_mma.op.a_major_mode == tcgen05.OperandMajorMode.K
         a_major_mode = (
-            cute.nvgpu.OperandMajorMode.K if is_k_major else cute.nvgpu.OperandMajorMode.MN
+            tcgen05.OperandMajorMode.K if is_k_major else tcgen05.OperandMajorMode.MN
         )
         tmp = cute.dice(self.dSQ_mma_tiler, (1, None, 1))
         a_smem_shape = tiled_mma.partition_shape_A(

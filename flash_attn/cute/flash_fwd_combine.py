@@ -15,7 +15,7 @@ from cutlass import Float32, Int32, Boolean, const_expr
 from flash_attn_cute import utils
 from flash_attn_cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn_cute.seqlen_info import SeqlenInfo
-from cutlass.cute import FastDivmodDivisorV2
+from cutlass.cute import FastDivmodDivisor
 
 
 class FlashAttentionForwardCombine:
@@ -283,9 +283,9 @@ class FlashAttentionForwardCombine:
             else Int32(cu_seqlens.shape[0] - 1)
         )
 
-        # Create FastDivmodDivisorV2 objects for efficient division
-        seqlen_divmod = FastDivmodDivisorV2(seqlen)
-        head_divmod = FastDivmodDivisorV2(num_head)
+        # Create FastDivmodDivisor objects for efficient division
+        seqlen_divmod = FastDivmodDivisor(seqlen)
+        head_divmod = FastDivmodDivisor(num_head)
 
         grid_dim = (
             cute.ceil_div(seqlen * num_head, self.tile_m),
@@ -339,8 +339,8 @@ class FlashAttentionForwardCombine:
         gmem_tiled_copy_O: cute.TiledCopy,
         gmem_tiled_copy_LSE: cute.TiledCopy,
         s2r_tiled_copy_LSE: cute.TiledCopy,
-        seqlen_divmod: FastDivmodDivisorV2,
-        head_divmod: FastDivmodDivisorV2,
+        seqlen_divmod: FastDivmodDivisor,
+        head_divmod: FastDivmodDivisor,
         varlen: cutlass.Constexpr[bool],
     ):
         # Thread and block indices
@@ -418,7 +418,7 @@ class FlashAttentionForwardCombine:
                 mi = tLSEcLSE[0, 0, m][1]  # Get m coordinate
                 idx = m_block * self.tile_m + mi
                 if idx < max_idx:
-                    # Calculate actual sequence position and head using FastDivmodDivisorV2
+                    # Calculate actual sequence position and head using FastDivmodDivisor
                     if const_expr(not varlen):
                         head_idx, m_idx = divmod(idx, seqlen_divmod)
                     else:

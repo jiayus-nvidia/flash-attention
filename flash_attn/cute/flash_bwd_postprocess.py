@@ -10,7 +10,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
-from cutlass.cute.nvgpu import cpasync, warp
+from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass import Float32, const_expr
 from cutlass.utils import LayoutEnum
 
@@ -111,8 +111,8 @@ class FlashAttentionBackwardPostprocess:
             tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
                 self.dtype,
-                cute.nvgpu.OperandMajorMode.K,  # These don't matter, we only care about the accum
-                cute.nvgpu.OperandMajorMode.K,
+                warpgroup.OperandMajorMode.K,  # These don't matter, we only care about the accum
+                warpgroup.OperandMajorMode.K,
                 Float32,
                 atom_layout_mnk=(atom_layout_dQ if not self.dQ_swapAB else atom_layout_dQ[::-1])
                 + (1,),
@@ -126,8 +126,8 @@ class FlashAttentionBackwardPostprocess:
             cta_group = tcgen05.CtaGroup.ONE
             tiled_mma = sm100_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
-                cute.nvgpu.OperandMajorMode.MN,  # dS_major_mode
-                cute.nvgpu.OperandMajorMode.MN,  # Kt_major_mode
+                tcgen05.OperandMajorMode.MN,  # dS_major_mode
+                tcgen05.OperandMajorMode.MN,  # Kt_major_mode
                 Float32,
                 cta_group,
                 (self.tile_m, self.tile_hdim),

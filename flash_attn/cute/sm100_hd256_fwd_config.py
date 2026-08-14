@@ -232,8 +232,8 @@ def make_sm100_hd256_fwd_tiled_mma_qk(
 
     return sm100_utils_basic.make_trivial_tiled_mma(
         dtype,
-        cute.nvgpu.OperandMajorMode.K,
-        cute.nvgpu.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
         Float32,
         tcgen05.CtaGroup.TWO,
         (tile_m * _SM100_HD256_FWD_CTA_GROUP_SIZE, tile_n),

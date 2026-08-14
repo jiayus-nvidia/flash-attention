@@ -45,7 +45,7 @@ from flash_attn_cute.tile_scheduler import (
     SingleTileVarlenScheduler,
     VarlenDynamicPersistentTileSchedulerSm90,
 )
-from cutlass.cute import FastDivmodDivisorV2
+from cutlass.cute import FastDivmodDivisor
 
 from flash_attn_cute.flash_fwd import FlashAttentionForwardBase
 from flash_attn_cute.sm90_fwd_config import make_sm90_fwd_tiled_mma
@@ -815,7 +815,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         mPageTable,
                         mK,
                         mV,
-                        FastDivmodDivisorV2(mK.shape[0]),
+                        FastDivmodDivisor(mK.shape[0]),
                         batch_idx,
                         head_idx_kv,
                         tidx,
@@ -1166,10 +1166,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 fastdiv_mods = (
                     seqlen_q_divmod
                     if not recompute_fastdiv_mods_q
-                    else FastDivmodDivisorV2(seqlen.seqlen_q),
+                    else FastDivmodDivisor(seqlen.seqlen_q),
                     seqlen_k_divmod
                     if not recompute_fastdiv_mods_k
-                    else FastDivmodDivisorV2(seqlen.seqlen_k),
+                    else FastDivmodDivisor(seqlen.seqlen_k),
                 )
 
             mask = AttentionMaskCls(seqlen)

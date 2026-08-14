@@ -236,8 +236,8 @@ def make_sm100_bwd_tiled_mma_sdp(
 
     return sm100_utils_basic.make_trivial_tiled_mma(
         dtype,
-        cute.nvgpu.OperandMajorMode.K,
-        cute.nvgpu.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
         Float32,
         tcgen05.CtaGroup.TWO if cta_group_size == 2 else tcgen05.CtaGroup.ONE,
         (sparse_tile_n, tile_m),

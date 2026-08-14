@@ -11,10 +11,12 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, Int32, const_expr
-from cutlass.cute import FastDivmodDivisorV2
+from cutlass.cute import FastDivmodDivisor
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
+
+from flash_attn_cute.cute_dsl_utils import _CUTE_DSL_VERSION
 
 
 import quack.activation
@@ -224,7 +226,7 @@ def compute_softmax_scale_log2(softmax_scale, score_mod):
 
 
 def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None):
-    """Compute FastDivmodDivisorV2 pairs for aux_tensors index computation.
+    """Compute FastDivmodDivisor pairs for aux_tensors index computation.
 
     Returns a (seqlen_q_divmod, seqlen_k_divmod) tuple, or None if aux_tensors is None.
     """
@@ -236,7 +238,7 @@ def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageT
         if const_expr(mPageTable is None)
         else mK.shape[0] * mPageTable.shape[1]
     )
-    return (FastDivmodDivisorV2(seqlen_q), FastDivmodDivisorV2(seqlen_k))
+    return (FastDivmodDivisor(seqlen_q), FastDivmodDivisor(seqlen_k))
 
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
@@ -384,15 +386,20 @@ def fmax(
     loc=None,
     ip=None,
 ) -> Float32:
+    args = (
+        Float32(a).ir_value(loc=loc, ip=ip),
+        Float32(b).ir_value(loc=loc, ip=ip),
+    )
+    kwargs = {
+        "c": Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
+        "ftz": ftz,
+        "loc": loc,
+        "ip": ip,
+    }
+    if _CUTE_DSL_VERSION < (4, 6, 0):
+        return Float32(nvvm.fmax(T.f32(), *args, **kwargs))
     return Float32(
-        nvvm.fmax(
-            Float32(a).ir_value(loc=loc, ip=ip),
-            Float32(b).ir_value(loc=loc, ip=ip),
-            c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-            ftz=ftz,
-            loc=loc,
-            ip=ip,
-        )
+        nvvm.fmax(*args, **kwargs)
     )
 
 
@@ -522,7 +529,15 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
     #     is_align_stack=False,
     #     asm_dialect=llvm.AsmDialect.AD_ATT,
     # )
-    nvvm.atomicrmw(op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value())
+    kwargs = {
+        "op": nvvm.AtomicOpKind.FADD,
+        "ptr": gmem_ptr.llvm_ptr,
+        "a": Float32(a).ir_value(),
+    }
+    if _CUTE_DSL_VERSION < (4, 6, 0):
+        nvvm.atomicrmw(res=T.f32(), **kwargs)
+    else:
+        nvvm.atomicrmw(**kwargs)
 
 
 @dsl_user_op

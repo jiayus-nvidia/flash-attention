@@ -342,8 +342,8 @@ def make_sm90_fwd_tiled_mma_qk(
     return sm90_utils_basic.make_trivial_tiled_mma(
         dtype,
         dtype,
-        cute.nvgpu.OperandMajorMode.K,
-        cute.nvgpu.OperandMajorMode.K,
+        warpgroup.OperandMajorMode.K,
+        warpgroup.OperandMajorMode.K,
         Float32,
         atom_layout_mnk=(tile_m // 64, 1, 1),
         tiler_mn=(64, tile_n),
@@ -364,8 +364,8 @@ def make_sm90_fwd_tiled_mma(
     tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
         dtype,
         dtype,
-        cute.nvgpu.OperandMajorMode.K,
-        cute.nvgpu.OperandMajorMode.MN,
+        warpgroup.OperandMajorMode.K,
+        warpgroup.OperandMajorMode.MN,
         Float32,
         atom_layout_mnk=(tile_m // 64, 1, 1),
         tiler_mn=(64, tile_hdimv),
