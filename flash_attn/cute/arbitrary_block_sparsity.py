@@ -1,8 +1,10 @@
-"""Compile arbitrary interval masks into compact SM90 forward/backward plans."""
+"""Compile arbitrary interval masks into compact architecture-native plans."""
 
 from __future__ import annotations
 
 import math
+import os
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -14,19 +16,52 @@ import torch
 from cutlass import Boolean, Int32, Uint32, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
+from flash_attn_cute.arbitrary_plan import (
+    ArbitraryPlanSignature,
+    ArbitraryPlanRuntimeBinding,
+    ArbitraryTopologyTensors,
+)
 from flash_attn_cute.block_sparsity import BlockSparseTensorsTorch
 from flash_attn_cute.cache_utils import get_jit_cache
 from flash_attn_cute.cute_dsl_utils import to_cute_tensor
+from flash_attn_cute.sm90_bwd_config import (
+    _ResolvedSm90BwdConsumerConfig,
+    make_sm90_bwd_tiled_mma_sdp,
+    resolve_sm90_bwd_consumer_config,
+)
 from flash_attn_cute.sm90_fwd_config import (
     _ResolvedSm90FwdConsumerConfig,
     _sm90_fwd_mask_payload_representative_tidx,
     make_sm90_fwd_tiled_mma_qk,
     resolve_sm90_fwd_consumer_config,
 )
-from flash_attn_cute.sm90_bwd_config import (
-    _ResolvedSm90BwdConsumerConfig,
-    make_sm90_bwd_tiled_mma_sdp,
-    resolve_sm90_bwd_consumer_config,
+from flash_attn_cute.sm100_bwd_config import (
+    _ResolvedSm100BwdConsumerConfig,
+    make_sm100_bwd_tiled_mma_sdp,
+    make_sm100_bwd_tmem_load,
+    resolve_sm100_bwd_consumer_config,
+)
+from flash_attn_cute.sm100_fwd_config import (
+    _ResolvedSm100FwdConsumerConfig,
+    make_sm100_fwd_tiled_mma_qk,
+    make_sm100_fwd_tmem_load,
+    resolve_sm100_fwd_consumer_config,
+)
+from flash_attn_cute.sm100_hd256_bwd_config import (
+    _ResolvedSm100Hd256DkdvConsumerConfig,
+    _ResolvedSm100Hd256DqConsumerConfig,
+    make_sm100_hd256_dkdv_score_ownership,
+    make_sm100_hd256_dkdv_tiled_mma_kq,
+    make_sm100_hd256_dq_score_ownership,
+    make_sm100_hd256_dq_tiled_mma_qk,
+    resolve_sm100_hd256_dkdv_consumer_config,
+    resolve_sm100_hd256_dq_consumer_config,
+)
+from flash_attn_cute.sm100_hd256_fwd_config import (
+    _ResolvedSm100Hd256FwdConsumerConfig,
+    make_sm100_hd256_fwd_tiled_mma_qk,
+    make_sm100_hd256_fwd_tmem_load,
+    resolve_sm100_hd256_fwd_consumer_config,
 )
 from flash_attn_cute.testing import is_fake_mode
 
@@ -42,11 +77,82 @@ _K2Q_COUNT_COMPILE_CACHE = get_jit_cache("arbitrary_plan_k2q_count")
 _K2Q_MATERIALIZE_COMPILE_CACHE = get_jit_cache("arbitrary_plan_k2q_materialize")
 
 
+def _consumer_plan_signature(config) -> ArbitraryPlanSignature:
+    """Return versioned metadata without changing the committed SM90 configs."""
+
+    signature = getattr(config, "plan_signature", None)
+    if signature is not None:
+        return signature
+    if isinstance(config, _ResolvedSm90FwdConsumerConfig):
+        return ArbitraryPlanSignature(
+            arch_family="sm90",
+            direction="forward",
+            kernel_family="sm90_generic_fwd",
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            q_stage=1,
+            cta_group_size=1,
+            pack_gqa=config.pack_gqa,
+            qhead_per_kvhead=config.qhead_per_kvhead,
+            payload_layout_id=(
+                f"sm90_wgmma_qk_t{config.num_mma_threads}"
+                f"_v{config.payload_values_per_thread}"
+                f"_w{config.payload_padded_words}_v1"
+            ),
+            dq_order_format="none",
+            cluster_axis="m",
+        )
+    if isinstance(config, _ResolvedSm90BwdConsumerConfig):
+        return ArbitraryPlanSignature(
+            arch_family="sm90",
+            direction="backward",
+            kernel_family="sm90_generic_bwd",
+            tile_m=config.tile_m,
+            tile_n=config.tile_n,
+            q_stage=config.physical_subtiles,
+            cta_group_size=1,
+            pack_gqa=False,
+            qhead_per_kvhead=config.qhead_per_kvhead,
+            payload_layout_id=(
+                f"sm90_wgmma_sdp_t{config.num_mma_threads}"
+                f"_s{config.subtile_factor}_swap{int(config.sdp_swap_ab)}"
+                f"_w{config.payload_padded_words}_v1"
+            ),
+            dq_order_format="rank16_qblock16",
+            cluster_axis="m",
+        )
+    raise TypeError(f"unsupported arbitrary consumer config: {type(config).__name__}")
+
+
+def _get_plan_builder_arch(device: torch.device) -> int:
+    """Resolve fake compilation targets without silently producing an SM90 plan."""
+
+    if not is_fake_mode():
+        major, minor = torch.cuda.get_device_capability(device)
+        return major * 10 + minor
+    arch_override = os.environ.get("FLASH_ATTENTION_ARCH") or os.environ.get("CUTE_DSL_ARCH")
+    if arch_override is None:
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability(device)
+            return major * 10 + minor
+        # Preserve the existing no-GPU SM90 planner test default.  CPU-only
+        # compilation for another architecture must provide an override.
+        return 90
+    match = re.fullmatch(r"(?:sm_?)?(\d+)(\d)[af]?", arch_override, re.IGNORECASE)
+    if match is None:
+        raise ValueError(f"invalid fake arbitrary-plan architecture: {arch_override!r}")
+    return int(match.group(1)) * 10 + int(match.group(2))
+
+
 @dataclass(frozen=True)
 class _ResolvedSm90BwdTopologyConfig:
     """Adapt the backward sparse Q tile to the shared topology classifier."""
 
     consumer: _ResolvedSm90BwdConsumerConfig
+
+    @property
+    def arch(self) -> int:
+        return self.consumer.arch
 
     @property
     def dtype(self) -> torch.dtype:
@@ -104,6 +210,304 @@ class _ResolvedSm90BwdTopologyConfig:
         )
 
 
+@dataclass(frozen=True)
+class _ResolvedSm100BwdTopologyConfig:
+    """Adapt the SM100 K2Q tile to the shared topology classifier."""
+
+    consumer: _ResolvedSm100BwdConsumerConfig
+
+    @property
+    def arch(self) -> int:
+        return self.consumer.arch
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.consumer.dtype
+
+    @property
+    def tile_m(self) -> int:
+        return self.consumer.sparse_tile_m
+
+    @property
+    def tile_n(self) -> int:
+        # Backward 2CTA cooperation expands the K/N axis.  The topology
+        # classifier and K2Q row lookup therefore operate on the cluster-union
+        # K tile rather than either CTA's physical K128 half.
+        return self.consumer.sparse_tile_n
+
+    @property
+    def pack_gqa(self) -> bool:
+        return False
+
+    @property
+    def qhead_per_kvhead(self) -> int:
+        return self.consumer.qhead_per_kvhead
+
+    @property
+    def num_mma_threads(self) -> int:
+        return self.consumer.num_mma_threads
+
+    @property
+    def num_mask_payload_groups(self) -> int:
+        return self.consumer.num_mma_threads
+
+    @property
+    def payload_values_per_thread(self) -> int:
+        return self.consumer.payload_values_per_thread
+
+    @property
+    def payload_valid_words(self) -> int:
+        return self.consumer.payload_valid_words
+
+    @property
+    def payload_padded_words(self) -> int:
+        return self.consumer.payload_padded_words
+
+    @property
+    def is_varlen(self) -> bool:
+        return self.consumer.is_varlen
+
+    @property
+    def topology_planner_compile_key(self) -> tuple:
+        return self.consumer.topology_planner_compile_key
+
+
+@dataclass(frozen=True)
+class _ResolvedSm100FwdTopologyConfig:
+    """Expose the q-stage union tile to the architecture-neutral classifier."""
+
+    consumer: _ResolvedSm100FwdConsumerConfig
+
+    @property
+    def arch(self) -> int:
+        return self.consumer.arch
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.consumer.dtype
+
+    @property
+    def tile_m(self) -> int:
+        return self.consumer.block_size[0]
+
+    @property
+    def tile_n(self) -> int:
+        return self.consumer.tile_n
+
+    @property
+    def pack_gqa(self) -> bool:
+        return self.consumer.pack_gqa
+
+    @property
+    def qhead_per_kvhead(self) -> int:
+        return self.consumer.qhead_per_kvhead
+
+    @property
+    def num_mma_threads(self) -> int:
+        return self.consumer.softmax_threads_per_subtile
+
+    @property
+    def num_mask_payload_groups(self) -> int:
+        return self.consumer.num_mask_payload_groups
+
+    @property
+    def payload_values_per_thread(self) -> int:
+        return self.consumer.payload_values_per_thread
+
+    @property
+    def payload_valid_words(self) -> int:
+        return self.consumer.payload_valid_words
+
+    @property
+    def payload_padded_words(self) -> int:
+        return self.consumer.payload_padded_words
+
+    @property
+    def is_varlen(self) -> bool:
+        return self.consumer.is_varlen
+
+    @property
+    def topology_planner_compile_key(self) -> tuple:
+        return self.consumer.topology_planner_compile_key
+
+
+@dataclass(frozen=True)
+class _ResolvedSm100Hd256FwdTopologyConfig:
+    """Expose the dedicated 2CTA Q256 union tile to the classifier."""
+
+    consumer: _ResolvedSm100Hd256FwdConsumerConfig
+
+    @property
+    def arch(self) -> int:
+        return self.consumer.arch
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.consumer.dtype
+
+    @property
+    def tile_m(self) -> int:
+        return self.consumer.block_size[0]
+
+    @property
+    def tile_n(self) -> int:
+        return self.consumer.tile_n
+
+    @property
+    def pack_gqa(self) -> bool:
+        return self.consumer.pack_gqa
+
+    @property
+    def qhead_per_kvhead(self) -> int:
+        return self.consumer.qhead_per_kvhead
+
+    @property
+    def num_mma_threads(self) -> int:
+        return self.consumer.softmax_threads_per_subtile
+
+    @property
+    def num_mask_payload_groups(self) -> int:
+        return self.consumer.num_mask_payload_groups
+
+    @property
+    def payload_values_per_thread(self) -> int:
+        return self.consumer.payload_values_per_thread
+
+    @property
+    def payload_valid_words(self) -> int:
+        return self.consumer.payload_valid_words
+
+    @property
+    def payload_padded_words(self) -> int:
+        return self.consumer.payload_padded_words
+
+    @property
+    def is_varlen(self) -> bool:
+        return self.consumer.is_varlen
+
+    @property
+    def topology_planner_compile_key(self) -> tuple:
+        return self.consumer.topology_planner_compile_key
+
+
+@dataclass(frozen=True)
+class _ResolvedSm100Hd256DqTopologyConfig:
+    """Expose the dedicated dQ Q256 union tile to the classifier."""
+
+    consumer: _ResolvedSm100Hd256DqConsumerConfig
+
+    @property
+    def arch(self) -> int:
+        return self.consumer.arch
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.consumer.dtype
+
+    @property
+    def tile_m(self) -> int:
+        return self.consumer.block_size[0]
+
+    @property
+    def tile_n(self) -> int:
+        return self.consumer.tile_n
+
+    @property
+    def pack_gqa(self) -> bool:
+        return self.consumer.pack_gqa
+
+    @property
+    def qhead_per_kvhead(self) -> int:
+        return self.consumer.qhead_per_kvhead
+
+    @property
+    def num_mma_threads(self) -> int:
+        return self.consumer.num_mma_threads
+
+    @property
+    def num_mask_payload_groups(self) -> int:
+        return self.consumer.num_mask_payload_groups
+
+    @property
+    def payload_values_per_thread(self) -> int:
+        return self.consumer.payload_values_per_thread
+
+    @property
+    def payload_valid_words(self) -> int:
+        return self.consumer.payload_valid_words
+
+    @property
+    def payload_padded_words(self) -> int:
+        return self.consumer.payload_padded_words
+
+    @property
+    def is_varlen(self) -> bool:
+        return self.consumer.is_varlen
+
+    @property
+    def topology_planner_compile_key(self) -> tuple:
+        return self.consumer.topology_planner_compile_key
+
+
+@dataclass(frozen=True)
+class _ResolvedSm100Hd256DkdvTopologyConfig:
+    """Expose the dedicated dKdV Q256 x K128 tile to K2Q planning."""
+
+    consumer: _ResolvedSm100Hd256DkdvConsumerConfig
+
+    @property
+    def arch(self) -> int:
+        return self.consumer.arch
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.consumer.dtype
+
+    @property
+    def tile_m(self) -> int:
+        return self.consumer.sparse_tile_m
+
+    @property
+    def tile_n(self) -> int:
+        return self.consumer.sparse_tile_n
+
+    @property
+    def pack_gqa(self) -> bool:
+        return self.consumer.pack_gqa
+
+    @property
+    def qhead_per_kvhead(self) -> int:
+        return self.consumer.qhead_per_kvhead
+
+    @property
+    def num_mma_threads(self) -> int:
+        return self.consumer.num_mma_threads
+
+    @property
+    def num_mask_payload_groups(self) -> int:
+        return self.consumer.num_mask_payload_groups
+
+    @property
+    def payload_values_per_thread(self) -> int:
+        return self.consumer.payload_values_per_thread
+
+    @property
+    def payload_valid_words(self) -> int:
+        return self.consumer.payload_valid_words
+
+    @property
+    def payload_padded_words(self) -> int:
+        return self.consumer.payload_padded_words
+
+    @property
+    def is_varlen(self) -> bool:
+        return self.consumer.is_varlen
+
+    @property
+    def topology_planner_compile_key(self) -> tuple:
+        return self.consumer.topology_planner_compile_key
+
+
 @dsl_user_op
 def _shr_u32(val: Uint32, shift: Uint32, *, loc=None, ip=None) -> Uint32:
     """Perform a defined PTX unsigned shift, including a shift by 32."""
@@ -134,7 +538,15 @@ def _load_endpoint(
 class _ArbitraryPlanCommonSm90:
     def __init__(
         self,
-        config: _ResolvedSm90FwdConsumerConfig | _ResolvedSm90BwdTopologyConfig,
+        config: (
+            _ResolvedSm90FwdConsumerConfig
+            | _ResolvedSm90BwdTopologyConfig
+            | _ResolvedSm100BwdTopologyConfig
+            | _ResolvedSm100FwdTopologyConfig
+            | _ResolvedSm100Hd256FwdTopologyConfig
+            | _ResolvedSm100Hd256DqTopologyConfig
+            | _ResolvedSm100Hd256DkdvTopologyConfig
+        ),
     ):
         self.dtype = cutlass.BFloat16 if config.dtype == torch.bfloat16 else cutlass.Float16
         self.tile_m = config.tile_m
@@ -148,6 +560,19 @@ class _ArbitraryPlanCommonSm90:
         self.payload_valid_words = config.payload_valid_words
         self.payload_padded_words = config.payload_padded_words
         self.is_varlen = config.is_varlen
+        # SM90 keeps one partial anchor for its existing producer/consumer
+        # protocol.  The SM100 1CTA path has an explicit full-only path and
+        # must preserve it so full blocks avoid payload loads entirely.
+        self.requires_partial_anchor = not isinstance(
+            config,
+            (
+                _ResolvedSm100FwdTopologyConfig,
+                _ResolvedSm100BwdTopologyConfig,
+                _ResolvedSm100Hd256FwdTopologyConfig,
+                _ResolvedSm100Hd256DqTopologyConfig,
+                _ResolvedSm100Hd256DkdvTopologyConfig,
+            ),
+        )
 
     @cute.jit
     def _sample_info(
@@ -440,51 +865,58 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
             mCuTotalMBlocks,
         )
         logical_q_rows = self.tile_m // self.payload_qhead_per_kvhead
-        physical_row = tidx * Int32(self.payload_qhead_per_kvhead)
-        q_global, _, q_valid = self._physical_q_info(
-            local_m_block,
-            physical_row,
-            q_begin,
-            q_len,
-        )
-        q_valid = q_valid & valid_m_block & (tidx < Int32(logical_q_rows))
+        logical_row = tidx
+        # A cooperative forward row can cover Q512 while the planner launch
+        # intentionally stays at 256 threads.  Walk rows thread-stride so a K
+        # block visible only to stage 1 / CTA rank 1 is still admitted to the
+        # candidate union before the full/partial classification pass below.
+        while logical_row < Int32(logical_q_rows):
+            physical_row = logical_row * Int32(self.payload_qhead_per_kvhead)
+            q_global, _, q_valid = self._physical_q_info(
+                local_m_block,
+                physical_row,
+                q_begin,
+                q_len,
+            )
+            q_valid = q_valid & valid_m_block
 
-        if q_valid:
-            previous_begin = Int32(-1)
-            num_intervals = (nfunc + Int32(1)) // Int32(2)
-            for interval_idx in cutlass.range(num_intervals, unroll=1):
-                global_begin, global_end, local_begin, local_end = self._safe_interval(
-                    mArbitraryFunc,
-                    mask_head,
-                    interval_idx,
-                    q_global,
-                    k_begin,
-                    k_len,
-                    total_k,
-                )
-                invalid = (
-                    (global_begin < Int32(0))
-                    | (global_end < Int32(0))
-                    | (global_begin > total_k)
-                    | (global_end > total_k)
-                    | (global_end < global_begin)
-                )
-                if global_end > global_begin and global_begin < previous_begin:
-                    invalid = Boolean(True)
-                if invalid:
-                    self._mark_error(mError, Uint32(_ERROR_INVALID_INTERVAL))
-                if global_end > global_begin:
-                    previous_begin = global_begin
-                if local_end > local_begin:
-                    block_begin = local_begin // Int32(self.tile_n)
-                    block_end = cute.ceil_div(local_end, self.tile_n)
-                    self._set_candidate_range(
-                        mVisibleBits,
+            if q_valid:
+                previous_begin = Int32(-1)
+                num_intervals = (nfunc + Int32(1)) // Int32(2)
+                for interval_idx in cutlass.range(num_intervals, unroll=1):
+                    global_begin, global_end, local_begin, local_end = self._safe_interval(
+                        mArbitraryFunc,
                         mask_head,
-                        compact_outer_row,
-                        block_begin,
-                        block_end,
+                        interval_idx,
+                        q_global,
+                        k_begin,
+                        k_len,
+                        total_k,
                     )
+                    invalid = (
+                        (global_begin < Int32(0))
+                        | (global_end < Int32(0))
+                        | (global_begin > total_k)
+                        | (global_end > total_k)
+                        | (global_end < global_begin)
+                    )
+                    if global_end > global_begin and global_begin < previous_begin:
+                        invalid = Boolean(True)
+                    if invalid:
+                        self._mark_error(mError, Uint32(_ERROR_INVALID_INTERVAL))
+                    if global_end > global_begin:
+                        previous_begin = global_begin
+                    if local_end > local_begin:
+                        block_begin = local_begin // Int32(self.tile_n)
+                        block_end = cute.ceil_div(local_end, self.tile_n)
+                        self._set_candidate_range(
+                            mVisibleBits,
+                            mask_head,
+                            compact_outer_row,
+                            block_begin,
+                            block_end,
+                        )
+            logical_row += Int32(_PLAN_THREADS)
 
         smem = cutlass_utils.SmemAllocator()
         sWarpPartial = smem.allocate_tensor(
@@ -577,14 +1009,15 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
                 partial_count += sWarpPartial[warp]
                 full_count += sWarpFull[warp]
                 anchor_full = cutlass.max(anchor_full, sWarpAnchor[warp])
-            if partial_count == Int32(0) and full_count > Int32(0):
-                anchor_full_word = anchor_full // Int32(32)
-                anchor_full_mask = Uint32(1) << Uint32(anchor_full % Int32(32))
-                mFullBits[mask_head, compact_outer_row, anchor_full_word] &= (
-                    Uint32(0xFFFF_FFFF) ^ anchor_full_mask
-                )
-                partial_count += Int32(1)
-                full_count -= Int32(1)
+            if const_expr(self.requires_partial_anchor):
+                if partial_count == Int32(0) and full_count > Int32(0):
+                    anchor_full_word = anchor_full // Int32(32)
+                    anchor_full_mask = Uint32(1) << Uint32(anchor_full % Int32(32))
+                    mFullBits[mask_head, compact_outer_row, anchor_full_word] &= (
+                        Uint32(0xFFFF_FFFF) ^ anchor_full_mask
+                    )
+                    partial_count += Int32(1)
+                    full_count -= Int32(1)
             mPartialCounts[mask_head, compact_outer_row] = partial_count
             mFullCounts[mask_head, compact_outer_row] = full_count
 
@@ -679,7 +1112,7 @@ class _ArbitraryPlanMaterializeSm90(_ArbitraryPlanCommonSm90):
             rMask = cute.make_rmem_tensor((self.payload_padded_words,), Uint32)
             rMask.fill(Uint32(0))
             for word_idx in cutlass.range_constexpr(self.payload_valid_words):
-                packed = Uint32(0)
+                mask_word = Uint32(0)
                 for bit_idx in cutlass.range(32, unroll=1):
                     value_idx = word_idx * 32 + bit_idx
                     keep = Boolean(False)
@@ -701,8 +1134,8 @@ class _ArbitraryPlanMaterializeSm90(_ArbitraryPlanCommonSm90):
                                 nfunc,
                             )
                     if keep:
-                        packed |= Uint32(1) << Uint32(bit_idx)
-                rMask[word_idx] = packed
+                        mask_word |= Uint32(1) << Uint32(bit_idx)
+                rMask[word_idx] = mask_word
             mask_iter = mPartialMasks.iterator + cute.crd2idx(
                 (payload_idx, Int32(0), payload_group_idx, Int32(0)),
                 mPartialMasks.layout,
@@ -810,15 +1243,314 @@ class _ArbitraryPlanMaterializeSm90(_ArbitraryPlanCommonSm90):
                             partial_ordinal += Int32(1)
 
 
-class _ArbitraryPlanK2QCommonSm90(_ArbitraryPlanCommonSm90):
-    def __init__(self, config: _ResolvedSm90BwdConsumerConfig):
-        super().__init__(_ResolvedSm90BwdTopologyConfig(config))
+class _ArbitraryPlanMaterializeSm100(_ArbitraryPlanMaterializeSm90):
+    """Materialize a generic or dedicated payload in native TMEM-load order."""
+
+    def __init__(
+        self,
+        config: (
+            _ResolvedSm100FwdConsumerConfig
+            | _ResolvedSm100Hd256FwdConsumerConfig
+            | _ResolvedSm100Hd256DqConsumerConfig
+        ),
+    ):
+        self.is_hd256_fwd = isinstance(config, _ResolvedSm100Hd256FwdConsumerConfig)
+        self.is_hd256_dq = isinstance(config, _ResolvedSm100Hd256DqConsumerConfig)
+        self.is_hd256 = self.is_hd256_fwd or self.is_hd256_dq
+        if self.is_hd256_fwd:
+            topology_config = _ResolvedSm100Hd256FwdTopologyConfig(config)
+        elif self.is_hd256_dq:
+            topology_config = _ResolvedSm100Hd256DqTopologyConfig(config)
+        else:
+            topology_config = _ResolvedSm100FwdTopologyConfig(config)
+        super().__init__(topology_config)
         self.consumer_tile_m = config.tile_m
+        self.consumer_tile_n = config.tile_n
+        self.physical_subtiles = config.physical_subtiles
+        self.cta_group_size = config.cta_group_size
+        if not self.is_hd256:
+            assert self.cta_group_size == 1, (
+                "generic SM100 arbitrary forward only supports the native 1CTA topology"
+            )
+
+    @cute.jit
+    def __call__(
+        self,
+        mArbitraryFunc: cute.Tensor,
+        mVisibleBits: cute.Tensor,
+        mFullBits: cute.Tensor,
+        mPartialOffsets: cute.Tensor,
+        mPartialIndices: cute.Tensor,
+        mPartialMasks: cute.Tensor,
+        mFullOffsets: cute.Tensor,
+        mFullIndices: cute.Tensor,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mCuSeqlensK: Optional[cute.Tensor],
+        mCuTotalMBlocks: Optional[cute.Tensor],
+        batch_size: Int32,
+        seqlen_q_fixed: Int32,
+        seqlen_k_fixed: Int32,
+        total_q: Int32,
+        total_k: Int32,
+        max_m_blocks: Int32,
+        max_n_blocks: Int32,
+        nfunc: Int32,
+        stream: cuda.CUstream = None,
+    ):
+        upper_total_m_blocks = mVisibleBits.shape[1]
+        hmask = mArbitraryFunc.shape[0]
+        if const_expr(self.is_hd256_fwd):
+            tiled_mma_qk = make_sm100_hd256_fwd_tiled_mma_qk(
+                self.dtype,
+                self.consumer_tile_m,
+                self.tile_n,
+            )
+        elif const_expr(self.is_hd256_dq):
+            tiled_mma_qk = make_sm100_hd256_dq_tiled_mma_qk(self.dtype)
+        else:
+            tiled_mma_qk = make_sm100_fwd_tiled_mma_qk(
+                self.dtype,
+                self.consumer_tile_m,
+                self.tile_n,
+            )
+        self.kernel(
+            tiled_mma_qk,
+            mArbitraryFunc,
+            mVisibleBits,
+            mFullBits,
+            mPartialOffsets,
+            mPartialIndices,
+            mPartialMasks,
+            mFullOffsets,
+            mFullIndices,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mCuTotalMBlocks,
+            batch_size,
+            seqlen_q_fixed,
+            seqlen_k_fixed,
+            total_q,
+            total_k,
+            max_m_blocks,
+            max_n_blocks,
+            nfunc,
+        ).launch(
+            grid=(upper_total_m_blocks, hmask, 1),
+            block=(_PLAN_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    @cute.jit
+    def _store_payload(
+        self,
+        tiled_mma_qk: cute.TiledMma,
+        mArbitraryFunc: cute.Tensor,
+        mPartialMasks: cute.Tensor,
+        payload_idx: Int32,
+        planner_tidx: Int32,
+        mask_head: Int32,
+        local_m_block: Int32,
+        block_id: Int32,
+        q_begin: Int32,
+        q_len: Int32,
+        k_begin: Int32,
+        k_len: Int32,
+        nfunc: Int32,
+    ) -> None:
+        payload_group_idx = planner_tidx
+        while payload_group_idx < Int32(self.num_mask_payload_groups):
+            if const_expr(self.is_hd256):
+                # The dedicated kernel's two CTA slices jointly own Q256.
+                # get_slice(cta_rank) and the Rep32 TMEM copy are the same
+                # ownership operations used by its softmax consumer.
+                for cta_rank in cutlass.range_constexpr(self.cta_group_size):
+                    thr_mma_qk = tiled_mma_qk.get_slice(cta_rank)
+                    if const_expr(self.is_hd256_dq):
+                        tScS_t2r = make_sm100_hd256_dq_score_ownership(
+                            tiled_mma_qk,
+                            Int32(cta_rank),
+                            payload_group_idx,
+                        )
+                    else:
+                        qk_acc_shape = thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
+                        tStS = thr_mma_qk.make_fragment_C(cute.append(qk_acc_shape, 1))
+                        tSAcc = tStS[(None, None), 0, 0, 0]
+                        thr_tmem_load = make_sm100_hd256_fwd_tmem_load(
+                            tSAcc,
+                            payload_group_idx,
+                        )
+                        cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+                        tScS = thr_mma_qk.partition_C(cS)
+                        tScS = tScS[(None, None), 0, 0]
+                        tScS_t2r = thr_tmem_load.partition_D(tScS)
+
+                    rMask = cute.make_rmem_tensor((self.payload_padded_words,), Uint32)
+                    rMask.fill(Uint32(0))
+                    for word_idx in cutlass.range_constexpr(self.payload_valid_words):
+                        mask_word = Uint32(0)
+                        for bit_idx in cutlass.range(32, unroll=1):
+                            value_idx = word_idx * 32 + bit_idx
+                            keep = Boolean(False)
+                            if value_idx < self.payload_values_per_thread:
+                                coord = tScS_t2r[value_idx]
+                                row_in_tile = Int32(coord[0])
+                                col_in_tile = Int32(coord[1])
+                                q_global, _, q_valid = self._physical_q_info(
+                                    local_m_block,
+                                    row_in_tile,
+                                    q_begin,
+                                    q_len,
+                                )
+                                k_local = block_id * Int32(self.tile_n) + col_in_tile
+                                if q_valid and k_local < k_len:
+                                    keep = self._is_visible(
+                                        mArbitraryFunc,
+                                        mask_head,
+                                        q_global,
+                                        k_begin + k_local,
+                                        nfunc,
+                                    )
+                            if keep:
+                                mask_word |= Uint32(1) << Uint32(bit_idx)
+                        rMask[word_idx] = mask_word
+
+                    mask_iter = mPartialMasks.iterator + cute.crd2idx(
+                        (
+                            payload_idx,
+                            Int32(cta_rank),
+                            payload_group_idx,
+                            Int32(0),
+                        ),
+                        mPartialMasks.layout,
+                    )
+                    mask_ptr = cute.make_ptr(
+                        Uint32,
+                        mask_iter.toint(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    gMask = cute.make_tensor(mask_ptr, (self.payload_padded_words,))
+                    cute.autovec_copy(rMask, gMask)
+            if const_expr(not self.is_hd256):
+                # Generic arbitrary forward deliberately mirrors only the native
+                # 1CTA consumer. q_stage contributes independent payload planes.
+                thr_mma_qk = tiled_mma_qk.get_slice(0)
+                qk_acc_shape = thr_mma_qk.partition_shape_C((self.consumer_tile_m, self.tile_n))
+                # Mirror the staged fake TMEM fragment used by softmax_loop.
+                # The singleton stage preserves the modes expected by
+                # make_tmem_copy; a bare fragment has insufficient rank for
+                # partition_D(tScS).
+                tStS = thr_mma_qk.make_fragment_C(cute.append(qk_acc_shape, 1))
+                tSAcc = tStS[(None, None), 0, 0, 0]
+                thr_tmem_load = make_sm100_fwd_tmem_load(
+                    tSAcc,
+                    payload_group_idx,
+                )
+                cS = cute.make_identity_tensor((self.consumer_tile_m, self.tile_n))
+                tScS = thr_mma_qk.partition_C(cS)
+                tScS = tScS[(None, None), 0, 0]
+                tScS_t2r = thr_tmem_load.partition_D(tScS)
+
+                for stage_idx in cutlass.range_constexpr(self.physical_subtiles):
+                    rMask = cute.make_rmem_tensor(
+                        (self.payload_padded_words,),
+                        Uint32,
+                    )
+                    rMask.fill(Uint32(0))
+                    for word_idx in cutlass.range_constexpr(self.payload_valid_words):
+                        mask_word = Uint32(0)
+                        for bit_idx in cutlass.range(32, unroll=1):
+                            value_idx = word_idx * 32 + bit_idx
+                            keep = Boolean(False)
+                            if value_idx < self.payload_values_per_thread:
+                                coord = tScS_t2r[value_idx]
+                                row_in_tile = Int32(stage_idx * self.consumer_tile_m) + Int32(
+                                    coord[0]
+                                )
+                                col_in_tile = Int32(coord[1])
+                                q_global, _, q_valid = self._physical_q_info(
+                                    local_m_block,
+                                    row_in_tile,
+                                    q_begin,
+                                    q_len,
+                                )
+                                k_local = block_id * Int32(self.tile_n) + col_in_tile
+                                if q_valid and k_local < k_len:
+                                    keep = self._is_visible(
+                                        mArbitraryFunc,
+                                        mask_head,
+                                        q_global,
+                                        k_begin + k_local,
+                                        nfunc,
+                                    )
+                            if keep:
+                                mask_word |= Uint32(1) << Uint32(bit_idx)
+                        rMask[word_idx] = mask_word
+
+                    mask_iter = mPartialMasks.iterator + cute.crd2idx(
+                        (
+                            payload_idx,
+                            Int32(stage_idx),
+                            payload_group_idx,
+                            Int32(0),
+                        ),
+                        mPartialMasks.layout,
+                    )
+                    mask_ptr = cute.make_ptr(
+                        Uint32,
+                        mask_iter.toint(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=min(
+                            16,
+                            4 * (self.payload_padded_words & -self.payload_padded_words),
+                        ),
+                    )
+                    gMask = cute.make_tensor(
+                        mask_ptr,
+                        (self.payload_padded_words,),
+                    )
+                    cute.autovec_copy(rMask, gMask)
+            payload_group_idx += Int32(_PLAN_THREADS)
+
+
+class _ArbitraryPlanK2QCommonSm90(_ArbitraryPlanCommonSm90):
+    def __init__(
+        self,
+        config: (
+            _ResolvedSm90BwdConsumerConfig
+            | _ResolvedSm100BwdConsumerConfig
+            | _ResolvedSm100Hd256DkdvConsumerConfig
+        ),
+    ):
+        if isinstance(config, _ResolvedSm100BwdConsumerConfig):
+            topology_config = _ResolvedSm100BwdTopologyConfig(config)
+        elif isinstance(config, _ResolvedSm100Hd256DkdvConsumerConfig):
+            topology_config = _ResolvedSm100Hd256DkdvTopologyConfig(config)
+        else:
+            topology_config = _ResolvedSm90BwdTopologyConfig(config)
+        super().__init__(topology_config)
+        self.consumer_tile_m = config.tile_m
+        self.consumer_tile_n = config.tile_n
         self.subtile_factor = config.subtile_factor
-        self.sdp_swap_ab = config.sdp_swap_ab
-        self.atom_layout_m_sdp = config.atom_layout_m_sdp
+        self.sdp_swap_ab = (
+            config.sdp_swap_ab if isinstance(config, _ResolvedSm90BwdConsumerConfig) else True
+        )
+        self.atom_layout_m_sdp = (
+            config.atom_layout_m_sdp if isinstance(config, _ResolvedSm90BwdConsumerConfig) else 1
+        )
         self.num_wg_mma = config.num_wg
+        self.cta_group_size = (
+            config.cta_group_size
+            if isinstance(
+                config,
+                (_ResolvedSm100BwdConsumerConfig, _ResolvedSm100Hd256DkdvConsumerConfig),
+            )
+            else 1
+        )
         self.spt = config.spt
+        dq_order_format = _consumer_plan_signature(config).dq_order_format
+        self.dq_order_rank_only = dq_order_format == "rank_only"
+        self.dq_order_none = dq_order_format == "none"
 
     @cute.jit
     def _sample_info_k(
@@ -892,7 +1624,7 @@ class _ArbitraryPlanK2QCommonSm90(_ArbitraryPlanCommonSm90):
 
 
 class _ArbitraryPlanK2QCountSm90(_ArbitraryPlanK2QCommonSm90):
-    """Count K-major partial/full Q lists from Q-major packed topology."""
+    """Count K-major partial/full Q lists from Q-major arbitrary topology."""
 
     @cute.jit
     def __call__(
@@ -1115,7 +1847,7 @@ class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCommonSm90):
                 rMask = cute.make_rmem_tensor((self.payload_padded_words,), Uint32)
                 rMask.fill(Uint32(0))
                 for word_idx in cutlass.range_constexpr(self.payload_valid_words):
-                    packed = Uint32(0)
+                    mask_word = Uint32(0)
                     for bit_idx in cutlass.range(32, unroll=1):
                         value_idx = word_idx * 32 + bit_idx
                         keep = Boolean(False)
@@ -1136,8 +1868,8 @@ class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCommonSm90):
                                     nfunc,
                                 )
                         if keep:
-                            packed |= Uint32(1) << Uint32(bit_idx)
-                    rMask[word_idx] = packed
+                            mask_word |= Uint32(1) << Uint32(bit_idx)
+                    rMask[word_idx] = mask_word
                 mask_iter = mPartialMasks.iterator + cute.crd2idx(
                     (payload_idx, Int32(subtile_idx), consumer_tidx, Int32(0)),
                     mPartialMasks.layout,
@@ -1224,7 +1956,7 @@ class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCommonSm90):
                 full = (mFullBits[mask_head, compact_q_row, word_idx] & bit) != Uint32(0)
                 if visible:
                     rank = Int32(0)
-                    if planner_tidx == Int32(0):
+                    if const_expr(not self.dq_order_none) and planner_tidx == Int32(0):
                         rank = self._dq_write_rank(
                             mVisibleBits,
                             mask_head,
@@ -1237,19 +1969,27 @@ class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCommonSm90):
                         if planner_tidx == Int32(0):
                             output_idx = mFullOffsets[plan_row] + full_ordinal
                             mFullIndices[output_idx] = local_q_block
-                            mFullDQOrder[output_idx] = Int32(
-                                (Uint32(rank) << Uint32(_DQ_ORDER_COMPONENT_BITS))
-                                | Uint32(local_q_block)
-                            )
+                            if const_expr(not self.dq_order_none):
+                                if const_expr(self.dq_order_rank_only):
+                                    mFullDQOrder[output_idx] = rank
+                                else:
+                                    mFullDQOrder[output_idx] = Int32(
+                                        (Uint32(rank) << Uint32(_DQ_ORDER_COMPONENT_BITS))
+                                        | Uint32(local_q_block)
+                                    )
                         full_ordinal += Int32(1)
                     else:
                         output_idx = mPartialOffsets[plan_row] + partial_ordinal
                         if planner_tidx == Int32(0):
                             mPartialIndices[output_idx] = local_q_block
-                            mPartialDQOrder[output_idx] = Int32(
-                                (Uint32(rank) << Uint32(_DQ_ORDER_COMPONENT_BITS))
-                                | Uint32(local_q_block)
-                            )
+                            if const_expr(not self.dq_order_none):
+                                if const_expr(self.dq_order_rank_only):
+                                    mPartialDQOrder[output_idx] = rank
+                                else:
+                                    mPartialDQOrder[output_idx] = Int32(
+                                        (Uint32(rank) << Uint32(_DQ_ORDER_COMPONENT_BITS))
+                                        | Uint32(local_q_block)
+                                    )
                         self._store_payload(
                             tiled_mma_sdp,
                             mArbitraryFunc,
@@ -1268,6 +2008,232 @@ class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCommonSm90):
                         partial_ordinal += Int32(1)
 
 
+class _ArbitraryPlanK2QMaterializeSm100(_ArbitraryPlanK2QMaterializeSm90):
+    """Materialize the SM100 K2Q payload in compute TMEM-load order."""
+
+    def __init__(
+        self,
+        config: _ResolvedSm100BwdConsumerConfig | _ResolvedSm100Hd256DkdvConsumerConfig,
+    ):
+        self.is_hd256_dkdv = isinstance(config, _ResolvedSm100Hd256DkdvConsumerConfig)
+        super().__init__(config)
+
+    @cute.jit
+    def __call__(
+        self,
+        mArbitraryFunc: cute.Tensor,
+        mVisibleBits: cute.Tensor,
+        mFullBits: cute.Tensor,
+        mQPartialCounts: cute.Tensor,
+        mQFullCounts: cute.Tensor,
+        mPartialOffsets: cute.Tensor,
+        mPartialIndices: cute.Tensor,
+        mPartialMasks: cute.Tensor,
+        mPartialDQOrder: cute.Tensor,
+        mFullOffsets: cute.Tensor,
+        mFullIndices: cute.Tensor,
+        mFullDQOrder: cute.Tensor,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mCuSeqlensK: Optional[cute.Tensor],
+        mCuTotalQBlocks: Optional[cute.Tensor],
+        mCuTotalKBlocks: Optional[cute.Tensor],
+        batch_size: Int32,
+        seqlen_q_fixed: Int32,
+        seqlen_k_fixed: Int32,
+        total_q: Int32,
+        total_k: Int32,
+        max_n_blocks: Int32,
+        nfunc: Int32,
+        stream: cuda.CUstream = None,
+    ):
+        upper_total_n_blocks = batch_size * max_n_blocks
+        hmask = mArbitraryFunc.shape[0]
+        if const_expr(self.is_hd256_dkdv):
+            tiled_mma_sdp = make_sm100_hd256_dkdv_tiled_mma_kq(self.dtype)
+        else:
+            tiled_mma_sdp = make_sm100_bwd_tiled_mma_sdp(
+                self.dtype,
+                self.consumer_tile_m,
+                self.tile_n,
+                self.cta_group_size,
+            )
+        self.kernel(
+            tiled_mma_sdp,
+            mArbitraryFunc,
+            mVisibleBits,
+            mFullBits,
+            mQPartialCounts,
+            mQFullCounts,
+            mPartialOffsets,
+            mPartialIndices,
+            mPartialMasks,
+            mPartialDQOrder,
+            mFullOffsets,
+            mFullIndices,
+            mFullDQOrder,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mCuTotalQBlocks,
+            mCuTotalKBlocks,
+            batch_size,
+            seqlen_q_fixed,
+            seqlen_k_fixed,
+            total_q,
+            total_k,
+            max_n_blocks,
+            nfunc,
+        ).launch(
+            grid=(upper_total_n_blocks, hmask, 1),
+            block=(_PLAN_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    @cute.jit
+    def _store_payload(
+        self,
+        tiled_mma_sdp: cute.TiledMma,
+        mArbitraryFunc: cute.Tensor,
+        mPartialMasks: cute.Tensor,
+        payload_idx: Int32,
+        planner_tidx: Int32,
+        mask_head: Int32,
+        local_q_block: Int32,
+        local_n_block: Int32,
+        q_begin: Int32,
+        q_len: Int32,
+        k_begin: Int32,
+        k_len: Int32,
+        nfunc: Int32,
+    ) -> None:
+        consumer_tidx = planner_tidx
+        while consumer_tidx < Int32(self.num_mma_threads):
+            if const_expr(self.is_hd256_dkdv):
+                for q_subtile in cutlass.range_constexpr(self.subtile_factor):
+                    for cta_rank in cutlass.range_constexpr(self.cta_group_size):
+                        tScS_t2r = make_sm100_hd256_dkdv_score_ownership(
+                            tiled_mma_sdp,
+                            consumer_tidx,
+                        )
+                        rMask = cute.make_rmem_tensor(
+                            (self.payload_padded_words,),
+                            Uint32,
+                        )
+                        rMask.fill(Uint32(0))
+                        for word_idx in cutlass.range_constexpr(self.payload_valid_words):
+                            mask_word = Uint32(0)
+                            for bit_idx in cutlass.range(32, unroll=1):
+                                value_idx = word_idx * 32 + bit_idx
+                                keep = Boolean(False)
+                                if value_idx < self.payload_values_per_thread:
+                                    coord = tScS_t2r[value_idx]
+                                    q_local = (
+                                        local_q_block * Int32(self.tile_m)
+                                        + Int32(q_subtile * self.consumer_tile_m)
+                                        + Int32(coord[1])
+                                    )
+                                    k_local = (
+                                        local_n_block * Int32(self.tile_n)
+                                        + Int32(cta_rank * self.consumer_tile_n)
+                                        + Int32(coord[0])
+                                    )
+                                    if q_local < q_len and k_local < k_len:
+                                        keep = self._is_visible(
+                                            mArbitraryFunc,
+                                            mask_head,
+                                            q_begin + q_local,
+                                            k_begin + k_local,
+                                            nfunc,
+                                        )
+                                if keep:
+                                    mask_word |= Uint32(1) << Uint32(bit_idx)
+                            rMask[word_idx] = mask_word
+
+                        payload_subtile_idx = q_subtile * self.cta_group_size + cta_rank
+                        mask_iter = mPartialMasks.iterator + cute.crd2idx(
+                            (
+                                payload_idx,
+                                Int32(payload_subtile_idx),
+                                consumer_tidx,
+                                Int32(0),
+                            ),
+                            mPartialMasks.layout,
+                        )
+                        mask_ptr = cute.make_ptr(
+                            Uint32,
+                            mask_iter.toint(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=4,
+                        )
+                        gMask = cute.make_tensor(mask_ptr, (self.payload_padded_words,))
+                        cute.autovec_copy(rMask, gMask)
+            if const_expr(not self.is_hd256_dkdv):
+                # The score MMA is warp-group owned, while mask bits follow the
+                # 256-thread TMEM load partition used by compute_loop.  For 2CTA,
+                # get_slice(cta_rank) is the single source of truth for which K128
+                # half each CTA owns inside the cluster-union K256 tile.
+                thr_tmem_load = make_sm100_bwd_tmem_load(
+                    consumer_tidx,
+                    self.num_wg_mma,
+                )
+                for subtile_idx in cutlass.range_constexpr(self.subtile_factor):
+                    for cta_rank in cutlass.range_constexpr(self.cta_group_size):
+                        thr_mma_sdp = tiled_mma_sdp.get_slice(cta_rank)
+                        cS = cute.make_identity_tensor((self.tile_n, self.consumer_tile_m))
+                        tScS = thr_mma_sdp.partition_C(cS)
+                        tScS_t2r = thr_tmem_load.partition_D(tScS)
+                        rMask = cute.make_rmem_tensor((self.payload_padded_words,), Uint32)
+                        rMask.fill(Uint32(0))
+                        for word_idx in cutlass.range_constexpr(self.payload_valid_words):
+                            mask_word = Uint32(0)
+                            for bit_idx in cutlass.range(32, unroll=1):
+                                value_idx = word_idx * 32 + bit_idx
+                                keep = Boolean(False)
+                                if value_idx < self.payload_values_per_thread:
+                                    coord = tScS_t2r[value_idx]
+                                    # Backward scores are K @ Q.T, so the consumer
+                                    # coordinate order is (K, Q), not (Q, K).
+                                    q_local = (
+                                        local_q_block * Int32(self.tile_m)
+                                        + Int32(subtile_idx * self.consumer_tile_m)
+                                        + Int32(coord[1])
+                                    )
+                                    k_local = local_n_block * Int32(self.tile_n) + Int32(coord[0])
+                                    if q_local < q_len and k_local < k_len:
+                                        keep = self._is_visible(
+                                            mArbitraryFunc,
+                                            mask_head,
+                                            q_begin + q_local,
+                                            k_begin + k_local,
+                                            nfunc,
+                                        )
+                                if keep:
+                                    mask_word |= Uint32(1) << Uint32(bit_idx)
+                            rMask[word_idx] = mask_word
+
+                        payload_subtile_idx = subtile_idx * self.cta_group_size + cta_rank
+                        mask_iter = mPartialMasks.iterator + cute.crd2idx(
+                            (
+                                payload_idx,
+                                Int32(payload_subtile_idx),
+                                consumer_tidx,
+                                Int32(0),
+                            ),
+                            mPartialMasks.layout,
+                        )
+                        mask_ptr = cute.make_ptr(
+                            Uint32,
+                            mask_iter.toint(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=min(
+                                16,
+                                4 * (self.payload_padded_words & -self.payload_padded_words),
+                            ),
+                        )
+                        gMask = cute.make_tensor(mask_ptr, (self.payload_padded_words,))
+                        cute.autovec_copy(rMask, gMask)
+            consumer_tidx += Int32(_PLAN_THREADS)
+
+
 def _exclusive_offsets(counts: torch.Tensor) -> torch.Tensor:
     offsets = torch.empty((counts.numel() + 1,), dtype=torch.int32, device=counts.device)
     offsets[0] = 0
@@ -1279,8 +2245,60 @@ def _to_cute_optional(tensor: torch.Tensor | None):
     return to_cute_tensor(tensor, assumed_align=4, leading_dim=0) if tensor is not None else None
 
 
+def _classify_compile_key(
+    config: (
+        _ResolvedSm90FwdConsumerConfig
+        | _ResolvedSm90BwdTopologyConfig
+        | _ResolvedSm100BwdTopologyConfig
+        | _ResolvedSm100FwdTopologyConfig
+        | _ResolvedSm100Hd256FwdTopologyConfig
+        | _ResolvedSm100Hd256DqTopologyConfig
+        | _ResolvedSm100Hd256DkdvTopologyConfig
+    ),
+) -> tuple:
+    """Keep family-compatible signatures separate from exact-arch CUBINs."""
+
+    return (
+        "arbitrary_plan_classify_v5",
+        config.arch,
+        config.topology_planner_compile_key,
+    )
+
+
+def _materialize_compile_key(
+    config: (
+        _ResolvedSm90FwdConsumerConfig
+        | _ResolvedSm100FwdConsumerConfig
+        | _ResolvedSm100Hd256FwdConsumerConfig
+        | _ResolvedSm100Hd256DqConsumerConfig
+    ),
+) -> tuple:
+    """Return the exact-target payload materializer compilation key."""
+
+    return (
+        (
+            "arbitrary_plan_materialize_hd256_dq_v1"
+            if isinstance(config, _ResolvedSm100Hd256DqConsumerConfig)
+            else "arbitrary_plan_materialize_hd256_fwd_v1"
+            if isinstance(config, _ResolvedSm100Hd256FwdConsumerConfig)
+            else "arbitrary_plan_materialize_v2"
+        ),
+        config.arch,
+        _consumer_plan_signature(config).arch_family,
+        config.payload_planner_compile_key,
+    )
+
+
 def _compile_classify(
-    config: _ResolvedSm90FwdConsumerConfig | _ResolvedSm90BwdTopologyConfig,
+    config: (
+        _ResolvedSm90FwdConsumerConfig
+        | _ResolvedSm90BwdTopologyConfig
+        | _ResolvedSm100BwdTopologyConfig
+        | _ResolvedSm100FwdTopologyConfig
+        | _ResolvedSm100Hd256FwdTopologyConfig
+        | _ResolvedSm100Hd256DqTopologyConfig
+        | _ResolvedSm100Hd256DkdvTopologyConfig
+    ),
     arbitrary_func: torch.Tensor,
     visible_bits: torch.Tensor,
     full_bits: torch.Tensor,
@@ -1291,7 +2309,7 @@ def _compile_classify(
     cu_seqlens_k: torch.Tensor | None,
     cu_total_m_blocks: torch.Tensor | None,
 ):
-    key = ("arbitrary_plan_classify_sm90", config.topology_planner_compile_key)
+    key = _classify_compile_key(config)
     if key not in _CLASSIFY_COMPILE_CACHE:
         kernel = _ArbitraryPlanClassifySm90(config)
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1321,7 +2339,12 @@ def _compile_classify(
 
 
 def _compile_materialize(
-    config: _ResolvedSm90FwdConsumerConfig,
+    config: (
+        _ResolvedSm90FwdConsumerConfig
+        | _ResolvedSm100FwdConsumerConfig
+        | _ResolvedSm100Hd256FwdConsumerConfig
+        | _ResolvedSm100Hd256DqConsumerConfig
+    ),
     arbitrary_func: torch.Tensor,
     visible_bits: torch.Tensor,
     full_bits: torch.Tensor,
@@ -1334,9 +2357,20 @@ def _compile_materialize(
     cu_seqlens_k: torch.Tensor | None,
     cu_total_m_blocks: torch.Tensor | None,
 ):
-    key = ("arbitrary_plan_materialize_sm90", config.payload_planner_compile_key)
+    key = _materialize_compile_key(config)
     if key not in _MATERIALIZE_COMPILE_CACHE:
-        kernel = _ArbitraryPlanMaterializeSm90(config)
+        kernel = (
+            _ArbitraryPlanMaterializeSm100(config)
+            if isinstance(
+                config,
+                (
+                    _ResolvedSm100FwdConsumerConfig,
+                    _ResolvedSm100Hd256FwdConsumerConfig,
+                    _ResolvedSm100Hd256DqConsumerConfig,
+                ),
+            )
+            else _ArbitraryPlanMaterializeSm90(config)
+        )
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         _MATERIALIZE_COMPILE_CACHE[key] = cute.compile(
             kernel,
@@ -1366,7 +2400,11 @@ def _compile_materialize(
 
 
 def _compile_k2q_count(
-    config: _ResolvedSm90BwdConsumerConfig,
+    config: (
+        _ResolvedSm90BwdConsumerConfig
+        | _ResolvedSm100BwdConsumerConfig
+        | _ResolvedSm100Hd256DkdvConsumerConfig
+    ),
     visible_bits: torch.Tensor,
     full_bits: torch.Tensor,
     partial_counts: torch.Tensor,
@@ -1376,7 +2414,21 @@ def _compile_k2q_count(
     cu_total_q_blocks: torch.Tensor | None,
     cu_total_k_blocks: torch.Tensor | None,
 ):
-    key = ("arbitrary_plan_k2q_count_sm90", config.planner_compile_key)
+    if isinstance(config, _ResolvedSm100BwdConsumerConfig):
+        topology_config = _ResolvedSm100BwdTopologyConfig(config)
+    elif isinstance(config, _ResolvedSm100Hd256DkdvConsumerConfig):
+        topology_config = _ResolvedSm100Hd256DkdvTopologyConfig(config)
+    else:
+        topology_config = _ResolvedSm90BwdTopologyConfig(config)
+    key = (
+        (
+            "arbitrary_plan_hd256_k2q_count_v1"
+            if isinstance(config, _ResolvedSm100Hd256DkdvConsumerConfig)
+            else "arbitrary_plan_k2q_count_v3"
+        ),
+        config.arch,
+        topology_config.topology_planner_compile_key,
+    )
     if key not in _K2Q_COUNT_COMPILE_CACHE:
         kernel = _ArbitraryPlanK2QCountSm90(config)
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1403,7 +2455,11 @@ def _compile_k2q_count(
 
 
 def _compile_k2q_materialize(
-    config: _ResolvedSm90BwdConsumerConfig,
+    config: (
+        _ResolvedSm90BwdConsumerConfig
+        | _ResolvedSm100BwdConsumerConfig
+        | _ResolvedSm100Hd256DkdvConsumerConfig
+    ),
     arbitrary_func: torch.Tensor,
     visible_bits: torch.Tensor,
     full_bits: torch.Tensor,
@@ -1421,9 +2477,25 @@ def _compile_k2q_materialize(
     cu_total_q_blocks: torch.Tensor | None,
     cu_total_k_blocks: torch.Tensor | None,
 ):
-    key = ("arbitrary_plan_k2q_materialize_sm90", config.planner_compile_key)
+    key = (
+        (
+            "arbitrary_plan_hd256_k2q_materialize_v1"
+            if isinstance(config, _ResolvedSm100Hd256DkdvConsumerConfig)
+            else "arbitrary_plan_k2q_materialize_v3"
+        ),
+        config.arch,
+        _consumer_plan_signature(config).arch_family,
+        config.planner_compile_key,
+    )
     if key not in _K2Q_MATERIALIZE_COMPILE_CACHE:
-        kernel = _ArbitraryPlanK2QMaterializeSm90(config)
+        kernel = (
+            _ArbitraryPlanK2QMaterializeSm100(config)
+            if isinstance(
+                config,
+                (_ResolvedSm100BwdConsumerConfig, _ResolvedSm100Hd256DkdvConsumerConfig),
+            )
+            else _ArbitraryPlanK2QMaterializeSm90(config)
+        )
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         _K2Q_MATERIALIZE_COMPILE_CACHE[key] = cute.compile(
             kernel,
@@ -1574,7 +2646,7 @@ def create_arbitrary_block_sparse_tensors(
     pack_gqa: bool | None = None,
     build_backward: bool = False,
 ) -> BlockSparseTensorsTorch:
-    """Build a compact sample-local arbitrary-mask plan for SM90 attention."""
+    """Build a compact sample-local arbitrary-mask plan for the target GPU."""
 
     metadata = _validate_builder_inputs(
         arbitrary_func,
@@ -1586,28 +2658,23 @@ def create_arbitrary_block_sparse_tensors(
         max_seqlen_q,
         max_seqlen_k,
     )
-    device = q.device
-    arch = (
-        90
-        if is_fake_mode()
-        else sum(
-            value * multiplier
-            for value, multiplier in zip(torch.cuda.get_device_capability(device), (10, 1))
-        )
-    )
-    fwd_config = resolve_sm90_fwd_consumer_config(
-        arch=arch,
-        dtype=q.dtype,
-        head_dim=q.shape[-1],
-        head_dim_v=v.shape[-1],
-        num_q_heads=q.shape[-2],
-        num_kv_heads=k.shape[-2],
+    runtime_binding = ArbitraryPlanRuntimeBinding.capture(
         is_varlen=metadata["is_varlen"],
-        hmask=metadata["hmask"],
-        pack_gqa=pack_gqa,
+        batch_size=metadata["batch_size"],
+        seqlen_q=(None if metadata["is_varlen"] else metadata["seqlen_q_fixed"]),
+        seqlen_k=(None if metadata["is_varlen"] else metadata["seqlen_k_fixed"]),
+        total_q=metadata["total_q"],
+        total_k=metadata["total_k"],
+        max_seqlen_q=metadata["max_seqlen_q"],
+        max_seqlen_k=metadata["max_seqlen_k"],
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
     )
-    bwd_config = (
-        resolve_sm90_bwd_consumer_config(
+    device = q.device
+    arch = _get_plan_builder_arch(device)
+    dq_config = None
+    if arch // 10 == 9:
+        fwd_config = resolve_sm90_fwd_consumer_config(
             arch=arch,
             dtype=q.dtype,
             head_dim=q.shape[-1],
@@ -1615,13 +2682,107 @@ def create_arbitrary_block_sparse_tensors(
             num_q_heads=q.shape[-2],
             num_kv_heads=k.shape[-2],
             is_varlen=metadata["is_varlen"],
+            hmask=metadata["hmask"],
+            pack_gqa=pack_gqa,
         )
-        if build_backward
-        else None
-    )
+        bwd_config = (
+            resolve_sm90_bwd_consumer_config(
+                arch=arch,
+                dtype=q.dtype,
+                head_dim=q.shape[-1],
+                head_dim_v=v.shape[-1],
+                num_q_heads=q.shape[-2],
+                num_kv_heads=k.shape[-2],
+                is_varlen=metadata["is_varlen"],
+            )
+            if build_backward
+            else None
+        )
+        fwd_topology_config = fwd_config
+    elif arch // 10 == 10 and arch != 101:
+        if build_backward and arch not in (100, 103):
+            raise NotImplementedError("arbitrary backward currently supports SM100/SM103 only")
+        use_hd256_consumer = q.shape[-1] == 256 and v.shape[-1] == 256
+        if use_hd256_consumer:
+            fwd_config = resolve_sm100_hd256_fwd_consumer_config(
+                arch=arch,
+                dtype=q.dtype,
+                head_dim=q.shape[-1],
+                head_dim_v=v.shape[-1],
+                num_q_heads=q.shape[-2],
+                num_kv_heads=k.shape[-2],
+                is_varlen=metadata["is_varlen"],
+                hmask=metadata["hmask"],
+                pack_gqa=pack_gqa,
+            )
+            if build_backward:
+                dq_config = resolve_sm100_hd256_dq_consumer_config(
+                    arch=arch,
+                    dtype=q.dtype,
+                    head_dim=q.shape[-1],
+                    head_dim_v=v.shape[-1],
+                    num_q_heads=q.shape[-2],
+                    num_kv_heads=k.shape[-2],
+                    is_varlen=metadata["is_varlen"],
+                    hmask=metadata["hmask"],
+                    pack_gqa=False,
+                    use_2cta_instrs=True,
+                    deterministic=False,
+                )
+        else:
+            fwd_config = resolve_sm100_fwd_consumer_config(
+                arch=arch,
+                dtype=q.dtype,
+                head_dim=q.shape[-1],
+                head_dim_v=v.shape[-1],
+                num_q_heads=q.shape[-2],
+                num_kv_heads=k.shape[-2],
+                is_varlen=metadata["is_varlen"],
+                hmask=metadata["hmask"],
+                pack_gqa=pack_gqa,
+                max_seqlen_q=metadata["max_seqlen_q"],
+            )
+        if build_backward and use_hd256_consumer:
+            bwd_config = resolve_sm100_hd256_dkdv_consumer_config(
+                arch=arch,
+                dtype=q.dtype,
+                head_dim=q.shape[-1],
+                head_dim_v=v.shape[-1],
+                num_q_heads=q.shape[-2],
+                num_kv_heads=k.shape[-2],
+                is_varlen=metadata["is_varlen"],
+                hmask=metadata["hmask"],
+                pack_gqa=False,
+                use_2cta_instrs=True,
+                deterministic=False,
+            )
+        else:
+            bwd_config = (
+                resolve_sm100_bwd_consumer_config(
+                    arch=arch,
+                    dtype=q.dtype,
+                    head_dim=q.shape[-1],
+                    head_dim_v=v.shape[-1],
+                    num_q_heads=q.shape[-2],
+                    num_kv_heads=k.shape[-2],
+                    is_varlen=metadata["is_varlen"],
+                )
+                if build_backward
+                else None
+            )
+        fwd_topology_config = (
+            _ResolvedSm100Hd256FwdTopologyConfig(fwd_config)
+            if use_hd256_consumer
+            else _ResolvedSm100FwdTopologyConfig(fwd_config)
+        )
+    elif arch == 101 or arch // 10 == 11:
+        raise NotImplementedError("SM110 arbitrary plan building requires Thor consumer validation")
+    else:
+        raise NotImplementedError("arbitrary plan building supports SM90/SM100/SM110 only")
 
     qratio = fwd_config.qhead_per_kvhead if fwd_config.pack_gqa else 1
-    fwd_max_m_blocks = math.ceil(metadata["max_seqlen_q"] * qratio / fwd_config.tile_m)
+    fwd_plan_tile_m = fwd_config.block_size[0]
+    fwd_max_m_blocks = math.ceil(metadata["max_seqlen_q"] * qratio / fwd_plan_tile_m)
     fwd_max_n_blocks = math.ceil(metadata["max_seqlen_k"] / fwd_config.tile_n)
     fwd_upper_total_m_blocks = metadata["batch_size"] * fwd_max_m_blocks
     fwd_num_words = max(1, math.ceil(fwd_max_n_blocks / 32))
@@ -1631,13 +2792,23 @@ def create_arbitrary_block_sparse_tensors(
         if bwd_config is not None
         else 0
     )
+    bwd_sparse_tile_n = (
+        bwd_config.sparse_tile_n
+        if isinstance(
+            bwd_config,
+            (_ResolvedSm100BwdConsumerConfig, _ResolvedSm100Hd256DkdvConsumerConfig),
+        )
+        else bwd_config.tile_n
+        if bwd_config is not None
+        else 0
+    )
     bwd_max_n_blocks = (
-        math.ceil(metadata["max_seqlen_k"] / bwd_config.tile_n) if bwd_config is not None else 0
+        math.ceil(metadata["max_seqlen_k"] / bwd_sparse_tile_n) if bwd_config is not None else 0
     )
     bwd_upper_total_m_blocks = metadata["batch_size"] * bwd_max_m_blocks
     bwd_upper_total_n_blocks = metadata["batch_size"] * bwd_max_n_blocks
     bwd_num_words = max(1, math.ceil(bwd_max_n_blocks / 32))
-    if bwd_config is not None and (
+    if isinstance(bwd_config, _ResolvedSm90BwdConsumerConfig) and (
         bwd_max_m_blocks > _DQ_ORDER_COMPONENT_LIMIT or bwd_max_n_blocks > _DQ_ORDER_COMPONENT_LIMIT
     ):
         raise ValueError(
@@ -1645,6 +2816,7 @@ def create_arbitrary_block_sparse_tensors(
         )
 
     cu_total_m_blocks = None
+    cu_total_fwd_n_blocks = None
     cu_total_bwd_m_blocks = None
     cu_total_bwd_n_blocks = None
     metadata_invalid = torch.zeros((), dtype=torch.bool, device=device)
@@ -1654,8 +2826,8 @@ def create_arbitrary_block_sparse_tensors(
         q_lengths = q_lengths_raw.clamp(min=0, max=metadata["max_seqlen_q"])
         physical_q_lengths = q_lengths * qratio
         m_counts = torch.div(
-            physical_q_lengths + fwd_config.tile_m - 1,
-            fwd_config.tile_m,
+            physical_q_lengths + fwd_plan_tile_m - 1,
+            fwd_plan_tile_m,
             rounding_mode="floor",
         ).to(torch.int32)
         cu_total_m_blocks = torch.empty(
@@ -1663,6 +2835,14 @@ def create_arbitrary_block_sparse_tensors(
         )
         cu_total_m_blocks[0] = 0
         cu_total_m_blocks[1:] = torch.cumsum(m_counts, dim=0, dtype=torch.int32)
+        fwd_n_counts = torch.div(
+            k_lengths_raw.clamp(min=0, max=metadata["max_seqlen_k"]) + fwd_config.tile_n - 1,
+            fwd_config.tile_n,
+            rounding_mode="floor",
+        ).to(torch.int32)
+        cu_total_fwd_n_blocks = torch.empty_like(cu_total_m_blocks)
+        cu_total_fwd_n_blocks[0] = 0
+        cu_total_fwd_n_blocks[1:] = torch.cumsum(fwd_n_counts, dim=0, dtype=torch.int32)
         if bwd_config is not None:
             bwd_m_counts = torch.div(
                 q_lengths + bwd_config.sparse_tile_m - 1,
@@ -1670,8 +2850,8 @@ def create_arbitrary_block_sparse_tensors(
                 rounding_mode="floor",
             ).to(torch.int32)
             bwd_n_counts = torch.div(
-                k_lengths_raw.clamp(min=0, max=metadata["max_seqlen_k"]) + bwd_config.tile_n - 1,
-                bwd_config.tile_n,
+                k_lengths_raw.clamp(min=0, max=metadata["max_seqlen_k"]) + bwd_sparse_tile_n - 1,
+                bwd_sparse_tile_n,
                 rounding_mode="floor",
             ).to(torch.int32)
             cu_total_bwd_m_blocks = torch.empty(
@@ -1735,7 +2915,7 @@ def create_arbitrary_block_sparse_tensors(
 
     if fwd_upper_total_m_blocks > 0 and fwd_max_n_blocks > 0:
         classify = _compile_classify(
-            fwd_config,
+            fwd_topology_config,
             arbitrary_func,
             visible_bits,
             full_bits,
@@ -1767,8 +2947,14 @@ def create_arbitrary_block_sparse_tensors(
                 Int32(metadata["nfunc"]),
             )
     if bwd_config is not None and bwd_upper_total_m_blocks > 0 and bwd_max_n_blocks > 0:
+        if isinstance(bwd_config, _ResolvedSm100BwdConsumerConfig):
+            bwd_topology_config = _ResolvedSm100BwdTopologyConfig(bwd_config)
+        elif isinstance(bwd_config, _ResolvedSm100Hd256DkdvConsumerConfig):
+            bwd_topology_config = _ResolvedSm100Hd256DkdvTopologyConfig(bwd_config)
+        else:
+            bwd_topology_config = _ResolvedSm90BwdTopologyConfig(bwd_config)
         bwd_classify = _compile_classify(
-            _ResolvedSm90BwdTopologyConfig(bwd_config),
+            bwd_topology_config,
             arbitrary_func,
             bwd_visible_bits,
             bwd_full_bits,
@@ -1939,6 +3125,20 @@ def create_arbitrary_block_sparse_tensors(
         dtype=torch.uint32,
         device=device,
     )
+    dq_partial_masks = (
+        torch.empty(
+            (
+                partial_nnz,
+                dq_config.physical_subtiles,
+                dq_config.num_mask_payload_groups,
+                dq_config.payload_padded_words,
+            ),
+            dtype=torch.uint32,
+            device=device,
+        )
+        if dq_config is not None
+        else None
+    )
     bwd_plan = None
     if bwd_config is not None:
         bwd_partial_counts = bwd_partial_counts_tmp[:, :bwd_total_n_blocks].clone()
@@ -1982,6 +3182,48 @@ def create_arbitrary_block_sparse_tensors(
                 partial_offsets,
                 partial_indices,
                 partial_masks,
+                full_offsets,
+                full_indices,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                cu_total_m_blocks,
+                Int32(metadata["batch_size"]),
+                Int32(metadata["seqlen_q_fixed"]),
+                Int32(metadata["seqlen_k_fixed"]),
+                Int32(metadata["total_q"]),
+                Int32(metadata["total_k"]),
+                Int32(fwd_max_m_blocks),
+                Int32(fwd_max_n_blocks),
+                Int32(metadata["nfunc"]),
+            )
+    if (
+        dq_config is not None
+        and dq_partial_masks is not None
+        and fwd_upper_total_m_blocks > 0
+        and partial_nnz + full_nnz > 0
+    ):
+        dq_materialize = _compile_materialize(
+            dq_config,
+            arbitrary_func,
+            visible_bits,
+            full_bits,
+            partial_offsets,
+            partial_indices,
+            dq_partial_masks,
+            full_offsets,
+            full_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cu_total_m_blocks,
+        )
+        if not is_fake_mode():
+            dq_materialize(
+                arbitrary_func,
+                visible_bits,
+                full_bits,
+                partial_offsets,
+                partial_indices,
+                dq_partial_masks,
                 full_offsets,
                 full_indices,
                 cu_seqlens_q,
@@ -2046,7 +3288,45 @@ def create_arbitrary_block_sparse_tensors(
                 Int32(bwd_max_n_blocks),
                 Int32(metadata["nfunc"]),
             )
+    q2k_topology = ArbitraryTopologyTensors(
+        direction="q2k",
+        partial_count=partial_counts,
+        partial_offset=partial_offsets,
+        partial_index=partial_indices,
+        full_count=full_counts,
+        full_offset=full_offsets,
+        full_index=full_indices,
+        cu_total_q_plan_rows=cu_total_m_blocks,
+        cu_total_k_plan_rows=cu_total_fwd_n_blocks,
+        runtime_binding=runtime_binding,
+    )
+    dq_plan = None
+    if dq_config is not None:
+        assert dq_partial_masks is not None
+        dq_plan = BlockSparseTensorsTorch(
+            mask_block_cnt=partial_counts,
+            mask_block_idx=partial_indices,
+            full_block_cnt=full_counts,
+            full_block_idx=full_indices,
+            cu_total_m_blocks=cu_total_m_blocks,
+            cu_block_idx_offsets=None,
+            block_size=dq_config.block_size,
+            dq_write_order=None,
+            dq_write_order_full=None,
+            spt=None,
+            mask_block_offset=partial_offsets,
+            full_block_offset=full_offsets,
+            mask_block_masks=dq_partial_masks,
+            pack_gqa=False,
+            bwd_tensors=None,
+            plan_signature=_consumer_plan_signature(dq_config),
+            topology_tensors=q2k_topology,
+        )
+
     if bwd_config is not None:
+        hd256_dkdv = isinstance(bwd_config, _ResolvedSm100Hd256DkdvConsumerConfig)
+        exposed_partial_dq_order = None if hd256_dkdv else bwd_partial_dq_order
+        exposed_full_dq_order = None if hd256_dkdv else bwd_full_dq_order
         bwd_plan = BlockSparseTensorsTorch(
             mask_block_cnt=bwd_partial_counts,
             mask_block_idx=bwd_partial_indices,
@@ -2055,14 +3335,29 @@ def create_arbitrary_block_sparse_tensors(
             cu_total_m_blocks=(cu_total_bwd_n_blocks if metadata["is_varlen"] else None),
             cu_block_idx_offsets=None,
             block_size=bwd_config.block_size,
-            dq_write_order=bwd_partial_dq_order,
-            dq_write_order_full=bwd_full_dq_order,
+            dq_write_order=exposed_partial_dq_order,
+            dq_write_order_full=exposed_full_dq_order,
             spt=bwd_config.spt,
             mask_block_offset=bwd_partial_offsets,
             full_block_offset=bwd_full_offsets,
             mask_block_masks=bwd_partial_masks,
             pack_gqa=None,
             bwd_tensors=None,
+            plan_signature=_consumer_plan_signature(bwd_config),
+            topology_tensors=ArbitraryTopologyTensors(
+                direction="k2q",
+                partial_count=bwd_partial_counts,
+                partial_offset=bwd_partial_offsets,
+                partial_index=bwd_partial_indices,
+                full_count=bwd_full_counts,
+                full_offset=bwd_full_offsets,
+                full_index=bwd_full_indices,
+                cu_total_q_plan_rows=cu_total_bwd_m_blocks,
+                cu_total_k_plan_rows=cu_total_bwd_n_blocks,
+                runtime_binding=runtime_binding,
+                dq_write_order=exposed_partial_dq_order,
+                dq_write_order_full=exposed_full_dq_order,
+            ),
         )
 
     plan = BlockSparseTensorsTorch(
@@ -2081,6 +3376,9 @@ def create_arbitrary_block_sparse_tensors(
         mask_block_masks=partial_masks,
         pack_gqa=fwd_config.pack_gqa,
         bwd_tensors=bwd_plan,
+        plan_signature=_consumer_plan_signature(fwd_config),
+        topology_tensors=q2k_topology,
+        dq_tensors=dq_plan,
     )
 
     return plan

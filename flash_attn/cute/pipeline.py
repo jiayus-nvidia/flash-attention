@@ -385,10 +385,13 @@ PipelineTmaUmma.create = _override_create(PipelineTmaUmmaOg, PipelineTmaUmma)
 
 @dataclass(frozen=True)
 class PipelineUmmaAsync(_PipelineIndexPhaseMixin, PipelineUmmaAsyncOg):
-    pass
-
-
-PipelineUmmaAsync.create = _override_create(PipelineUmmaAsyncOg, PipelineUmmaAsync)
+    @staticmethod
+    def create(*args, consumer_mask_override: Optional[int] = None, **kwargs):
+        obj = PipelineUmmaAsyncOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineUmmaAsync)
+        if consumer_mask_override is not None:
+            object.__setattr__(obj, "consumer_mask", Int32(consumer_mask_override))
+        return obj
 
 
 # ── PipelineAsyncUmma ───────────────────────────────────────────────────────
@@ -396,7 +399,10 @@ PipelineUmmaAsync.create = _override_create(PipelineUmmaAsyncOg, PipelineUmmaAsy
 
 @dataclass(frozen=True)
 class PipelineAsyncUmma(_PipelineIndexPhaseMixin, PipelineAsyncUmmaOg):
-    pass
-
-
-PipelineAsyncUmma.create = _override_create(PipelineAsyncUmmaOg, PipelineAsyncUmma)
+    @staticmethod
+    def create(*args, producer_mask_override: Optional[int] = None, **kwargs):
+        obj = PipelineAsyncUmmaOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineAsyncUmma)
+        if producer_mask_override is not None:
+            object.__setattr__(obj, "producer_mask", Int32(producer_mask_override))
+        return obj

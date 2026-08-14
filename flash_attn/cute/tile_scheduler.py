@@ -326,14 +326,10 @@ class SingleTileMaxVarlenScheduler:
     @staticmethod
     @cute.jit
     def create(params: Params, *, loc=None, ip=None) -> "SingleTileMaxVarlenScheduler":
-        return SingleTileMaxVarlenScheduler(
-            params, cute.arch.block_idx(), loc=loc, ip=ip
-        )
+        return SingleTileMaxVarlenScheduler(params, cute.arch.block_idx(), loc=loc, ip=ip)
 
     @staticmethod
-    def get_grid_shape(
-        params: Params, *, loc=None, ip=None
-    ) -> Tuple[Int32, Int32, Int32]:
+    def get_grid_shape(params: Params, *, loc=None, ip=None) -> Tuple[Int32, Int32, Int32]:
         return (params.num_block, params.num_head, params.num_batch)
 
     @cute.jit
@@ -345,18 +341,13 @@ class SingleTileMaxVarlenScheduler:
                 seqlen = self.params.mSeqUsed[batch_idx]
             else:
                 assert self.params.mCuSeqlens is not None
-                seqlen = (
-                    self.params.mCuSeqlens[batch_idx + 1]
-                    - self.params.mCuSeqlens[batch_idx]
-                )
+                seqlen = self.params.mCuSeqlens[batch_idx + 1] - self.params.mCuSeqlens[batch_idx]
         valid = (
             self._is_first_block
             and batch_idx < self.params.num_batch
             and block_idx * self.params.tile_size < seqlen
         )
-        return WorkTileInfo(
-            (Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(0)), valid
-        )
+        return WorkTileInfo((Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(0)), valid)
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
         return self.get_current_work(loc=loc, ip=ip)
@@ -535,9 +526,7 @@ class SingleTileLPTScheduler:
             # Seems faster if swizzle is a power of 2
             log2_floor = lambda n: 31 - clz(n)
             swizzle = (
-                1
-                if size_l2 < size_one_head
-                else (1 << log2_floor(Int32(size_l2 // size_one_head)))
+                1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))
             )
             # If we're in the last section (called residual), we don't want to divide by
             # swizzle. Instead we want to divide by the remainder.
@@ -772,20 +761,14 @@ class SingleTileLPTBwdScheduler:
         ) -> "SingleTileLPTBwdScheduler.Params":
             size_l2 = 40 * 1024 * 1024
             size_one_qdo_head = (
-                cutlass.Int64(args.seqlen_k)
-                * (args.headdim + args.headdim_v)
-                * args.element_size
+                cutlass.Int64(args.seqlen_k) * (args.headdim + args.headdim_v) * args.element_size
             )
-            size_one_dqaccum_head = (
-                cutlass.Int64(args.seqlen_k) * args.headdim * 4
-            )
+            size_one_dqaccum_head = cutlass.Int64(args.seqlen_k) * args.headdim * 4
             # size_one_dqaccum_head = 0
             size_one_head = size_one_qdo_head + size_one_dqaccum_head
             log2_floor = lambda n: 31 - clz(n)
             swizzle = (
-                1
-                if size_l2 < size_one_head
-                else (1 << log2_floor(Int32(size_l2 // size_one_head)))
+                1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))
             )
             # swizzle = 8
             # If we're in the last section (called residual), we don't want to divide by
@@ -1029,9 +1012,7 @@ class VarlenDynamicPersistentTileSchedulerSm90:
         group_start_tile = self._group_start_tile
         num_m_blocks = self._get_num_m_blocks(lane, virtual_batch)
         num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane)
-        m_blocks_in_group = cute.arch.shuffle_sync(
-            num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1
-        )
+        m_blocks_in_group = cute.arch.shuffle_sync(num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1)
         group_end_tile = group_start_tile + m_blocks_in_group * params.num_head
 
         while group_end_tile <= tile_idx:
@@ -1073,9 +1054,7 @@ class VarlenDynamicPersistentTileSchedulerSm90:
             nheads_remainder = params.num_head - section_idx * nheads_in_l2
             nheads_in_this_section = cutlass.min(nheads_in_l2, nheads_remainder)
             block = l2_mod // nheads_in_this_section
-            head = section_idx * nheads_in_l2 + (
-                l2_mod - block * nheads_in_this_section
-            )
+            head = section_idx * nheads_in_l2 + (l2_mod - block * nheads_in_this_section)
             if const_expr(params.lpt):
                 block = num_m_blocks - Int32(1) - block
             actual_batch = params.mMetadata[2, virtual_batch]
@@ -1120,9 +1099,7 @@ class VarlenDynamicPersistentTileSchedulerSm90:
 
     @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
-        return WorkTileInfo(
-            (self._block, self._head, self._batch, Int32(0)), self._valid
-        )
+        return WorkTileInfo((self._block, self._head, self._batch, Int32(0)), self._valid)
 
     @cute.jit
     def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
@@ -1137,14 +1114,17 @@ class VarlenDynamicPersistentTileSchedulerSm90:
         if const_expr(self.is_producer):
             next_tile_idx = Int32(0)
             if cute.arch.lane_idx() == Int32(0):
-                next_tile_idx = Int32(
-                    cute.arch.atomic_add(
-                        ptr=self.params.mTileCounter.iterator,
-                        val=Int32(1),
-                        sem="relaxed",
-                        scope="gpu",
+                next_tile_idx = (
+                    Int32(
+                        cute.arch.atomic_add(
+                            ptr=self.params.mTileCounter.iterator,
+                            val=Int32(1),
+                            sem="relaxed",
+                            scope="gpu",
+                        )
                     )
-                ) + cute.arch.grid_dim()[0]
+                    + cute.arch.grid_dim()[0]
+                )
             self._next_tile_idx = next_tile_idx
 
     @cute.jit
@@ -1227,6 +1207,7 @@ class SingleTileVarlenScheduler:
         head_swizzle: cutlass.Constexpr[bool] = False
         cluster_shape_m: cutlass.Constexpr[int] = 1
         scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
+        use_cluster_idx: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
@@ -1273,6 +1254,7 @@ class SingleTileVarlenScheduler:
                 head_swizzle=args.head_swizzle,
                 cluster_shape_m=args.cluster_shape_mn[0],
                 scheduling_mode=scheduling_mode,
+                use_cluster_idx=args.use_cluster_idx,
             )
 
     def __init__(
@@ -1331,6 +1313,12 @@ class SingleTileVarlenScheduler:
                 loc=loc,
                 ip=ip,
             )
+        if const_expr(params.use_cluster_idx):
+            # Cooperative CTAs must decode the same logical work tile.  The
+            # cluster rank is applied later by the kernel's consumer mapping.
+            tile_idx = cute.arch.cluster_idx()[0]
+            split_idx = cute.arch.block_idx()[1]
+            return SingleTileVarlenScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
         tile_idx, split_idx, _ = cute.arch.block_idx()
         return SingleTileVarlenScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
@@ -1386,7 +1374,11 @@ class SingleTileVarlenScheduler:
         group_end_tile = m_blocks_in_group * params.num_head
         # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, num_m_blocks_cumulative = %d, m_blocks_in_group = %d", self._tile_idx, group_end_tile, num_m_blocks, num_m_blocks_cumulative, m_blocks_in_group)
         block, head_idx, batch_idx = Int32(0), Int32(0), Int32(0)
-        next_tile_idx = self._tile_idx // params.cluster_shape_m
+        next_tile_idx = (
+            self._tile_idx
+            if const_expr(params.use_cluster_idx)
+            else self._tile_idx // params.cluster_shape_m
+        )
         while group_end_tile <= next_tile_idx:
             batch_idx += cute.arch.WARP_SIZE - 1
             if batch_idx >= params.num_batch:
@@ -1466,7 +1458,7 @@ class SingleTileVarlenScheduler:
                 head_idx = mh_block // num_m_blocks
                 block = mh_block - head_idx * num_m_blocks
             is_valid = self._is_first_block and batch_idx < params.num_batch
-            if cutlass.const_expr(params.cluster_shape_m > 1):
+            if cutlass.const_expr(params.cluster_shape_m > 1 and not params.use_cluster_idx):
                 bidx_in_cluster = cute.arch.block_in_cluster_idx()
                 block = block * params.cluster_shape_m + bidx_in_cluster[0]
         # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)

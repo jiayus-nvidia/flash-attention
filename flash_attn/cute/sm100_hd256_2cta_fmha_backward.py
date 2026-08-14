@@ -117,6 +117,10 @@ class BlackwellFusedMultiHeadAttentionBackward:
         mask_mod: cutlass.Constexpr | None = None,
         is_arbitrary: bool = False,
         has_aux_tensors: cutlass.Constexpr = False,
+        mask_payload_valid_words_dq: int = 4,
+        mask_payload_padded_words_dq: int = 4,
+        mask_payload_valid_words_dkdv: int = 1,
+        mask_payload_padded_words_dkdv: int = 1,
         subtile_factor: cutlass.Constexpr[int] = 1,
         tile_m_dq: int = 128,
         tile_n_dq: int = 128,
@@ -144,14 +148,28 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert not deterministic, (
             "SM100 backward with head_dim=256 does not support deterministic mode"
         )
-        if is_arbitrary:
-            assert has_aux_tensors, "SM100 backward with head_dim=256 arbitrary mask requires aux_tensors"
-        else:
-            assert not has_aux_tensors, "SM100 backward with head_dim=256 does not support aux_tensors"
+        assert not has_aux_tensors, "SM100 backward with head_dim=256 does not support aux_tensors"
         assert cluster_size in (1, 2), (
             "SM100 backward with head_dim=256 only supports cluster_size in {1, 2}"
         )
         assert use_2cta_instrs, "SM100 backward with head_dim=256 requires use_2cta_instrs=True"
+        if is_arbitrary:
+            assert qhead_per_kvhead >= 1
+            assert not is_persistent and not use_clc_scheduler, (
+                "SM100 backward with head_dim=256 arbitrary requires STATIC scheduling"
+            )
+            assert cluster_size == 2, (
+                "SM100 backward with head_dim=256 arbitrary requires a 2CTA cluster"
+            )
+            assert subtile_factor == 2, (
+                "SM100 backward with head_dim=256 arbitrary requires Q256 K2Q entries"
+            )
+            assert mask_payload_valid_words_dq == 4 and mask_payload_padded_words_dq == 4, (
+                "SM100 hd256 arbitrary dQ payload requires four valid/padded words"
+            )
+            assert mask_payload_valid_words_dkdv == 1 and mask_payload_padded_words_dkdv == 1, (
+                "SM100 hd256 arbitrary dKdV payload requires one valid/padded word"
+            )
         self.subtile_factor = subtile_factor
 
         self.acc_dtype = cutlass.Float32
@@ -180,6 +198,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
             False,  # split_head
             qhead_per_kvhead=self.qhead_per_kvhead,
             is_arbitrary=self.is_arbitrary,
+            mask_payload_valid_words=mask_payload_valid_words_dq,
+            mask_payload_padded_words=mask_payload_padded_words_dq,
             use_clc_scheduler=self.use_clc_scheduler,
         )
         self.dkdv_kernel = BlackwellFusedMultiHeadAttentionBackwardDKDVKernel(
@@ -190,6 +210,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
             self.window_size_right,
             qhead_per_kvhead=self.qhead_per_kvhead,
             is_arbitrary=self.is_arbitrary,
+            mask_payload_valid_words=mask_payload_valid_words_dkdv,
+            mask_payload_padded_words=mask_payload_padded_words_dkdv,
             use_clc_scheduler=self.use_clc_scheduler,
             subtile_factor=self.subtile_factor,
         )
@@ -219,6 +241,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
         aux_tensors: list | None = None,
         block_sparse_tensors_dq: BlockSparseTensors | None = None,
         block_sparse_tensors: BlockSparseTensors | None = None,
+        max_seqlen_q_runtime: Int32 = Int32(0),
+        max_seqlen_k_runtime: Int32 = Int32(0),
         stream: cuda.CUstream = None,
     ):
         """Host function to launch CuTeDSL kernel."""
@@ -236,7 +260,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
             assert self.is_arbitrary, (
                 "SM100 backward with head_dim=256 dQ CSR support requires arbitrary=True"
             )
-            assert not varlen, "SM100 backward with head_dim=256 dQ CSR support does not support varlen"
             assert block_sparse_tensors_dq.mask_block_offset is not None, (
                 "SM100 backward with head_dim=256 dQ only supports linear CSR block sparse tensors"
             )
@@ -244,18 +267,26 @@ class BlackwellFusedMultiHeadAttentionBackward:
             assert self.is_arbitrary, (
                 "SM100 backward with head_dim=256 CSR support requires arbitrary=True"
             )
-            assert not varlen, "SM100 backward with head_dim=256 CSR support does not support varlen"
             assert block_sparse_tensors.mask_block_offset is not None, (
                 "SM100 backward with head_dim=256 only supports linear CSR block sparse tensors"
             )
         if cutlass.const_expr(self.is_arbitrary):
-            assert aux_tensors is not None and len(aux_tensors) > 0, (
-                "SM100 backward with head_dim=256 arbitrary mask requires aux_tensors"
+            assert (cumulative_s_q is None) == (cumulative_s_k is None), (
+                "SM100 hd256 arbitrary varlen backward requires both cu_seqlens tensors"
             )
-        else:
-            assert aux_tensors is None or len(aux_tensors) == 0, (
-                "SM100 backward with head_dim=256 does not support aux_tensors"
+            assert block_sparse_tensors_dq is not None and block_sparse_tensors is not None, (
+                "SM100 backward with head_dim=256 arbitrary requires independent "
+                "dQ Q2K and dKdV K2Q plans"
             )
+            assert block_sparse_tensors_dq.mask_block_masks is not None, (
+                "SM100 backward with head_dim=256 arbitrary dQ requires mask_block_masks"
+            )
+            assert block_sparse_tensors.mask_block_masks is not None, (
+                "SM100 backward with head_dim=256 arbitrary dKdV requires mask_block_masks"
+            )
+        assert aux_tensors is None or len(aux_tensors) == 0, (
+            "SM100 backward with head_dim=256 does not support aux_tensors"
+        )
         assert dQ_accum is not None, (
             "SM100 backward with head_dim=256 expects dQ tensor at dQ_accum slot"
         )
@@ -308,6 +339,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
             scale_softmax,
             aux_tensors,
             block_sparse_tensors_dq,
+            max_seqlen_q_runtime,
             stream,
         )
         self.dkdv_kernel(
@@ -324,5 +356,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
             scale_softmax,
             aux_tensors,
             block_sparse_tensors,
+            max_seqlen_k_runtime,
             stream,
         )

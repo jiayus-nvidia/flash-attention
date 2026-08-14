@@ -11,7 +11,7 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.typing import Int32, Int64, Float32
+from cutlass.cute.typing import Int32, Int64, Float32, Uint32
 
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn_cute.tile_scheduler import (
@@ -30,7 +30,10 @@ from flash_attn_cute.mask import (
 from flash_attn_cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 from flash_attn_cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
 from flash_attn_cute.utils import ex2_emulation_2
-from flash_attn_cute.block_sparse_utils import _get_curr_blocksparse_tensors_linear_raw
+from flash_attn_cute.block_sparse_utils import (
+    apply_loaded_arbitrary_mask,
+    load_mask_payload,
+)
 from flash_attn_cute.block_sparsity import BlockSparseTensors
 
 
@@ -40,27 +43,39 @@ def _hd256_bs_block_info(
     batch_idx: Int32,
     head_idx: Int32,
     m_block: Int32,
+    seqlen_q: Int32,
 ):
-    """Per-(batch, head, m_block) CSR block bookkeeping for the hd256 2CTA kernel.
+    """Return one hd256 Q2K plan row and its partial/full payload bases."""
+    mask_block_cnt = blocksparse_tensors.mask_block_cnt
+    mask_block_idx = blocksparse_tensors.mask_block_idx
+    full_block_cnt = blocksparse_tensors.full_block_cnt
+    full_block_idx = blocksparse_tensors.full_block_idx
+    mask_block_offset = blocksparse_tensors.mask_block_offset
+    full_block_offset = blocksparse_tensors.full_block_offset
+    cu_total_m_blocks = blocksparse_tensors.cu_total_m_blocks
+    assert len(mask_block_cnt.shape) == 2
+    assert mask_block_offset is not None
+    assert full_block_cnt is not None
+    assert full_block_idx is not None
+    assert full_block_offset is not None
 
-    Returns `(total, mask_cnt, mask_off, mask_idx, full_off, full_idx)` where
-    `total` is the number of KV blocks to process (mask + full) and the rest are
-    the raw compact-index views consumed by `_hd256_bs_nblock`. The sparse Q block
-    size is the full 2CTA cluster M tile (2 * tile_m = 256), so `m_block` is the
-    cluster tile index and no q-subtiling is applied.
-    """
-    (
-        mask_cnt,
-        mask_off,
-        mask_idx,
-        full_cnt,
-        full_off,
-        full_idx,
-    ) = _get_curr_blocksparse_tensors_linear_raw(
-        batch_idx, head_idx, m_block, blocksparse_tensors
-    )
+    total_m_blocks = mask_block_cnt.shape[1]
+    plan_head = Int32(0)
+    if mask_block_cnt.shape[0] != 1:
+        plan_head = head_idx
+    m_blocks_per_sample = cute.ceil_div(seqlen_q, 256)
+    outer_row = batch_idx * m_blocks_per_sample + m_block
+    if cutlass.const_expr(cu_total_m_blocks is not None):
+        outer_row = cu_total_m_blocks[batch_idx] + m_block
+    plan_row = plan_head * total_m_blocks + outer_row
+    mask_cnt = mask_block_cnt[plan_head, outer_row]
+    mask_off = mask_block_offset[plan_row]
+    full_cnt = full_block_cnt[plan_head, outer_row]
+    full_off = full_block_offset[plan_row]
+    mask_idx = mask_block_idx
+    full_idx = full_block_idx
     total = mask_cnt + full_cnt
-    return (total, mask_cnt, mask_off, mask_idx, full_off, full_idx)
+    return (total, mask_cnt, mask_off, mask_idx, full_cnt, full_off, full_idx)
 
 
 @cute.jit
@@ -72,7 +87,7 @@ def _hd256_bs_nblock(i: Int32, bs_info):
     mask masks every entry of such tiles (an empty CSR row is, by construction,
     a fully-masked Q tile), so the dummy block contributes nothing to the output.
     """
-    total, mask_cnt, mask_off, mask_idx, full_off, full_idx = bs_info
+    total, mask_cnt, mask_off, mask_idx, _, full_off, full_idx = bs_info
     n_block = Int32(0)
     if total > 0:
         if cutlass.const_expr(full_idx is not None):
@@ -88,7 +103,7 @@ def _hd256_bs_nblock(i: Int32, bs_info):
 @cute.jit
 def _hd256_bs_is_full_block(i: Int32, bs_info):
     """Return whether the i-th processed CSR entry comes from the full-block list."""
-    total, mask_cnt, _, _, _, full_idx = bs_info
+    total, mask_cnt, _, _, _, _, full_idx = bs_info
     is_full_block = False
     if total > 0:
         if cutlass.const_expr(full_idx is not None):
@@ -115,6 +130,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         score_mod=None,
         mask_mod=None,
         is_arbitrary: bool = False,
+        mask_payload_valid_words: int = 4,
+        mask_payload_padded_words: int = 4,
         has_aux_tensors: bool = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
@@ -127,10 +144,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         assert score_mod is None, "SM100 forward with head_dim=256 does not support score_mod"
         assert mask_mod is None, "SM100 forward with head_dim=256 does not support mask_mod"
-        if is_arbitrary:
-            assert has_aux_tensors, "SM100 forward with head_dim=256 arbitrary mask requires aux tensors"
-        else:
-            assert not has_aux_tensors, "SM100 forward with head_dim=256 does not support aux tensors"
+        assert not has_aux_tensors, "SM100 forward with head_dim=256 does not support aux tensors"
         assert not paged_kv_non_tma, (
             "SM100 hd256 2CTA supports TMA paged KV only (page_size must equal tile_n=128)"
         )
@@ -143,6 +157,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert m_block_size == 128 and n_block_size == 128, (
             "SM100 dedicated kernel only supports tile_m=128 and tile_n=128"
         )
+        if is_arbitrary:
+            assert use_2cta_instrs, (
+                "SM100 hd256 arbitrary forward requires the dedicated 2CTA kernel"
+            )
+            assert mask_payload_valid_words == 4 and mask_payload_padded_words == 4, (
+                "SM100 hd256 arbitrary forward requires four valid/padded words"
+            )
         # q_stage / persistence / scheduler knobs are accepted for interface parity,
         # but this dedicated kernel uses fixed internal settings.
 
@@ -180,6 +201,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.is_causal = is_causal
         self.is_local = is_local
         self.is_arbitrary = is_arbitrary
+        self.mask_payload_valid_words = mask_payload_valid_words
+        self.mask_payload_padded_words = mask_payload_padded_words
         self.use_semantic_trip_range = is_causal or is_local
         self.use_clc_scheduler = False
 
@@ -251,6 +274,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        max_seqlen_q_runtime: Int32 = Int32(0),
         stream: cuda.CUstream = None,
     ):
         # Keep parity with FlashAttentionForwardSm100.__call__ interface.
@@ -275,15 +299,36 @@ class BlackwellFusedMultiHeadAttentionForward:
             assert mPageTable is None, (
                 "SM100 forward with head_dim=256 block sparsity does not support paged KV"
             )
-            assert mCuSeqlensQ is None and mCuSeqlensK is None, (
-                "SM100 forward with head_dim=256 block sparsity does not support varlen"
-            )
         if cutlass.const_expr(self.is_arbitrary):
-            assert aux_tensors is not None and len(aux_tensors) > 0, (
-                "SM100 forward with head_dim=256 arbitrary mask requires aux_tensors"
+            assert blocksparse_tensors is not None, (
+                "SM100 hd256 arbitrary forward requires a compact Q2K plan"
             )
-        else:
-            assert aux_tensors is None, "SM100 forward with head_dim=256 does not support aux_tensors"
+            assert (mCuSeqlensQ is None) == (mCuSeqlensK is None), (
+                "SM100 hd256 arbitrary varlen forward requires both cu_seqlens tensors"
+            )
+            if cutlass.const_expr(mCuSeqlensQ is not None):
+                assert blocksparse_tensors.cu_total_m_blocks is not None, (
+                    "SM100 hd256 arbitrary varlen forward requires compact Q256 row prefixes"
+                )
+            assert len(blocksparse_tensors.mask_block_cnt.shape) == 2, (
+                "SM100 hd256 arbitrary forward requires rank-2 compact counts"
+            )
+            assert len(blocksparse_tensors.mask_block_idx.shape) == 1
+            assert blocksparse_tensors.full_block_cnt is not None
+            assert len(blocksparse_tensors.full_block_cnt.shape) == 2
+            assert blocksparse_tensors.mask_block_offset is not None
+            assert len(blocksparse_tensors.mask_block_offset.shape) == 1
+            assert blocksparse_tensors.full_block_offset is not None
+            assert len(blocksparse_tensors.full_block_offset.shape) == 1
+            assert blocksparse_tensors.full_block_idx is not None
+            assert len(blocksparse_tensors.full_block_idx.shape) == 1
+            assert blocksparse_tensors.mask_block_masks is not None, (
+                "SM100 hd256 arbitrary forward requires mask_block_masks"
+            )
+            assert len(blocksparse_tensors.mask_block_masks.shape) == 4, (
+                "SM100 hd256 arbitrary forward payload must be rank 4"
+            )
+        assert aux_tensors is None, "SM100 forward with head_dim=256 does not support aux_tensors"
         assert not self.is_local, (
             "SM100 forward with head_dim=256 does not support local attention yet"
         )
@@ -354,7 +399,6 @@ class BlackwellFusedMultiHeadAttentionForward:
             b = mCuSeqlensK.shape[0] - 1
         else:
             b = mQ.shape[0]
-
         scale_softmax = softmax_scale
         scale_softmax_log2 = softmax_scale * math.log2(math.exp(1.0))
         scale_output = 1.0
@@ -447,15 +491,18 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.o_dtype = o.element_type
         self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
+        grid_seqlen_q = s_q
+        if cutlass.const_expr(cum_seqlen_q is not None):
+            grid_seqlen_q = max_seqlen_q_runtime
         if cutlass.const_expr(self.use_clc_scheduler):
             self.tile_sched_params, grid = compute_grid_clc(
-                (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
+                (grid_seqlen_q, o.shape[1], o.shape[2]),
                 self.cta_tiler,
                 (*self.cluster_shape_mn, 1),
             )
         else:
             self.tile_sched_params, grid = compute_grid(
-                (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
+                (grid_seqlen_q, o.shape[1], o.shape[2]),
                 self.cta_tiler,
                 self.is_persistent,
             )
@@ -1023,6 +1070,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             batch_coord,
                             curr_block_coord[2][0],
                             mma_block_coord[0],
+                            seqlen_q,
                         )
                         bs_total = bs_info[0]
                         seqlen_kv_loop_start = Int32(0)
@@ -1191,6 +1239,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             batch_coord,
                             curr_block_coord[2][0],
                             mma_block_coord[0],
+                            seqlen_q,
                         )[0]
                         seqlen_kv_loop_start = Int32(0)
                         seqlen_kv_loop_steps = bs_total
@@ -1417,6 +1466,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax_warp_ids[0]:
             # increase register after decreasing
             cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
+            mask_payloads = None
+            if cutlass.const_expr(self.is_arbitrary):
+                assert blocksparse_tensors is not None
+                assert blocksparse_tensors.mask_block_masks is not None
+                mask_payloads = blocksparse_tensors.mask_block_masks
 
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
@@ -1455,6 +1509,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             batch_coord,
                             curr_block_coord[2][0],
                             mma_block_coord[0],
+                            seqlen_q,
                         )
                         bs_total = bs_info[0]
                         # Walk the CSR list; an empty row still runs one fully-masked step.
@@ -1517,11 +1572,18 @@ class BlackwellFusedMultiHeadAttentionForward:
                             # Residual path only needs seqlen masking on the last K tile.
                             need_apply_mask = step == end_count - 1
                         apply_arbitrary_mask = False
+                        empty_dummy = False
+                        payload_idx = Int32(0)
                         if cutlass.const_expr(self.is_arbitrary):
-                            if cutlass.const_expr(self.use_block_sparsity):
-                                apply_arbitrary_mask = not is_full_block
-                            else:
+                            # The empty-row iteration exists only for the 2CTA
+                            # barrier protocol.  It receives a local zero mask
+                            # and must not dereference payload_base.
+                            if bs_total == 0:
                                 apply_arbitrary_mask = True
+                                empty_dummy = True
+                            elif step < bs_info[1]:
+                                apply_arbitrary_mask = True
+                                payload_idx = bs_info[2] + step
                             need_apply_mask = need_apply_mask or apply_arbitrary_mask
                         # Si -> Pi
                         (
@@ -1536,10 +1598,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 window_size_left,
                                 window_size_right,
                                 self.is_arbitrary,
-                                batch_coord,
-                                curr_block_coord[2][0],
-                                aux_tensors,
                                 apply_arbitrary_mask,
+                                mask_payloads,
+                                payload_idx,
+                                col_block,
+                                empty_dummy,
+                                cta_rank_in_cluster,
                             ),
                             (
                                 row_max_prev,
@@ -1629,6 +1693,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             batch_coord,
                             curr_block_coord[2][0],
                             mma_block_coord[0],
+                            seqlen_q,
                         )[0]
                         seqlen_kv_loop_steps = bs_total
                         if bs_total == 0:
@@ -1719,10 +1784,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             window_size_left,
             window_size_right,
             is_arbitrary,
-            batch_coord,
-            head_coord,
-            aux_tensors,
             apply_arbitrary_mask,
+            mask_payloads,
+            payload_idx,
+            n_block,
+            empty_dummy,
+            cta_rank_in_cluster,
         ) = mask_args
         row_max, row_sum, seqlen_q, seqlen_k, scale_softmax_log2 = value_args
         tStS, tScS = tensor_args
@@ -1758,13 +1825,41 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
             if cutlass.const_expr(is_arbitrary):
                 if apply_arbitrary_mask:
-                    FusedMask.apply_arbitrary_mask(
-                        tTMEM_LOADrS,
-                        tTMEM_LOADcS,
-                        batch_coord,
-                        head_coord,
-                        aux_tensors,
-                    )
+                    assert cutlass.const_expr(
+                        cute.size(tTMEM_LOADrS) == self.mask_payload_valid_words * 32
+                    ), "SM100 hd256 arbitrary payload does not cover the score fragment"
+                    if empty_dummy:
+                        # Preserve the empty-row pipeline iteration without a
+                        # global payload read from an empty partial list.
+                        r_bitmask = cute.make_rmem_tensor(
+                            (self.mask_payload_padded_words,),
+                            Uint32,
+                        )
+                        r_bitmask.fill(Uint32(0))
+                        apply_loaded_arbitrary_mask(
+                            tTMEM_LOADrS,
+                            n_block,
+                            r_bitmask,
+                            self.mask_payload_valid_words,
+                        )
+                    else:
+                        assert mask_payloads is not None
+                        # Intentionally load only after the score wait above:
+                        # retaining four words across the wait causes avoidable
+                        # register pressure in this hd256 softmax warp-group.
+                        r_bitmask = load_mask_payload(
+                            mask_payloads,
+                            payload_idx,
+                            thread_idx,
+                            subtile_idx=cta_rank_in_cluster,
+                            payload_words=self.mask_payload_padded_words,
+                        )
+                        apply_loaded_arbitrary_mask(
+                            tTMEM_LOADrS,
+                            n_block,
+                            r_bitmask,
+                            self.mask_payload_valid_words,
+                        )
         old_row_max = row_max
         row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
         row_max_safe = row_max

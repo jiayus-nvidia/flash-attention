@@ -7,14 +7,14 @@ try:
 except PackageNotFoundError:
     __version__ = "0.0.0"
 
+from .arbitrary_block_sparsity import create_arbitrary_block_sparse_tensors
 from .interface import (
     flash_attn_func,
     flash_attn_varlen_func,
 )
-from .arbitrary_block_sparsity import create_arbitrary_block_sparse_tensors
 
 __all__ = [
+    "create_arbitrary_block_sparse_tensors",
     "flash_attn_func",
     "flash_attn_varlen_func",
-    "create_arbitrary_block_sparse_tensors",
 ]

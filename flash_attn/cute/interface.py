@@ -1,21 +1,18 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # CuTe DSL implementation for Hopper and Blackwell. Requires nvidia-cutlass-dsl==4.6.1.
 
-import os
 import math
+import os
 from functools import lru_cache
-from typing import Optional, Tuple, Callable
-
-import torch
-
+from typing import Callable, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
-from quack.compile_utils import make_fake_tensor as fake_tensor
+import torch
+from cutlass import Float32, Int32
 from flash_attn_cute.cache_utils import get_jit_cache
 from flash_attn_cute.testing import is_fake_mode
-
+from quack.compile_utils import make_fake_tensor as fake_tensor
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
     from flash_attn_cute import cute_dsl_ptxas  # noqa: F401
@@ -24,48 +21,74 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
     cute_dsl_ptxas.patch()
 
 
-from flash_attn_cute import utils
-from flash_attn_cute import fa_logging
-from flash_attn_cute.cute_dsl_utils import (
-    to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata, get_broadcast_dims,
+from flash_attn_cute import fa_logging, utils
+from flash_attn_cute.arbitrary_plan import (
+    canonical_blackwell_arch_family,
+    validate_arbitrary_attention_plan,
+    validate_arbitrary_plan_runtime_binding,
+    validate_arbitrary_plan_signature,
 )
-from flash_attn_cute.flash_fwd import FlashAttentionForwardSm80
-from flash_attn_cute.flash_fwd_sm90 import FlashAttentionForwardSm90
-from flash_attn_cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
-from flash_attn_cute.flash_fwd_sm120 import FlashAttentionForwardSm120
-from flash_attn_cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
-from flash_attn_cute.flash_bwd import FlashAttentionBackwardSm80
-from flash_attn_cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
-from flash_attn_cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
-from flash_attn_cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
-from flash_attn_cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
-from flash_attn_cute.flash_fwd_combine import FlashAttentionForwardCombine
-from flash_attn_cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
-
-# SM100 head_dim=256 2CTA kernel imports
-from flash_attn_cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
-from flash_attn_cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
-
 from flash_attn_cute.block_sparsity import (
     BlockSparseTensorsTorch,
     LinearBlockSparseTensorsTorch,
     get_sparse_q_block_size,
-    to_cute_block_sparse_tensors,
-    normalize_block_sparse_config,
-    normalize_block_sparse_config_bwd,
     normalize_arbitrary_block_sparse_config,
     normalize_arbitrary_block_sparse_config_bwd,
+    normalize_block_sparse_config,
+    normalize_block_sparse_config_bwd,
+    to_cute_block_sparse_tensors,
 )
-from flash_attn_cute.sm90_fwd_config import (
-    FwdConfig,
-    _tile_size_fwd_sm90,
-    resolve_sm90_fwd_consumer_config,
+from flash_attn_cute.cute_dsl_utils import (
+    get_aux_tensor_metadata,
+    get_broadcast_dims,
+    to_cute_aux_tensor,
+    to_cute_tensor,
 )
+from flash_attn_cute.flash_bwd import FlashAttentionBackwardSm80
+from flash_attn_cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from flash_attn_cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+from flash_attn_cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+from flash_attn_cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+from flash_attn_cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
+from flash_attn_cute.flash_fwd import FlashAttentionForwardSm80
+from flash_attn_cute.flash_fwd_combine import FlashAttentionForwardCombine
+from flash_attn_cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
+from flash_attn_cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+from flash_attn_cute.flash_fwd_sm100 import DescaleTensors, FlashAttentionForwardSm100
+from flash_attn_cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn_cute.sm90_bwd_config import (
     BwdConfig as BwdConfig,  # noqa: F401
+)
+from flash_attn_cute.sm90_bwd_config import (
     _tile_size_bwd_sm90,
     resolve_sm90_bwd_consumer_config,
 )
+from flash_attn_cute.sm90_fwd_config import (
+    FwdConfig,
+    _ResolvedSm90FwdConsumerConfig,
+    _tile_size_fwd_sm90,
+    resolve_sm90_fwd_consumer_config,
+)
+from flash_attn_cute.sm100_bwd_config import resolve_sm100_bwd_consumer_config
+from flash_attn_cute.sm100_fwd_config import (
+    _ResolvedSm100FwdConsumerConfig,
+    resolve_sm100_fwd_consumer_config,
+)
+from flash_attn_cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
+
+# SM100 head_dim=256 2CTA kernel imports
+from flash_attn_cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
+from flash_attn_cute.sm100_hd256_bwd_config import (
+    _ResolvedSm100Hd256DkdvConsumerConfig,
+    _ResolvedSm100Hd256DqConsumerConfig,
+    resolve_sm100_hd256_dkdv_consumer_config,
+    resolve_sm100_hd256_dq_consumer_config,
+)
+from flash_attn_cute.sm100_hd256_fwd_config import (
+    _ResolvedSm100Hd256FwdConsumerConfig,
+    resolve_sm100_hd256_fwd_consumer_config,
+)
+
 
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
@@ -126,6 +149,32 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.device == expected_device, f"{name} device {t.device} != expected {expected_device}"
     if not is_fake_mode():
         assert t.is_cuda, f"{name} must be on CUDA"
+
+
+def _validate_aux_tensors_device(aux_tensors, expected_device) -> None:
+    if aux_tensors is None:
+        return
+    if not isinstance(aux_tensors, (list, tuple)):
+        raise TypeError("aux_tensors must be a list or tuple of torch.Tensor values")
+    for idx, tensor in enumerate(aux_tensors):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"aux_tensors[{idx}] must be a torch.Tensor")
+        if tensor.device != expected_device:
+            raise ValueError(
+                f"aux_tensors[{idx}] device {tensor.device} != expected "
+                f"{expected_device}"
+            )
+        if not is_fake_mode() and not tensor.is_cuda:
+            raise ValueError(f"aux_tensors[{idx}] must be on CUDA")
+
+
+def _validate_score_mod_pair(
+    score_mod, score_mod_bwd, *, requires_backward: bool = True
+) -> None:
+    if score_mod is None and score_mod_bwd is not None:
+        raise ValueError("score_mod_bwd cannot be provided without score_mod")
+    if requires_backward and score_mod is not None and score_mod_bwd is None:
+        raise ValueError("score_mod and score_mod_bwd must be provided together")
 
 
 torch2cute_dtype_map = {
@@ -363,6 +412,11 @@ def _flash_attn_fwd(
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
+    blackwell_arch_family = (
+        canonical_blackwell_arch_family(arch)
+        if arch // 10 in (10, 11)
+        else None
+    )
     alignment = 16 // q.element_size()
     if arch // 10 not in [8, 12]:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
@@ -380,6 +434,7 @@ def _flash_attn_fwd(
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
     out_torch_dtype = torch.bfloat16 if is_fp8 else q.dtype
     device = q.device
+    _validate_aux_tensors_device(aux_tensors, device)
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
@@ -428,15 +483,28 @@ def _flash_attn_fwd(
         tensor_name="linear_k_block_sparse_tensors",
     )
     use_block_sparsity = block_sparse_tensors is not None
-    use_dedicated_hd256_kernel = arch // 10 == 10 and head_dim == 256 and head_dim_v == 256
-    arbitrary_config = None
-    has_packed_arbitrary_plan = (
-        block_sparse_tensors is not None
-        and getattr(block_sparse_tensors, "mask_block_masks", None) is not None
+    use_dedicated_hd256_kernel = (
+        blackwell_arch_family == "sm100"
+        and head_dim == 256
+        and head_dim_v == 256
     )
-    if has_packed_arbitrary_plan and not arbitrary:
-        raise ValueError("a packed arbitrary plan requires arbitrary=True")
+    if (
+        blackwell_arch_family == "sm110"
+        and head_dim == 256
+        and head_dim_v == 256
+    ):
+        raise NotImplementedError(
+            "head_dim=256 dedicated forward is not supported on SM110"
+        )
+    arbitrary_config = None
+    arbitrary_plan_signature = validate_arbitrary_attention_plan(
+        arbitrary=arbitrary,
+        block_sparse_tensors=block_sparse_tensors,
+    )
+    requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
     if arbitrary:
+        assert arbitrary_plan_signature is not None
+        assert block_sparse_tensors is not None
         no_window = (window_size_left is None and window_size_right is None) or (
             window_size_left is not None
             and window_size_right is not None
@@ -446,44 +514,100 @@ def _flash_attn_fwd(
             raise ValueError("arbitrary=True cannot be combined with causal or local/window masks")
         if mask_mod is not None:
             raise ValueError("arbitrary=True cannot be combined with mask_mod")
-        if arch // 10 != 9:
-            raise NotImplementedError("Packed arbitrary attention currently supports SM90 only")
-        if not has_packed_arbitrary_plan:
-            raise ValueError(
-                "arbitrary=True requires block_sparse_tensors returned by "
-                "create_arbitrary_block_sparse_tensors"
-            )
         if qv is not None:
             raise NotImplementedError("arbitrary mask is not supported with MLA qv path")
         if is_fp8:
             raise NotImplementedError("arbitrary mask is not supported with FP8 kernels")
+        expected_arch_family = (
+            "sm90"
+            if arch // 10 == 9
+            else blackwell_arch_family
+            if blackwell_arch_family is not None
+            else None
+        )
+        if arbitrary_plan_signature.arch_family != expected_arch_family:
+            raise ValueError(
+                "arbitrary forward plan arch_family mismatch: expected "
+                f"{expected_arch_family!r}, got "
+                f"{arbitrary_plan_signature.arch_family!r}"
+            )
         if page_table is not None:
-            raise NotImplementedError("packed arbitrary attention does not support paged KV")
+            raise NotImplementedError("arbitrary attention does not support paged KV")
         if num_splits != 1:
-            raise NotImplementedError("packed arbitrary attention does not support SplitKV")
+            raise NotImplementedError("arbitrary attention does not support SplitKV")
         if seqused_q is not None or seqused_k is not None:
-            raise NotImplementedError("packed arbitrary attention does not support seqused_q/k")
+            raise NotImplementedError("arbitrary attention does not support seqused_q/k")
         is_arbitrary_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
         if is_arbitrary_varlen:
             if cu_seqlens_q is None or cu_seqlens_k is None:
                 raise ValueError(
-                    "packed arbitrary varlen attention requires both cu_seqlens_q and cu_seqlens_k"
+                    "arbitrary varlen attention requires both cu_seqlens_q and cu_seqlens_k"
                 )
             if max_seqlen_q is None or max_seqlen_k is None:
                 raise ValueError(
-                    "packed arbitrary varlen attention requires max_seqlen_q and max_seqlen_k"
+                    "arbitrary varlen attention requires max_seqlen_q and max_seqlen_k"
                 )
-        arbitrary_config = resolve_sm90_fwd_consumer_config(
-            arch=arch,
-            dtype=q.dtype,
-            head_dim=head_dim,
-            head_dim_v=head_dim_v,
-            num_q_heads=num_head,
-            num_kv_heads=num_head_kv,
+        validate_arbitrary_plan_runtime_binding(
+            block_sparse_tensors.topology_tensors.runtime_binding,
             is_varlen=is_arbitrary_varlen,
-            hmask=block_sparse_tensors.mask_block_cnt.shape[0],
-            pack_gqa=requested_pack_gqa,
+            batch_size=batch_size,
+            seqlen_q=None if is_arbitrary_varlen else seqlen_q,
+            seqlen_k=None if is_arbitrary_varlen else seqlen_k,
+            total_q=total_q,
+            total_k=(k.shape[0] if is_arbitrary_varlen else batch_size * seqlen_k),
+            max_seqlen_q=(max_seqlen_q if max_seqlen_q is not None else seqlen_q),
+            max_seqlen_k=(max_seqlen_k if max_seqlen_k is not None else seqlen_k),
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            context="arbitrary forward plan",
         )
+        if arch // 10 == 9:
+            arbitrary_config = resolve_sm90_fwd_consumer_config(
+                arch=arch,
+                dtype=q.dtype,
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                num_q_heads=num_head,
+                num_kv_heads=num_head_kv,
+                is_varlen=is_arbitrary_varlen,
+                hmask=block_sparse_tensors.mask_block_cnt.shape[0],
+                pack_gqa=requested_pack_gqa,
+            )
+        elif blackwell_arch_family == "sm100":
+            if use_dedicated_hd256_kernel:
+                arbitrary_config = resolve_sm100_hd256_fwd_consumer_config(
+                    arch=arch,
+                    dtype=q.dtype,
+                    head_dim=head_dim,
+                    head_dim_v=head_dim_v,
+                    num_q_heads=num_head,
+                    num_kv_heads=num_head_kv,
+                    is_varlen=is_arbitrary_varlen,
+                    hmask=block_sparse_tensors.mask_block_cnt.shape[0],
+                    pack_gqa=requested_pack_gqa,
+                )
+            else:
+                resolved_max_seqlen_q = max_seqlen_q if is_arbitrary_varlen else seqlen_q
+                arbitrary_config = resolve_sm100_fwd_consumer_config(
+                    arch=arch,
+                    dtype=q.dtype,
+                    head_dim=head_dim,
+                    head_dim_v=head_dim_v,
+                    num_q_heads=num_head,
+                    num_kv_heads=num_head_kv,
+                    is_varlen=is_arbitrary_varlen,
+                    hmask=block_sparse_tensors.mask_block_cnt.shape[0],
+                    pack_gqa=requested_pack_gqa,
+                    max_seqlen_q=resolved_max_seqlen_q,
+                )
+        elif blackwell_arch_family == "sm110":
+            raise NotImplementedError(
+                "arbitrary forward on SM110 requires Thor validation"
+            )
+        else:
+            raise NotImplementedError(
+                "arbitrary forward supports SM90 and generic SM100 1CTA"
+            )
         pack_gqa = arbitrary_config.pack_gqa
         causal = False
         window_size_left = None
@@ -494,7 +618,6 @@ def _flash_attn_fwd(
     )
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
-    requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
 
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -503,13 +626,29 @@ def _flash_attn_fwd(
         num_threads = 128
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
-    if arbitrary_config is not None:
+    if isinstance(arbitrary_config, _ResolvedSm90FwdConsumerConfig):
         fwd_cfg = FwdConfig(
             arbitrary_config.tile_m,
             arbitrary_config.tile_n,
             arbitrary_config.mma_pv_is_rs,
             arbitrary_config.intra_wg_overlap,
             arbitrary_config.num_stages,
+        )
+        num_threads = arbitrary_config.attention_num_threads
+    elif isinstance(arbitrary_config, _ResolvedSm100FwdConsumerConfig):
+        fwd_cfg = FwdConfig(
+            arbitrary_config.tile_m,
+            arbitrary_config.tile_n,
+            fwd_cfg.mma_pv_is_rs,
+            fwd_cfg.intra_wg_overlap,
+        )
+        num_threads = arbitrary_config.attention_num_threads
+    elif isinstance(arbitrary_config, _ResolvedSm100Hd256FwdConsumerConfig):
+        fwd_cfg = FwdConfig(
+            arbitrary_config.tile_m,
+            arbitrary_config.tile_n,
+            fwd_cfg.mma_pv_is_rs,
+            fwd_cfg.intra_wg_overlap,
         )
         num_threads = arbitrary_config.attention_num_threads
     elif tile_mn is None:
@@ -529,7 +668,7 @@ def _flash_attn_fwd(
     else:
         fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
-    if arbitrary_config is not None:
+    if isinstance(arbitrary_config, _ResolvedSm90FwdConsumerConfig):
         mma_pv_is_rs = arbitrary_config.mma_pv_is_rs
         intra_wg_overlap = arbitrary_config.intra_wg_overlap
     elif mma_pv_is_rs is None:
@@ -551,10 +690,16 @@ def _flash_attn_fwd(
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
-    if arch // 10 == 10:
+    if blackwell_arch_family == "sm100":
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
         q_stage = 1
+    if isinstance(arbitrary_config, _ResolvedSm100FwdConsumerConfig):
+        if q_stage != arbitrary_config.q_stage:
+            raise ValueError(
+                "arbitrary forward q_stage drift between interface and plan"
+            )
+        q_stage = arbitrary_config.q_stage
 
     m_block_size_effective = q_stage * tile_m
     seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, (window_size_right or max_seqlen_k) + (window_size_left or max_seqlen_k) + 1 + tile_m))
@@ -599,6 +744,21 @@ def _flash_attn_fwd(
     # hd=256 2CTA forward uses dedicated kernel (SM100 only)
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
+    if arbitrary:
+        # Generic arbitrary forward reuses only the existing 1CTA path.  The
+        # pre-existing dedicated hd256 kernel remains cooperative.
+        use_2cta_instrs = use_dedicated_hd256_kernel
+        # Validate only after q-stage, PackGQA, kernel family, and CTA-group
+        # dispatch have reached their final values.  A consumer-native payload
+        # must never enter a merely shape-compatible kernel specialization.
+        assert arbitrary_config is not None
+        if arch // 10 != 9:
+            validate_arbitrary_plan_signature(
+                arbitrary_plan_signature,
+                arbitrary_config.plan_signature,
+                context="arbitrary forward plan after dispatch",
+            )
+
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
@@ -622,7 +782,12 @@ def _flash_attn_fwd(
     # pays work-stealing overhead.
     is_varlen_mha = is_varlen and qhead_per_kvhead == 1
     is_dense_noncausal = not is_varlen and not causal and not local
-    use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
+    use_clc_scheduler = (
+        requested_use_clc_scheduler
+        and not is_varlen_mha
+        and not is_dense_noncausal
+        and not arbitrary
+    )
     if use_block_sparsity:
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
         head_dim_idx = 0 if block_sparse_tensors.mask_block_cnt.ndim == 2 else 1
@@ -640,10 +805,12 @@ def _flash_attn_fwd(
     if block_sparse_tensors is not None:
         if arbitrary_config is not None:
             qratio_plan = arbitrary_config.qhead_per_kvhead if pack_gqa else 1
+            plan_tile_m, plan_tile_n = arbitrary_config.block_size
             expected_fixed_total_m_blocks = (
                 None
                 if cu_seqlens_q is not None
-                else batch_size * math.ceil(seqlen_q * qratio_plan / tile_m)
+                else batch_size
+                * math.ceil(seqlen_q * qratio_plan / plan_tile_m)
             )
             normalized_block_sparse_tensors = normalize_arbitrary_block_sparse_config(
                 block_sparse_tensors,
@@ -651,8 +818,9 @@ def _flash_attn_fwd(
                 batch_size=batch_size,
                 num_q_heads=num_head,
                 is_varlen=cu_seqlens_q is not None,
-                block_size=(tile_m, tile_n),
+                block_size=(plan_tile_m, plan_tile_n),
                 pack_gqa=pack_gqa,
+                physical_subtiles=arbitrary_config.physical_subtiles,
                 num_mask_payload_groups=arbitrary_config.num_mask_payload_groups,
                 payload_padded_words=arbitrary_config.payload_padded_words,
                 expected_fixed_total_m_blocks=expected_fixed_total_m_blocks,
@@ -740,6 +908,11 @@ def _flash_attn_fwd(
         block_sparse_broadcast_pattern,
         aux_tensor_metadata,
         arbitrary,
+        (
+            arbitrary_plan_signature.compile_key
+            if arbitrary_plan_signature is not None
+            else None
+        ),
         lse is None,
         cu_seqlens_q is None,
         cu_seqlens_k is None,
@@ -773,6 +946,10 @@ def _flash_attn_fwd(
         gather_kv_length,
         sparse_kv,
         disable_sparse_kv_bitmask,
+        # Dedicated hd256 gained a dynamic max-seqlen argument for its
+        # fixed/varlen shared ABI.  Keep the version in the persistent key so
+        # an older callable cannot be invoked with the new argument list.
+        1 if use_dedicated_hd256_kernel else None,
         fa_logging.get_fa_log_level(),
     )
 
@@ -917,9 +1094,8 @@ def _flash_attn_fwd(
                     assert softcap is None, "SM100 forward with head_dim=256 does not support softcap"
                     if use_block_sparsity:
                         assert _is_linear_csr_block_sparse(block_sparse_tensors), (
-                            "SM100 forward with head_dim=256 only supports linear CSR block "
-                            "sparsity (pass linear_k_block_sparse_tensors or CSR tensors with "
-                            "mask_block_offset set)"
+                            "SM100 forward with head_dim=256 only supports compact/linear CSR "
+                            "block sparsity with mask_block_offset"
                         )
                         assert arbitrary, (
                             "SM100 forward with head_dim=256 block sparsity requires arbitrary=True"
@@ -966,6 +1142,22 @@ def _flash_attn_fwd(
                 )
                 if use_dedicated_hd256_kernel:
                     fwd_kwargs["is_arbitrary"] = arbitrary
+                    fwd_kwargs["mask_payload_valid_words"] = (
+                        arbitrary_config.payload_valid_words
+                        if isinstance(
+                            arbitrary_config,
+                            _ResolvedSm100Hd256FwdConsumerConfig,
+                        )
+                        else 0
+                    )
+                    fwd_kwargs["mask_payload_padded_words"] = (
+                        arbitrary_config.payload_padded_words
+                        if isinstance(
+                            arbitrary_config,
+                            _ResolvedSm100Hd256FwdConsumerConfig,
+                        )
+                        else 0
+                    )
                 else:
                     fwd_kwargs["is_arbitrary"] = arbitrary
 
@@ -1059,6 +1251,8 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 cute_aux_tensors,
             ])
+            if use_dedicated_hd256_kernel:
+                compile_args.append(Int32(0))
             if arch // 10 == 9:
                 compile_args.extend(
                     [scheduler_metadata_tensor, scheduler_tile_counter_tensor, Int32(0)]
@@ -1144,6 +1338,10 @@ def _flash_attn_fwd(
                 else None,
                 aux_tensors,
             ])
+            if use_dedicated_hd256_kernel:
+                call_args.append(
+                    max_seqlen_q if max_seqlen_q is not None else seqlen_q
+                )
             if arch // 10 == 9:
                 call_args.extend([scheduler_metadata, scheduler_tile_counter, num_SMs])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
@@ -1317,6 +1515,31 @@ def _bwd_postprocess_convert(
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
 
 
+def _resolve_flash_bwd_compile_options(
+    *,
+    arch: int,
+    arbitrary_use_2cta: bool,
+    arbitrary_hd256: bool,
+) -> str:
+    """Select main-backward compiler options for an exact target and route."""
+
+    options = "--enable-tvm-ffi"
+    use_o2 = (arch == 103 and arbitrary_use_2cta) or (
+        arch == 100
+        and arbitrary_use_2cta
+        and arbitrary_hd256
+    )
+    if use_o2:
+        # CuTe DSL 4.6.1 O3 leaves backend-generated local-memory spills in
+        # generic arbitrary D128/D192 2CTA backward on SM103 and in the dedicated
+        # arbitrary hd256
+        # backward on exact SM100. Native B300/B200 O2/O3 A/B keeps identical
+        # PTX while O2 removes those spills without a runtime regression. Keep
+        # exact-SM100 generic D128/D192 and every forward route on default O3.
+        options += " --opt-level 2"
+    return options
+
+
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1365,6 +1588,24 @@ def _flash_attn_bwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    blackwell_arch_family = (
+        canonical_blackwell_arch_family(arch)
+        if arch // 10 in (10, 11)
+        else None
+    )
+    use_dedicated_hd256_kernel = (
+        blackwell_arch_family == "sm100"
+        and q.shape[-1] == 256
+        and v.shape[-1] == 256
+    )
+    if (
+        blackwell_arch_family == "sm110"
+        and q.shape[-1] == 256
+        and v.shape[-1] == 256
+    ):
+        raise NotImplementedError(
+            "head_dim=256 dedicated backward is not supported on SM110"
+        )
     if linear_q_block_sparse_tensors is not None:
         if block_sparse_tensors is not None:
             raise ValueError(
@@ -1372,9 +1613,21 @@ def _flash_attn_bwd(
             )
         block_sparse_tensors = linear_q_block_sparse_tensors
     arbitrary_config = None
+    arbitrary_config_dq = None
     arbitrary_hmask = None
     arbitrary_is_varlen = False
+    arbitrary_use_2cta = False
+    arbitrary_requires_2cta = False
+    dq_plan = None
+    outer_arbitrary_plan_signature = validate_arbitrary_attention_plan(
+        arbitrary=arbitrary,
+        block_sparse_tensors=block_sparse_tensors,
+    )
+    arbitrary_plan_signature = None
+    arbitrary_plan_signature_dq = None
     if arbitrary:
+        assert outer_arbitrary_plan_signature is not None
+        assert block_sparse_tensors is not None
         no_window = (window_size_left is None and window_size_right is None) or (
             window_size_left is not None
             and window_size_right is not None
@@ -1384,52 +1637,349 @@ def _flash_attn_bwd(
             raise ValueError("arbitrary=True cannot be combined with causal or local/window masks")
         if mask_mod is not None:
             raise ValueError("arbitrary=True cannot be combined with mask_mod")
-        if arch // 10 != 9:
-            raise NotImplementedError("packed arbitrary backward only supports SM90")
-        if block_sparse_tensors is None:
-            raise ValueError("arbitrary backward requires a packed block_sparse_tensors plan")
-        outer_mask_block_cnt = getattr(block_sparse_tensors, "mask_block_cnt", None)
-        if outer_mask_block_cnt is None or outer_mask_block_cnt.ndim != 2:
-            raise ValueError("arbitrary backward requires the outer packed Q2K plan")
-        arbitrary_hmask = outer_mask_block_cnt.shape[0]
-        nested_bwd = getattr(block_sparse_tensors, "bwd_tensors", None)
-        if nested_bwd is None:
-            raise ValueError(
-                "arbitrary backward requires a plan built with "
-                "create_arbitrary_block_sparse_tensors(..., build_backward=True)"
+        if outer_arbitrary_plan_signature is not None:
+            outer_plan = block_sparse_tensors
+            expected_arch_family = (
+                "sm90"
+                if arch // 10 == 9
+                else blackwell_arch_family
+                if blackwell_arch_family is not None
+                else None
             )
-        block_sparse_tensors = nested_bwd
-        if (
-            getattr(block_sparse_tensors, "mask_block_masks", None) is None
-            or block_sparse_tensors.dq_write_order is None
-        ):
-            raise ValueError(
-                "arbitrary backward requires a plan built with "
-                "create_arbitrary_block_sparse_tensors(..., build_backward=True)"
+            if outer_plan.plan_signature.arch_family != expected_arch_family:
+                raise ValueError(
+                    "arbitrary backward plan arch_family mismatch: expected "
+                    f"{expected_arch_family!r}, got "
+                    f"{outer_plan.plan_signature.arch_family!r}"
+                )
+            if arch // 10 != 9 and arch not in (100, 103):
+                raise NotImplementedError(
+                    "arbitrary backward currently supports SM90 and "
+                    "SM100/SM103 generic kernels"
+                )
+            outer_mask_block_cnt = getattr(outer_plan, "mask_block_cnt", None)
+            if outer_mask_block_cnt is None or outer_mask_block_cnt.ndim != 2:
+                raise ValueError(
+                    "arbitrary backward requires the outer Q2K plan"
+                )
+            arbitrary_hmask = outer_mask_block_cnt.shape[0]
+            if (cu_seqlens_q is None) != (cu_seqlens_k is None):
+                raise ValueError(
+                    "arbitrary backward requires both cu_seqlens_q and "
+                    "cu_seqlens_k, or neither for fixed-length attention"
+                )
+            arbitrary_is_varlen = cu_seqlens_q is not None
+            if arbitrary_is_varlen and (
+                max_seqlen_q is None or max_seqlen_k is None
+            ):
+                raise ValueError(
+                    "varlen arbitrary backward requires max_seqlen_q and "
+                    "max_seqlen_k"
+                )
+            if seqused_q is not None or seqused_k is not None:
+                raise NotImplementedError(
+                    "arbitrary backward does not support seqused_q/k"
+                )
+            validate_arbitrary_plan_runtime_binding(
+                outer_plan.topology_tensors.runtime_binding,
+                is_varlen=arbitrary_is_varlen,
+                batch_size=(
+                    cu_seqlens_q.shape[0] - 1
+                    if arbitrary_is_varlen
+                    else q.shape[0]
+                ),
+                seqlen_q=None if arbitrary_is_varlen else q.shape[1],
+                seqlen_k=None if arbitrary_is_varlen else k.shape[1],
+                total_q=(q.shape[0] if arbitrary_is_varlen else q.shape[0] * q.shape[1]),
+                total_k=(k.shape[0] if arbitrary_is_varlen else k.shape[0] * k.shape[1]),
+                max_seqlen_q=(
+                    max_seqlen_q if arbitrary_is_varlen else q.shape[1]
+                ),
+                max_seqlen_k=(
+                    max_seqlen_k if arbitrary_is_varlen else k.shape[1]
+                ),
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                context="arbitrary outer forward plan for backward",
             )
-        if (cu_seqlens_q is None) != (cu_seqlens_k is None):
-            raise ValueError(
-                "arbitrary backward requires both cu_seqlens_q and cu_seqlens_k, "
-                "or neither for fixed-length attention"
+            if arch // 10 == 9:
+                fwd_config = resolve_sm90_fwd_consumer_config(
+                    arch=arch,
+                    dtype=q.dtype,
+                    head_dim=q.shape[-1],
+                    head_dim_v=v.shape[-1],
+                    num_q_heads=q.shape[-2],
+                    num_kv_heads=k.shape[-2],
+                    is_varlen=arbitrary_is_varlen,
+                    hmask=arbitrary_hmask,
+                    pack_gqa=outer_plan.pack_gqa,
+                )
+            elif use_dedicated_hd256_kernel:
+                fwd_config = resolve_sm100_hd256_fwd_consumer_config(
+                    arch=arch,
+                    dtype=q.dtype,
+                    head_dim=q.shape[-1],
+                    head_dim_v=v.shape[-1],
+                    num_q_heads=q.shape[-2],
+                    num_kv_heads=k.shape[-2],
+                    is_varlen=arbitrary_is_varlen,
+                    hmask=arbitrary_hmask,
+                    pack_gqa=outer_plan.pack_gqa,
+                )
+            else:
+                fwd_config = resolve_sm100_fwd_consumer_config(
+                    arch=arch,
+                    dtype=q.dtype,
+                    head_dim=q.shape[-1],
+                    head_dim_v=v.shape[-1],
+                    num_q_heads=q.shape[-2],
+                    num_kv_heads=k.shape[-2],
+                    is_varlen=arbitrary_is_varlen,
+                    hmask=arbitrary_hmask,
+                    pack_gqa=outer_plan.pack_gqa,
+                    max_seqlen_q=(
+                        max_seqlen_q if arbitrary_is_varlen else q.shape[1]
+                    ),
+                )
+            if arch // 10 != 9:
+                validate_arbitrary_plan_signature(
+                    outer_plan.plan_signature,
+                    fwd_config.plan_signature,
+                    context="arbitrary outer forward plan",
+                )
+            nested_bwd = getattr(outer_plan, "bwd_tensors", None)
+            if nested_bwd is None:
+                raise ValueError(
+                    "arbitrary backward requires a plan built with "
+                    "create_arbitrary_block_sparse_tensors(..., build_backward=True)"
+                )
+            validate_arbitrary_attention_plan(
+                arbitrary=True,
+                block_sparse_tensors=nested_bwd,
             )
-        arbitrary_is_varlen = cu_seqlens_q is not None
-        if arbitrary_is_varlen and (
-            max_seqlen_q is None or max_seqlen_k is None
-        ):
-            raise ValueError(
-                "varlen arbitrary backward requires max_seqlen_q and max_seqlen_k"
+            if use_dedicated_hd256_kernel:
+                if utils._get_disable_2cta_default():
+                    raise NotImplementedError(
+                        "SM100/SM103 hd256 arbitrary backward requires 2CTA instructions"
+                    )
+                if (
+                    softcap != 0.0
+                    or score_mod is not None
+                    or score_mod_bwd is not None
+                    or mask_mod is not None
+                    or aux_tensors is not None
+                    or dlse is not None
+                    or pack_gqa is True
+                ):
+                    raise NotImplementedError(
+                        "SM100/SM103 hd256 arbitrary backward does not support "
+                        "softcap, score_mod, mask_mod, aux_tensors, dlse, or PackGQA"
+                    )
+                if linear_k_block_sparse_tensors is not None:
+                    raise ValueError(
+                        "hd256 arbitrary backward derives dQ from outer.dq_tensors; "
+                        "do not also pass linear_k_block_sparse_tensors"
+                    )
+                dq_plan = getattr(outer_plan, "dq_tensors", None)
+                if dq_plan is None:
+                    raise ValueError(
+                        "SM100/SM103 hd256 arbitrary backward requires an independent "
+                        "dq_tensors plan"
+                    )
+                validate_arbitrary_attention_plan(
+                    arbitrary=True,
+                    block_sparse_tensors=dq_plan,
+                )
+                if (
+                    dq_plan.topology_tensors
+                    is not outer_plan.topology_tensors
+                ):
+                    raise ValueError(
+                        "hd256 outer and dQ plans must share the exact Q2K topology"
+                    )
+                if (
+                    dq_plan.topology_tensors.runtime_binding
+                    is not outer_plan.topology_tensors.runtime_binding
+                ):
+                    raise ValueError(
+                        "hd256 outer and dQ plans must share the same runtime binding"
+                    )
+                arbitrary_config_dq = resolve_sm100_hd256_dq_consumer_config(
+                    arch=arch,
+                    dtype=q.dtype,
+                    head_dim=q.shape[-1],
+                    head_dim_v=v.shape[-1],
+                    num_q_heads=q.shape[-2],
+                    num_kv_heads=k.shape[-2],
+                    is_varlen=arbitrary_is_varlen,
+                    hmask=arbitrary_hmask,
+                    pack_gqa=False,
+                    use_2cta_instrs=True,
+                    deterministic=deterministic,
+                )
+                arbitrary_config = resolve_sm100_hd256_dkdv_consumer_config(
+                    arch=arch,
+                    dtype=q.dtype,
+                    head_dim=q.shape[-1],
+                    head_dim_v=v.shape[-1],
+                    num_q_heads=q.shape[-2],
+                    num_kv_heads=k.shape[-2],
+                    is_varlen=arbitrary_is_varlen,
+                    hmask=arbitrary_hmask,
+                    pack_gqa=False,
+                    use_2cta_instrs=True,
+                    deterministic=deterministic,
+                )
+                arbitrary_requires_2cta = True
+            else:
+                arbitrary_requires_2cta = (
+                    (q.shape[-1] == 192 and v.shape[-1] == 128)
+                    or nested_bwd.plan_signature.cta_group_size == 2
+                )
+                if arbitrary_requires_2cta:
+                    unsupported = []
+                    if utils._get_disable_2cta_default():
+                        unsupported.append("FA_DISABLE_2CTA=1")
+                    if softcap != 0.0:
+                        unsupported.append("softcap")
+                    if score_mod is not None or score_mod_bwd is not None:
+                        unsupported.append("score_mod/score_mod_bwd")
+                    if aux_tensors is not None:
+                        unsupported.append("aux_tensors")
+                    if unsupported:
+                        raise NotImplementedError(
+                            "SM100/SM103 arbitrary 2CTA backward was requested "
+                            "and does not "
+                            "support: " + ", ".join(unsupported)
+                        )
+            if (
+                nested_bwd.topology_tensors.runtime_binding
+                is not outer_plan.topology_tensors.runtime_binding
+            ):
+                raise ValueError(
+                    "arbitrary outer and nested backward plans must share "
+                    "the same runtime binding"
+                )
+            validate_arbitrary_plan_runtime_binding(
+                nested_bwd.topology_tensors.runtime_binding,
+                is_varlen=arbitrary_is_varlen,
+                batch_size=(
+                    cu_seqlens_q.shape[0] - 1
+                    if arbitrary_is_varlen
+                    else q.shape[0]
+                ),
+                seqlen_q=None if arbitrary_is_varlen else q.shape[1],
+                seqlen_k=None if arbitrary_is_varlen else k.shape[1],
+                total_q=(q.shape[0] if arbitrary_is_varlen else q.shape[0] * q.shape[1]),
+                total_k=(k.shape[0] if arbitrary_is_varlen else k.shape[0] * k.shape[1]),
+                max_seqlen_q=(
+                    max_seqlen_q if arbitrary_is_varlen else q.shape[1]
+                ),
+                max_seqlen_k=(
+                    max_seqlen_k if arbitrary_is_varlen else k.shape[1]
+                ),
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                context="arbitrary nested backward plan",
             )
-        if seqused_q is not None or seqused_k is not None:
-            raise NotImplementedError("arbitrary backward does not support seqused_q/k")
-        arbitrary_config = resolve_sm90_bwd_consumer_config(
-            arch=arch,
-            dtype=q.dtype,
-            head_dim=q.shape[-1],
-            head_dim_v=v.shape[-1],
-            num_q_heads=q.shape[-2],
-            num_kv_heads=k.shape[-2],
-            is_varlen=arbitrary_is_varlen,
-        )
+            if (
+                not use_dedicated_hd256_kernel
+                and nested_bwd.dq_write_order is None
+            ):
+                raise ValueError(
+                    "arbitrary backward requires a plan built with "
+                    "create_arbitrary_block_sparse_tensors(..., build_backward=True)"
+                )
+            if not use_dedicated_hd256_kernel:
+                arbitrary_config = (
+                    resolve_sm90_bwd_consumer_config(
+                        arch=arch,
+                        dtype=q.dtype,
+                        head_dim=q.shape[-1],
+                        head_dim_v=v.shape[-1],
+                        num_q_heads=q.shape[-2],
+                        num_kv_heads=k.shape[-2],
+                        is_varlen=arbitrary_is_varlen,
+                    )
+                    if arch // 10 == 9
+                    else resolve_sm100_bwd_consumer_config(
+                        arch=arch,
+                        dtype=q.dtype,
+                        head_dim=q.shape[-1],
+                        head_dim_v=v.shape[-1],
+                        num_q_heads=q.shape[-2],
+                        num_kv_heads=k.shape[-2],
+                        is_varlen=arbitrary_is_varlen,
+                    )
+                )
+            if arch // 10 != 9:
+                validate_arbitrary_plan_signature(
+                    nested_bwd.plan_signature,
+                    arbitrary_config.plan_signature,
+                    context="arbitrary nested backward plan",
+                )
+            if use_dedicated_hd256_kernel:
+                assert arbitrary_config_dq is not None
+                validate_arbitrary_plan_signature(
+                    dq_plan.plan_signature,
+                    arbitrary_config_dq.plan_signature,
+                    context="arbitrary hd256 dQ plan",
+                )
+                dq_masks = dq_plan.mask_block_masks
+                dkdv_masks = nested_bwd.mask_block_masks
+                if dq_masks is None or tuple(dq_masks.shape[1:]) != (
+                    arbitrary_config_dq.payload_shape_tail
+                ):
+                    raise ValueError(
+                        "arbitrary hd256 dQ payload must have shape "
+                        f"[partial_nnz, {arbitrary_config_dq.payload_shape_tail}]; "
+                        f"got {None if dq_masks is None else tuple(dq_masks.shape)}"
+                    )
+                if dkdv_masks is None or tuple(dkdv_masks.shape[1:]) != (
+                    arbitrary_config.payload_shape_tail
+                ):
+                    raise ValueError(
+                        "arbitrary hd256 dKdV payload must have shape "
+                        f"[partial_nnz, {arbitrary_config.payload_shape_tail}]; "
+                        f"got {None if dkdv_masks is None else tuple(dkdv_masks.shape)}"
+                    )
+                if (
+                    arbitrary_config_dq.block_size != (256, 128)
+                    or arbitrary_config.block_size != (256, 128)
+                ):
+                    raise ValueError(
+                        "arbitrary hd256 backward requires Q256 x K128 plans"
+                    )
+                arbitrary_plan_signature_dq = dq_plan.plan_signature
+            elif arbitrary_requires_2cta:
+                mask_payloads = nested_bwd.mask_block_masks
+                expected_payload_tail = (
+                    2,
+                    arbitrary_config.num_mma_threads,
+                    arbitrary_config.payload_padded_words,
+                )
+                if mask_payloads is None or mask_payloads.ndim != 4:
+                    raise ValueError(
+                        "arbitrary 2CTA backward requires a rank-4 "
+                        "mask_block_masks payload"
+                    )
+                if tuple(mask_payloads.shape[1:]) != expected_payload_tail:
+                    raise ValueError(
+                        "arbitrary 2CTA backward mask_block_masks must have "
+                        "shape [partial_nnz, 2, 256, 4]; got "
+                        f"{tuple(mask_payloads.shape)}"
+                    )
+                if arbitrary_config.block_size != (128, 256):
+                    raise ValueError(
+                        "arbitrary 2CTA backward resolved consumer requires "
+                        "block_size=(128, 256); got "
+                        f"{arbitrary_config.block_size}"
+                    )
+                arbitrary_use_2cta = True
+            if use_dedicated_hd256_kernel:
+                arbitrary_use_2cta = True
+            block_sparse_tensors = nested_bwd
+            arbitrary_plan_signature = nested_bwd.plan_signature
         causal = False
         window_size_left = None
         window_size_right = None
@@ -1461,15 +2011,16 @@ def _flash_attn_bwd(
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
 
-    use_dedicated_hd256_kernel = arch // 10 == 10 and head_dim == 256 and head_dim_v == 256
     use_sm100_hdim192_linear_csr_bwd = (
         arch // 10 in [10, 11]
+        and not arbitrary
         and head_dim == 192
         and head_dim_v == 128
         and _is_linear_csr_block_sparse(block_sparse_tensors)
     )
     use_sm100_hdim128_linear_csr_bwd = (
         arch // 10 in [10, 11]
+        and not arbitrary
         and head_dim == 128
         and head_dim_v == 128
         and _is_linear_csr_block_sparse(block_sparse_tensors)
@@ -1559,15 +2110,25 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
         requested_disable_2cta = utils._get_disable_2cta_default()
-        disable_2cta = (
-            requested_disable_2cta
-            or score_mod is not None
-            or score_mod_bwd is not None
-            or (mask_mod is not None and not arbitrary)
-            or (block_sparse_tensors is not None and not use_sm100_2cta_linear_csr_bwd)
-        )
-        cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
-        use_2cta_instrs = cluster_size==2
+        if arbitrary_use_2cta:
+            # Only topologies that require a CTA pair reach here: generic
+            # D=Dv=128, generic D=192/Dv=128, and the dedicated hd256 kernel.
+            # Their nested plan signatures were validated above, so never
+            # silently downgrade any route to 1CTA.
+            assert not requested_disable_2cta
+            cluster_size = 2
+            use_2cta_instrs = True
+        else:
+            disable_2cta = (
+                requested_disable_2cta
+                or arbitrary
+                or score_mod is not None
+                or score_mod_bwd is not None
+                or (mask_mod is not None and not arbitrary)
+                or (block_sparse_tensors is not None and not use_sm100_2cta_linear_csr_bwd)
+            )
+            cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
+            use_2cta_instrs = cluster_size == 2
 
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
@@ -1593,6 +2154,7 @@ def _flash_attn_bwd(
 
     num_head_kv = k.shape[-2]
     use_block_sparsity = block_sparse_tensors is not None
+    _validate_aux_tensors_device(aux_tensors, q.device)
     subtile_factor = (
         arbitrary_config.subtile_factor
         if arbitrary_config is not None
@@ -1692,11 +2254,11 @@ def _flash_attn_bwd(
         )
         score_mod = utils.create_softcap_scoremod(softcap)
         score_mod_bwd = utils.create_softcap_scoremod_bwd(softcap)
+    _validate_score_mod_pair(score_mod, score_mod_bwd)
     if score_mod is not None:
-        assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
         if not arbitrary:
             assert cu_seqlens_q is None and cu_seqlens_k is None, (
-                "varlen + score_mod is currently supported only by packed arbitrary backward"
+                "varlen + score_mod is currently supported only by arbitrary backward"
             )
         if arch // 10 == 8:
             raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
@@ -1842,10 +2404,12 @@ def _flash_attn_bwd(
     score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
     score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod else False
-    num_aux_tensors = len(aux_tensors) if aux_tensors else 0
+    aux_tensor_metadata = (
+        get_aux_tensor_metadata(aux_tensors) if aux_tensors is not None else None
+    )
     cute_aux_tensors = None
     if aux_tensors is not None:
-        cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
+        cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
@@ -1864,7 +2428,9 @@ def _flash_attn_bwd(
                 num_q_heads=num_head,
                 is_varlen=arbitrary_is_varlen,
                 block_size=arbitrary_config.block_size,
-                subtile_factor=arbitrary_config.subtile_factor,
+                # The payload axis is per physical CTA.  The logical Q
+                # subtile factor remains one for the K256 2CTA union.
+                subtile_factor=arbitrary_config.physical_subtiles,
                 num_mma_threads=arbitrary_config.num_mma_threads,
                 payload_padded_words=arbitrary_config.payload_padded_words,
                 expected_hmask=arbitrary_hmask,
@@ -1872,7 +2438,12 @@ def _flash_attn_bwd(
                 expected_fixed_total_n_blocks=(
                     None
                     if arbitrary_is_varlen
-                    else batch_size * math.ceil(seqlen_k / arbitrary_config.tile_n)
+                    else batch_size
+                    * math.ceil(seqlen_k / arbitrary_config.block_size[1])
+                ),
+                require_dq_write_order=not isinstance(
+                    arbitrary_config,
+                    _ResolvedSm100Hd256DkdvConsumerConfig,
                 ),
             )
         else:
@@ -1898,14 +2469,39 @@ def _flash_attn_bwd(
                 raise NotImplementedError(
                     "SM100 backward with head_dim=256 only supports linear CSR block sparsity"
                 )
-            if (
-                qhead_per_kvhead > 1
-                and normalized_block_sparse_tensors.mask_block_cnt.shape[1] != 1
-            ):
-                raise NotImplementedError(
-                    "SM100 backward with head_dim=256 currently requires head-broadcast "
-                    "linear_q_block_sparse_tensors for GQA/MQA"
+            if arbitrary:
+                if not isinstance(
+                    arbitrary_config_dq,
+                    _ResolvedSm100Hd256DqConsumerConfig,
+                ):
+                    raise AssertionError("missing resolved hd256 dQ consumer config")
+                normalized_block_sparse_tensors_dq = (
+                    normalize_arbitrary_block_sparse_config(
+                        dq_plan,
+                        device=device,
+                        batch_size=batch_size,
+                        num_q_heads=num_head,
+                        is_varlen=arbitrary_is_varlen,
+                        block_size=arbitrary_config_dq.block_size,
+                        pack_gqa=False,
+                        physical_subtiles=arbitrary_config_dq.physical_subtiles,
+                        num_mask_payload_groups=(
+                            arbitrary_config_dq.num_mask_payload_groups
+                        ),
+                        payload_padded_words=(
+                            arbitrary_config_dq.payload_padded_words
+                        ),
+                        expected_fixed_total_m_blocks=(
+                            None
+                            if arbitrary_is_varlen
+                            else batch_size
+                            * math.ceil(
+                                seqlen_q / arbitrary_config_dq.block_size[0]
+                            )
+                        ),
+                    )
                 )
+                use_dq_block_sparsity = True
         if deterministic:
             if normalized_block_sparse_tensors.dq_write_order is None:
                 raise ValueError(
@@ -2023,8 +2619,18 @@ def _flash_attn_bwd(
             score_mod_hash,
             score_mod_bwd_hash,
             mask_mod_hash,
-            num_aux_tensors,
+            aux_tensor_metadata,
             arbitrary,
+            (
+                arbitrary_plan_signature.compile_key
+                if arbitrary_plan_signature is not None
+                else None
+            ),
+            (
+                arbitrary_plan_signature_dq.compile_key
+                if arbitrary_plan_signature_dq is not None
+                else None
+            ),
             use_block_sparsity,
             subtile_factor,
             block_sparse_broadcast_pattern,
@@ -2057,8 +2663,18 @@ def _flash_attn_bwd(
             score_mod_hash,
             score_mod_bwd_hash,
             mask_mod_hash,
-            num_aux_tensors,
+            aux_tensor_metadata,
             arbitrary,
+            (
+                arbitrary_plan_signature.compile_key
+                if arbitrary_plan_signature is not None
+                else None
+            ),
+            (
+                arbitrary_plan_signature_dq.compile_key
+                if arbitrary_plan_signature_dq is not None
+                else None
+            ),
             use_block_sparsity,
             subtile_factor,
             block_sparse_broadcast_pattern,
@@ -2075,6 +2691,9 @@ def _flash_attn_bwd(
             # Prevent TVM stride poisoning when only one block is present.
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
+            # See the forward key above.  The dedicated wrapper now takes two
+            # dynamic max-seqlen values before the stream argument.
+            1 if use_dedicated_hd256_kernel else None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2168,8 +2787,6 @@ def _flash_attn_bwd(
                     "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
                 if block_sparse_tensors is not None:
                     assert arbitrary, "SM100 backward with head_dim=256 CSR support requires arbitrary=True"
-                    assert cu_seqlens_q is None and cu_seqlens_k is None, \
-                        "SM100 backward with head_dim=256 CSR support does not support varlen"
 
                 dq_tile_mn = (128, 128)
                 dkdv_tile_mn = (128, 64)
@@ -2188,6 +2805,38 @@ def _flash_attn_bwd(
                     mask_mod=mask_mod,
                     is_arbitrary=arbitrary,
                     has_aux_tensors=aux_tensors is not None,
+                    mask_payload_valid_words_dq=(
+                        arbitrary_config_dq.payload_valid_words
+                        if isinstance(
+                            arbitrary_config_dq,
+                            _ResolvedSm100Hd256DqConsumerConfig,
+                        )
+                        else 4
+                    ),
+                    mask_payload_padded_words_dq=(
+                        arbitrary_config_dq.payload_padded_words
+                        if isinstance(
+                            arbitrary_config_dq,
+                            _ResolvedSm100Hd256DqConsumerConfig,
+                        )
+                        else 4
+                    ),
+                    mask_payload_valid_words_dkdv=(
+                        arbitrary_config.payload_valid_words
+                        if isinstance(
+                            arbitrary_config,
+                            _ResolvedSm100Hd256DkdvConsumerConfig,
+                        )
+                        else 1
+                    ),
+                    mask_payload_padded_words_dkdv=(
+                        arbitrary_config.payload_padded_words
+                        if isinstance(
+                            arbitrary_config,
+                            _ResolvedSm100Hd256DkdvConsumerConfig,
+                        )
+                        else 1
+                    ),
                     subtile_factor=subtile_factor,
                     tile_m_dq=dq_tile_mn[0],
                     tile_n_dq=dq_tile_mn[1],
@@ -2213,6 +2862,16 @@ def _flash_attn_bwd(
                     is_arbitrary=arbitrary,
                     has_aux_tensors=aux_tensors is not None,
                     subtile_factor=subtile_factor,
+                    mask_payload_valid_words=(
+                        arbitrary_config.payload_valid_words
+                        if arbitrary
+                        else 2
+                    ),
+                    mask_payload_padded_words=(
+                        arbitrary_config.payload_padded_words
+                        if arbitrary
+                        else 4
+                    ),
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -2254,12 +2913,18 @@ def _flash_attn_bwd(
         if use_dedicated_hd256_kernel:
             compile_args.append(sparse_tensors_compile_dq)
         compile_args.append(sparse_tensors_compile)
+        if use_dedicated_hd256_kernel:
+            compile_args.extend([Int32(0), Int32(0)])
         if arch // 10 == 9:
             compile_args.extend([Int32(0), Int32(0)])
         compile_args.append(current_stream)
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
             *compile_args,
-            options="--enable-tvm-ffi",
+            options=_resolve_flash_bwd_compile_options(
+                arch=arch,
+                arbitrary_use_2cta=arbitrary_use_2cta,
+                arbitrary_hd256=(use_dedicated_hd256_kernel and arbitrary),
+            ),
         )
     if not is_fake_mode():
         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
@@ -2288,6 +2953,13 @@ def _flash_attn_bwd(
         if use_dedicated_hd256_kernel:
             call_args.append(_block_sparse_runtime_tuple(normalized_block_sparse_tensors_dq))
         call_args.append(_block_sparse_runtime_tuple(normalized_block_sparse_tensors))
+        if use_dedicated_hd256_kernel:
+            call_args.extend(
+                [
+                    max_seqlen_q if max_seqlen_q is not None else seqlen_q,
+                    max_seqlen_k if max_seqlen_k is not None else seqlen_k,
+                ]
+            )
         if arch // 10 == 9:
             call_args.extend([seqlen_q, seqlen_k])
         _flash_attn_bwd.compile_cache[compile_key](*call_args)
@@ -2365,12 +3037,38 @@ class FlashAttnFunc(torch.autograd.Function):
         linear_q_block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
         return_lse: bool = False,
     ):
+        if (
+            block_sparse_tensors is not None
+            and linear_k_block_sparse_tensors is not None
+        ):
+            raise ValueError(
+                "Pass either block_sparse_tensors or "
+                "linear_k_block_sparse_tensors, not both."
+            )
+        for name, linear_plan in (
+            ("linear_k_block_sparse_tensors", linear_k_block_sparse_tensors),
+            ("linear_q_block_sparse_tensors", linear_q_block_sparse_tensors),
+        ):
+            if getattr(linear_plan, "plan_signature", None) is not None:
+                raise ValueError(
+                    f"versioned arbitrary plans cannot be passed through {name}; "
+                    "use block_sparse_tensors"
+                )
+        effective_fwd_plan = (
+            linear_k_block_sparse_tensors
+            if linear_k_block_sparse_tensors is not None
+            else block_sparse_tensors
+        )
+        validate_arbitrary_attention_plan(
+            arbitrary=arbitrary,
+            block_sparse_tensors=effective_fwd_plan,
+        )
         if arbitrary and (
             block_sparse_tensors_bwd is not None
             or linear_q_block_sparse_tensors is not None
         ):
             raise ValueError(
-                "packed arbitrary attention stores backward tensors in "
+                "arbitrary attention stores backward tensors in "
                 "block_sparse_tensors.bwd_tensors; do not pass a second backward plan"
             )
         if linear_q_block_sparse_tensors is not None and block_sparse_tensors_bwd is not None:
@@ -2421,7 +3119,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.score_mod_bwd = score_mod_bwd
         ctx.mask_mod = mask_mod
         ctx.block_sparse_tensors_bwd = (
-            block_sparse_tensors
+            effective_fwd_plan
             if arbitrary
             else (
                 linear_q_block_sparse_tensors
@@ -2430,12 +3128,16 @@ class FlashAttnFunc(torch.autograd.Function):
             )
         )
         ctx.block_sparse_tensors_dq = (
-            linear_k_block_sparse_tensors
-            if linear_k_block_sparse_tensors is not None
+            None
+            if arbitrary
             else (
-                block_sparse_tensors
-                if _is_linear_csr_block_sparse(block_sparse_tensors)
-                else None
+                linear_k_block_sparse_tensors
+                if linear_k_block_sparse_tensors is not None
+                else (
+                    block_sparse_tensors
+                    if _is_linear_csr_block_sparse(block_sparse_tensors)
+                    else None
+                )
             )
         )
         ctx.set_materialize_grads(False)
@@ -2507,6 +3209,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
     ):
+        validate_arbitrary_attention_plan(
+            arbitrary=arbitrary,
+            block_sparse_tensors=block_sparse_tensors,
+        )
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -2630,6 +3336,12 @@ def flash_attn_func(
     linear_k_block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
     linear_q_block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
 ):
+    requires_backward = torch.is_grad_enabled() and (
+        q.requires_grad or k.requires_grad or v.requires_grad
+    )
+    _validate_score_mod_pair(
+        score_mod, score_mod_bwd, requires_backward=requires_backward
+    )
     return FlashAttnFunc.apply(
         q,
         k,
@@ -2701,6 +3413,12 @@ def flash_attn_varlen_func(
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.
     """
+    requires_backward = torch.is_grad_enabled() and (
+        q.requires_grad or k.requires_grad or v.requires_grad
+    )
+    _validate_score_mod_pair(
+        score_mod, score_mod_bwd, requires_backward=requires_backward
+    )
     return FlashAttnVarlenFunc.apply(
         q,
         k,

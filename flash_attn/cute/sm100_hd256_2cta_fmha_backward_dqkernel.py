@@ -30,7 +30,10 @@ from flash_attn_cute.mask import (
 )
 from flash_attn_cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 import flash_attn_cute.copy_utils as fa_copy_utils
-from flash_attn_cute.block_sparse_utils import _get_curr_blocksparse_tensors_linear_raw
+from flash_attn_cute.block_sparse_utils import (
+    apply_loaded_arbitrary_mask,
+    load_mask_payload,
+)
 from flash_attn_cute.block_sparsity import BlockSparseTensors
 
 
@@ -40,17 +43,39 @@ def _hd256_dq_bs_block_info(
     batch_idx: Int32,
     head_idx: Int32,
     m_block: Int32,
+    q_blocks_per_sample: Int32,
+    is_valid_q: cutlass.Boolean,
 ):
-    (
-        mask_cnt,
-        mask_off,
-        mask_idx,
-        full_cnt,
-        full_off,
-        full_idx,
-    ) = _get_curr_blocksparse_tensors_linear_raw(
-        batch_idx, head_idx, m_block, blocksparse_tensors
-    )
+    mask_block_cnt = blocksparse_tensors.mask_block_cnt
+    mask_idx = blocksparse_tensors.mask_block_idx
+    full_block_cnt = blocksparse_tensors.full_block_cnt
+    full_idx = blocksparse_tensors.full_block_idx
+    mask_block_offset = blocksparse_tensors.mask_block_offset
+    full_block_offset = blocksparse_tensors.full_block_offset
+    cu_total_m_blocks = blocksparse_tensors.cu_total_m_blocks
+    assert len(mask_block_cnt.shape) == 2
+    assert mask_block_offset is not None
+    assert full_block_cnt is not None
+    assert full_idx is not None
+    assert full_block_offset is not None
+
+    total_q_blocks = mask_block_cnt.shape[1]
+    plan_head = Int32(0)
+    if mask_block_cnt.shape[0] != 1:
+        plan_head = head_idx
+    mask_cnt = Int32(0)
+    mask_off = Int32(0)
+    full_cnt = Int32(0)
+    full_off = Int32(0)
+    if is_valid_q:
+        outer_row = batch_idx * q_blocks_per_sample + m_block
+        if cutlass.const_expr(cu_total_m_blocks is not None):
+            outer_row = cu_total_m_blocks[batch_idx] + m_block
+        plan_row = plan_head * total_q_blocks + outer_row
+        mask_cnt = mask_block_cnt[plan_head, outer_row]
+        mask_off = mask_block_offset[plan_row]
+        full_cnt = full_block_cnt[plan_head, outer_row]
+        full_off = full_block_offset[plan_row]
     total = mask_cnt + full_cnt
     return (total, mask_cnt, mask_off, mask_idx, full_off, full_idx)
 
@@ -93,6 +118,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         split_head: bool,
         qhead_per_kvhead: int = 1,
         is_arbitrary: bool = False,
+        mask_payload_valid_words: int = 4,
+        mask_payload_padded_words: int = 4,
         use_clc_scheduler: bool = False,
     ):
         self.acc_dtype = acc_dtype
@@ -117,6 +144,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         )
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_arbitrary = is_arbitrary
+        self.mask_payload_valid_words = mask_payload_valid_words
+        self.mask_payload_padded_words = mask_payload_padded_words
+        if self.is_arbitrary:
+            assert self.qhead_per_kvhead >= 1
+            assert not is_persistent and not use_clc_scheduler, (
+                "SM100 hd256 arbitrary dQ requires STATIC scheduling"
+            )
+            assert self.mask_payload_valid_words == 4 and self.mask_payload_padded_words == 4, (
+                "SM100 hd256 arbitrary dQ payload requires four valid/padded words"
+            )
         assert mma_tiler[0] == 128 and mma_tiler[1] == 128, "Only 128x128 tile impl is supported"
         assert mma_tiler[2] == 256, "Only 256 is supported for 128x128 tile impl"
         self.cta_tiler = (
@@ -220,20 +257,42 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         scale_softmax: cutlass.Float32,
         aux_tensors: Optional[list],
         block_sparse_tensors: Optional[BlockSparseTensors],
+        max_seqlen_q_runtime: Int32,
         stream: cuda.CUstream,
     ):
         varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
         self.use_block_sparsity = cutlass.const_expr(block_sparse_tensors is not None)
+        if cutlass.const_expr(self.is_arbitrary):
+            assert cutlass.const_expr(self.use_block_sparsity), (
+                "SM100 hd256 arbitrary dQ requires a compact Q2K plan"
+            )
         if cutlass.const_expr(self.use_block_sparsity):
             assert block_sparse_tensors is not None
             assert self.is_arbitrary, "SM100 hd256 dQ CSR block sparsity requires arbitrary=True"
-            assert not varlen, "SM100 hd256 dQ CSR block sparsity does not support varlen"
-            assert not self.use_clc_scheduler, "SM100 hd256 dQ CSR block sparsity does not support CLC"
+            assert not self.use_clc_scheduler, (
+                "SM100 hd256 dQ CSR block sparsity does not support CLC"
+            )
             assert not self.is_causal and not self.is_local, (
                 "SM100 hd256 dQ CSR block sparsity only supports arbitrary masks"
             )
             assert block_sparse_tensors.mask_block_offset is not None, (
                 "SM100 hd256 dQ only supports linear CSR block sparse tensors"
+            )
+            assert (cum_seqlen_q is None) == (cum_seqlen_k is None), (
+                "SM100 hd256 arbitrary dQ varlen requires both cu_seqlens tensors"
+            )
+            if cutlass.const_expr(cum_seqlen_q is not None):
+                assert block_sparse_tensors.cu_total_m_blocks is not None, (
+                    "SM100 hd256 arbitrary varlen dQ requires compact Q256 row prefixes"
+                )
+            assert len(block_sparse_tensors.mask_block_cnt.shape) == 2, (
+                "SM100 hd256 arbitrary dQ requires compact rank-2 Q2K counts"
+            )
+            assert block_sparse_tensors.mask_block_masks is not None, (
+                "SM100 hd256 arbitrary dQ requires mask_block_masks"
+            )
+            assert len(block_sparse_tensors.mask_block_masks.shape) == 4, (
+                "SM100 hd256 arbitrary dQ payload must be rank 4"
             )
         # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D),
         # similar to the dedicated hd256 forward path.
@@ -361,15 +420,18 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.dq_dtype = dq.element_type
         self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
+        grid_seqlen_q = s_q
+        if cutlass.const_expr(cum_seqlen_q is not None):
+            grid_seqlen_q = max_seqlen_q_runtime
         if cutlass.const_expr(self.use_clc_scheduler):
             self.tile_sched_params, grid = compute_grid_clc(
-                (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
+                (grid_seqlen_q, dq.shape[1], dq.shape[2]),
                 self.cta_tiler,
                 (*self.cluster_shape_mn, 1),
             )
         else:
             self.tile_sched_params, grid = compute_grid(
-                (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
+                (grid_seqlen_q, dq.shape[1], dq.shape[2]),
                 self.cta_tiler,
                 self.is_persistent,
             )
@@ -1020,6 +1082,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         batch_coord,
                         curr_block_coord[2][0],
                         mma_block_coord[0],
+                        cute.ceil_div(seqlen_q, self.qk_mma_tiler[0]),
+                        is_valid_q,
                     )
                     seqlen_kv_loop_start = Int32(0)
                     seqlen_kv_loop_steps = bs_info[0]
@@ -1314,6 +1378,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         batch_coord,
                         curr_block_coord[2][0],
                         mma_block_coord[0],
+                        cute.ceil_div(seqlen_q, self.qk_mma_tiler[0]),
+                        is_valid_q,
                     )[0]
                 else:
                     seqlen_kv_loop_start, seqlen_kv_loop_steps = (
@@ -1921,6 +1987,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
             # increase register after decreasing
             cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
+            mask_payloads = None
+            if cutlass.const_expr(self.is_arbitrary):
+                assert block_sparse_tensors is not None
+                assert block_sparse_tensors.mask_block_masks is not None
+                mask_payloads = block_sparse_tensors.mask_block_masks
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
                 mma_block_coord = (
@@ -1951,6 +2022,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         batch_coord,
                         curr_block_coord[2][0],
                         mma_block_coord[0],
+                        cute.ceil_div(seqlen_q, self.qk_mma_tiler[0]),
+                        is_valid_q,
                     )
                     start_count = Int32(0)
                     trip_count = bs_info[0]
@@ -2016,10 +2089,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                         # Si, dPi -> dSi
                         if cutlass.const_expr(self.use_block_sparsity):
-                            need_apply_mask = (
-                                (mma_block_coord[0] + 1) * self.qk_mma_tiler[0] > seqlen_q
-                                or (col_block + 1) * self.qk_mma_tiler[1] > seqlen_k
-                            )
+                            need_apply_mask = (mma_block_coord[0] + 1) * self.qk_mma_tiler[
+                                0
+                            ] > seqlen_q or (col_block + 1) * self.qk_mma_tiler[1] > seqlen_k
                         elif cutlass.const_expr(self.use_semantic_trip_range):
                             need_apply_mask = (
                                 step >= n_block_min_causal_local_mask
@@ -2028,11 +2100,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         else:
                             need_apply_mask = step == end_count - 1
                         apply_arbitrary_mask = False
+                        payload_idx = Int32(0)
                         if cutlass.const_expr(self.is_arbitrary):
-                            if cutlass.const_expr(self.use_block_sparsity):
-                                apply_arbitrary_mask = not is_full_block
-                            else:
-                                apply_arbitrary_mask = True
+                            assert cutlass.const_expr(self.use_block_sparsity)
+                            apply_arbitrary_mask = step < bs_info[1]
+                            if apply_arbitrary_mask:
+                                payload_idx = bs_info[2] + step
                             need_apply_mask = need_apply_mask or apply_arbitrary_mask
                         mma_s_consumer, mma_dp_consumer, ds_mma_producer = self.compute_step(
                             (
@@ -2040,10 +2113,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 window_size_left,
                                 window_size_right,
                                 self.is_arbitrary,
-                                batch_coord,
-                                curr_block_coord[2][0],
-                                aux_tensors,
                                 apply_arbitrary_mask,
+                                mask_payloads,
+                                payload_idx,
+                                col_block,
                             ),
                             (
                                 seqlen_q,
@@ -2107,6 +2180,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         batch_coord,
                         curr_block_coord[2][0],
                         mma_block_coord[0],
+                        cute.ceil_div(seqlen_q, self.qk_mma_tiler[0]),
+                        is_valid_q,
                     )[0]
                 else:
                     seqlen_kv_loop_start, seqlen_kv_loop_steps = (
@@ -2218,10 +2293,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             window_size_left,
             window_size_right,
             is_arbitrary,
-            batch_coord,
-            head_coord,
-            aux_tensors,
             apply_arbitrary_mask,
+            mask_payloads,
+            payload_idx,
+            n_block,
         ) = mask_args
         seqlen_q, seqlen_k, scale_softmax, batch_coord, block_m_idx, varlen = value_args
         tStS, tScS, tdPtdP, tdPcdP, sLSE, sSum_OdO = tensor_args
@@ -2258,12 +2333,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             )
             if cutlass.const_expr(is_arbitrary):
                 if apply_arbitrary_mask:
-                    FusedMask.apply_arbitrary_mask(
+                    assert mask_payloads is not None
+                    assert cutlass.const_expr(
+                        cute.size(tTMEM_LOADrS) == self.mask_payload_valid_words * 32
+                    ), "SM100 hd256 arbitrary dQ payload does not cover the score fragment"
+                    r_bitmask = load_mask_payload(
+                        mask_payloads,
+                        payload_idx,
+                        thread_idx,
+                        subtile_idx=bidx % 2,
+                        payload_words=self.mask_payload_padded_words,
+                    )
+                    apply_loaded_arbitrary_mask(
                         tTMEM_LOADrS,
-                        tTMEM_LOADcS,
-                        batch_coord,
-                        head_coord,
-                        aux_tensors,
+                        n_block,
+                        r_bitmask,
+                        self.mask_payload_valid_words,
                     )
 
         log2_e = cutlass.Float32(math.log2(math.e))

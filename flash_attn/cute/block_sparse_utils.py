@@ -5,16 +5,15 @@ This module contains runtime execution functions for block-sparse attention kern
 These utilities are used by CUTE DSL kernels to produce and consume block-sparse loads.
 """
 
-from typing import Callable, Optional, Tuple
-from functools import partial
 import math
+from functools import partial
+from typing import Callable, Optional, Tuple
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
-
-from quack import copy_utils
 
 # Import data structures from block_sparsity
 from flash_attn_cute import barrier
@@ -22,6 +21,7 @@ from flash_attn_cute.block_sparsity import BlockSparseTensors
 from flash_attn_cute.named_barrier import NamedBarrierBwd
 from flash_attn_cute.seqlen_info import SeqlenInfoQK
 from flash_attn_cute.sm90_fwd_config import _sm90_fwd_mask_payload_group_idx
+from quack import copy_utils
 
 
 @dsl_user_op
@@ -161,7 +161,7 @@ def get_curr_arbitrary_blocksparse_tensors(
     tile_m: cutlass.Constexpr[int],
     qhead_per_kvhead: cutlass.Constexpr[int],
 ):
-    """Extract one compact arbitrary-plan row and its packed-mask base."""
+    """Extract one compact arbitrary-plan row and its mask-payload base."""
     mask_block_cnt = blocksparse_tensors.mask_block_cnt
     mask_block_idx = blocksparse_tensors.mask_block_idx
     full_block_cnt = blocksparse_tensors.full_block_cnt
@@ -242,7 +242,7 @@ def get_curr_arbitrary_blocksparse_tensors_bwd(
     blocksparse_tensors: BlockSparseTensors,
     n_blocks_per_sample: cutlass.Int32,
 ):
-    """Extract one compact arbitrary K2Q row and its packed-mask base."""
+    """Extract one compact arbitrary K2Q row and its mask-payload base."""
 
     mask_block_cnt = blocksparse_tensors.mask_block_cnt
     mask_block_idx = blocksparse_tensors.mask_block_idx
@@ -312,7 +312,7 @@ def get_curr_arbitrary_block_counts_bwd_sm90(
 
 
 @cute.jit
-def load_packed_mask_payload(
+def load_mask_payload(
     mask_payloads: Optional[cute.Tensor],
     payload_idx: Int32,
     payload_group_idx: Int32,
@@ -501,6 +501,7 @@ def prefetch_arbitrary_forward_mask(
     payload_idx: Int32,
     is_partial,
     payload_words: cutlass.Constexpr[int],
+    subtile_idx: Int32 = Int32(0),
 ):
     """Use the TMA producer warp to stage a partial payload in L1."""
     if is_partial:
@@ -510,7 +511,7 @@ def prefetch_arbitrary_forward_mask(
         word_offset = lane_idx * cache_line_words
         if word_offset < payload_total_words:
             mask_iter = mask_payloads.iterator + cute.crd2idx(
-                (payload_idx, Int32(0), Int32(0), Int32(0)),
+                (payload_idx, subtile_idx, Int32(0), Int32(0)),
                 mask_payloads.layout,
             )
             mask_ptr = cute.make_ptr(
@@ -534,10 +535,10 @@ def apply_arbitrary_forward_mask(
     mask_seqlen: cutlass.Constexpr[bool] = True,
     r_bitmask: Optional[cute.Tensor] = None,
 ):
-    """Apply one packed partial-block payload."""
+    """Apply one partial-block payload."""
     # The FA mask callback passes mask_seqlen; the payload already encodes it.
     if const_expr(r_bitmask is None):
-        r_bitmask = load_packed_mask_payload(
+        r_bitmask = load_mask_payload(
             mask_payloads,
             payload_idx,
             payload_group_idx,
@@ -549,6 +550,44 @@ def apply_arbitrary_forward_mask(
         mask_mod=None,
         mask_seqlen=False,
         rBitmask=r_bitmask,
+    )
+
+
+@cute.jit
+def apply_loaded_arbitrary_mask(
+    acc_S: cute.Tensor,
+    n_block: Int32,
+    r_bitmask: cute.Tensor,
+    payload_valid_words: cutlass.Constexpr[int],
+):
+    """Apply valid mask words without retaining generic mask state."""
+
+    # The payload is already laid out in the exact TMEM-to-register score
+    # order, so arbitrary masking needs no sequence coordinates or
+    # AttentionMask object.  Keeping this leaf specialized also makes the
+    # consumer-native mapping explicit.
+    for word_idx in cutlass.range_constexpr(payload_valid_words):
+        col_start = 32 * word_idx
+        mask_word = r_bitmask[word_idx]
+        for bit_idx in cutlass.range_constexpr(32):
+            col = col_start + bit_idx
+            keep = cutlass.Boolean((mask_word >> bit_idx) & 1)
+            acc_S[col] = acc_S[col] if keep else -Float32.inf
+
+
+@cute.jit
+def apply_loaded_arbitrary_forward_mask(
+    acc_S: cute.Tensor,
+    n_block: Int32,
+    r_bitmask: cute.Tensor,
+):
+    """Apply every word of a forward consumer-native payload."""
+
+    apply_loaded_arbitrary_mask(
+        acc_S,
+        n_block,
+        r_bitmask,
+        cute.size(r_bitmask.shape[0]),
     )
 
 
@@ -822,7 +861,7 @@ def consume_arbitrary_forward_overlap(
                 payload_words=payload_words,
             ),
             mask_prefetch_fn=partial(
-                load_packed_mask_payload,
+                load_mask_payload,
                 mask_payloads,
                 payload_idx,
                 payload_group_idx,
@@ -851,7 +890,7 @@ def consume_arbitrary_forward_overlap(
                     payload_words=payload_words,
                 ),
                 mask_prefetch_fn=partial(
-                    load_packed_mask_payload,
+                    load_mask_payload,
                     mask_payloads,
                     payload_idx,
                     payload_group_idx,
@@ -1138,7 +1177,7 @@ def consume_block_sparse_loads(
     """
     mask_payloads = blocksparse_tensors.mask_block_masks
     if const_expr(mask_payloads is not None):
-        # Packed payloads are self-contained for arbitrary-only attention.
+        # Mask payloads are self-contained for arbitrary-only attention.
         # Only score_mod consumers need CSR indices to reconstruct logical K coordinates.
         if const_expr(score_mod_fn is not None):
             (
@@ -1427,6 +1466,133 @@ def load_block_list_sm100(
     return kv_producer_state
 
 
+@cute.jit
+def produce_arbitrary_forward_loads_sm100(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx: Int32,
+    head_idx: Int32,
+    m_block: Int32,
+    seqlen_info: SeqlenInfoQK,
+    kv_producer_state,
+    load_Q,
+    load_K,
+    load_V,
+    q_stage: cutlass.Constexpr,
+    payload_cta_rank: Int32,
+    cta_group_size: cutlass.Constexpr[int],
+    q_producer_phase: Int32,
+    sparse_tile_m: cutlass.Constexpr[int],
+    qhead_per_kvhead: cutlass.Constexpr[int],
+    payload_words: cutlass.Constexpr[int],
+):
+    """Produce compact Q2K payload loads for generic SM100 forward."""
+
+    (
+        partial_count,
+        partial_indices,
+        full_count,
+        full_indices,
+        payload_base,
+    ) = get_curr_arbitrary_blocksparse_tensors(
+        batch_idx,
+        head_idx,
+        m_block,
+        blocksparse_tensors,
+        seqlen_info,
+        sparse_tile_m,
+        qhead_per_kvhead,
+    )
+
+    q_phase_flipped = False
+    if partial_count > 0:
+        # Keep the callable producer closures at this single JIT boundary.
+        # CuTe DSL 4.6.1 cannot re-stage a captured load_Q/K/V callable through
+        # a second decorated helper (it rejects the resulting code object for
+        # having free variables).
+        load_Q(block=0, stage=0)
+        if const_expr(q_stage == 2):
+            load_Q(block=1, stage=1)
+
+        current_ordinal = partial_count - Int32(1)
+        prefetch_arbitrary_forward_block_index(
+            partial_indices,
+            current_ordinal,
+            True,
+        )
+        for stage_idx in cutlass.range_constexpr(q_stage):
+            payload_subtile_idx = Int32(stage_idx) * cta_group_size + payload_cta_rank
+            prefetch_arbitrary_forward_mask(
+                blocksparse_tensors.mask_block_masks,
+                payload_base + current_ordinal,
+                True,
+                payload_words,
+                payload_subtile_idx,
+            )
+        for offset in cutlass.range(partial_count, unroll=1):
+            partial_ordinal = partial_count - Int32(1) - offset
+            n_block = partial_indices[partial_ordinal]
+            if offset + Int32(1) < partial_count:
+                next_ordinal = partial_ordinal - Int32(1)
+                prefetch_arbitrary_forward_block_index(
+                    partial_indices,
+                    next_ordinal,
+                    True,
+                )
+                for stage_idx in cutlass.range_constexpr(q_stage):
+                    payload_subtile_idx = Int32(stage_idx) * cta_group_size + payload_cta_rank
+                    prefetch_arbitrary_forward_mask(
+                        blocksparse_tensors.mask_block_masks,
+                        payload_base + next_ordinal,
+                        True,
+                        payload_words,
+                        payload_subtile_idx,
+                    )
+            load_K(
+                block=n_block,
+                producer_state=kv_producer_state,
+                page_idx=None,
+            )
+            kv_producer_state.advance()
+            load_V(
+                block=n_block,
+                producer_state=kv_producer_state,
+                page_idx=None,
+            )
+            kv_producer_state.advance()
+        q_phase_flipped = True
+        if full_count > 0:
+            kv_producer_state = load_block_list_sm100(
+                full_indices,
+                Int32(0),
+                full_count,
+                load_q_with_first=False,
+                q_stage=q_stage,
+                kv_producer_state=kv_producer_state,
+                load_Q=load_Q,
+                load_K=load_K,
+                load_V=load_V,
+                pipeline_kv=None,
+            )
+    elif full_count > 0:
+        kv_producer_state = load_block_list_sm100(
+            full_indices,
+            Int32(0),
+            full_count,
+            load_q_with_first=True,
+            q_stage=q_stage,
+            kv_producer_state=kv_producer_state,
+            load_Q=load_Q,
+            load_K=load_K,
+            load_V=load_V,
+            pipeline_kv=None,
+        )
+        q_phase_flipped = True
+
+    if q_phase_flipped:
+        q_producer_phase ^= 1
+    return kv_producer_state, q_producer_phase
+
+
 # SM100-specific tile processor using SM100 helpers
 @cute.jit
 def produce_block_sparse_loads_sm100(
@@ -1615,41 +1781,13 @@ def produce_block_sparse_loads_sm100_linear(
     full_empty = curr_full_block_cnt == 0
     q_phase_flipped = False
 
-    if mask_empty:
-        kv_producer_state = load_block_list_sm100(
-            curr_full_block_idx,
-            curr_full_block_offset,
-            curr_full_block_offset + curr_full_block_cnt,
-            load_q_with_first=True,
-            q_stage=q_stage,
-            kv_producer_state=kv_producer_state,
-            load_Q=load_Q,
-            load_K=load_K,
-            load_V=load_V,
-            pipeline_kv=pipeline_kv,
-        )
-        q_phase_flipped = not full_empty
-    else:
-        kv_producer_state = load_block_list_sm100(
-            curr_mask_block_idx,
-            curr_mask_block_offset,
-            curr_mask_block_offset + curr_mask_block_cnt,
-            load_q_with_first=True,
-            q_stage=q_stage,
-            kv_producer_state=kv_producer_state,
-            load_Q=load_Q,
-            load_K=load_K,
-            load_V=load_V,
-            pipeline_kv=pipeline_kv,
-        )
-        q_phase_flipped = True
-
-        if not full_empty:
+    if const_expr(curr_full_block_idx is None):
+        if not mask_empty:
             kv_producer_state = load_block_list_sm100(
-                curr_full_block_idx,
-                curr_full_block_offset,
-                curr_full_block_offset + curr_full_block_cnt,
-                load_q_with_first=False,
+                curr_mask_block_idx,
+                curr_mask_block_offset,
+                curr_mask_block_offset + curr_mask_block_cnt,
+                load_q_with_first=True,
                 q_stage=q_stage,
                 kv_producer_state=kv_producer_state,
                 load_Q=load_Q,
@@ -1657,6 +1795,50 @@ def produce_block_sparse_loads_sm100_linear(
                 load_V=load_V,
                 pipeline_kv=pipeline_kv,
             )
+            q_phase_flipped = True
+    else:
+        if mask_empty:
+            kv_producer_state = load_block_list_sm100(
+                curr_full_block_idx,
+                curr_full_block_offset,
+                curr_full_block_offset + curr_full_block_cnt,
+                load_q_with_first=True,
+                q_stage=q_stage,
+                kv_producer_state=kv_producer_state,
+                load_Q=load_Q,
+                load_K=load_K,
+                load_V=load_V,
+                pipeline_kv=pipeline_kv,
+            )
+            q_phase_flipped = not full_empty
+        else:
+            kv_producer_state = load_block_list_sm100(
+                curr_mask_block_idx,
+                curr_mask_block_offset,
+                curr_mask_block_offset + curr_mask_block_cnt,
+                load_q_with_first=True,
+                q_stage=q_stage,
+                kv_producer_state=kv_producer_state,
+                load_Q=load_Q,
+                load_K=load_K,
+                load_V=load_V,
+                pipeline_kv=pipeline_kv,
+            )
+            q_phase_flipped = True
+
+            if not full_empty:
+                kv_producer_state = load_block_list_sm100(
+                    curr_full_block_idx,
+                    curr_full_block_offset,
+                    curr_full_block_offset + curr_full_block_cnt,
+                    load_q_with_first=False,
+                    q_stage=q_stage,
+                    kv_producer_state=kv_producer_state,
+                    load_Q=load_Q,
+                    load_K=load_K,
+                    load_V=load_V,
+                    pipeline_kv=pipeline_kv,
+                )
 
     if q_phase_flipped:
         q_producer_phase ^= 1
@@ -1684,6 +1866,30 @@ def get_total_block_count_linear_sm100(
     if const_expr(full_block_cnt is not None):
         total = total + full_block_cnt[sparse_batch_idx, sparse_head_idx, m_block_sparse]
     return total
+
+
+@cute.jit
+def get_total_arbitrary_block_count_fwd_sm100(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx: Int32,
+    head_idx: Int32,
+    m_block: Int32,
+    seqlen_info: SeqlenInfoQK,
+    sparse_tile_m: cutlass.Constexpr[int],
+    qhead_per_kvhead: cutlass.Constexpr[int],
+):
+    """Count one compact Q2K plan row without using fixed-linear shapes."""
+
+    partial_count, full_count, _ = get_curr_arbitrary_block_counts_fwd_sm90(
+        batch_idx,
+        head_idx,
+        m_block,
+        blocksparse_tensors,
+        seqlen_info,
+        sparse_tile_m,
+        qhead_per_kvhead,
+    )
+    return partial_count + full_count
 
 
 @cute.jit
@@ -1836,6 +2042,155 @@ def handle_block_sparse_empty_tile_correction_sm100(
 
 
 @cute.jit
+def softmax_arbitrary_forward_sm100(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx: Int32,
+    head_idx: Int32,
+    m_block: Int32,
+    seqlen_info: SeqlenInfoQK,
+    softmax_step: Callable,
+    mma_si_consumer_phase: Int32,
+    si_corr_producer_phase: Int32,
+    s0_s1_sequence_phase: Int32,
+    sm_stats_barrier: cutlass.pipeline.NamedBarrier,
+    stage_idx: Int32,
+    payload_subtile_idx: Int32,
+    payload_group_idx: Int32,
+    sparse_tile_m: cutlass.Constexpr[int],
+    qhead_per_kvhead: cutlass.Constexpr[int],
+    payload_words: cutlass.Constexpr[int],
+):
+    """Consume one compact Q2K row with a TMEM-native mask payload."""
+
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+    (
+        partial_count,
+        partial_indices,
+        full_count,
+        full_indices,
+        payload_base,
+    ) = get_curr_arbitrary_blocksparse_tensors(
+        batch_idx,
+        head_idx,
+        m_block,
+        blocksparse_tensors,
+        seqlen_info,
+        sparse_tile_m,
+        qhead_per_kvhead,
+    )
+    total_count = partial_count + full_count
+    mask_payloads = blocksparse_tensors.mask_block_masks
+    assert mask_payloads is not None
+
+    if total_count == 0:
+        sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
+    else:
+        if partial_count > 0:
+            partial_ordinal = partial_count - Int32(1)
+            n_block = partial_indices[partial_ordinal]
+            payload_idx = payload_base + partial_ordinal
+            # This global-to-register load intentionally precedes the score
+            # pipeline wait inside softmax_step.  The four words remain live
+            # while QK completes, then mask the score after score_mod.
+            r_bitmask = load_mask_payload(
+                mask_payloads,
+                payload_idx,
+                payload_group_idx,
+                subtile_idx=payload_subtile_idx,
+                payload_words=payload_words,
+            )
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_step(
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                n_block,
+                is_first=True,
+                mask_fn=partial(
+                    apply_loaded_arbitrary_forward_mask,
+                    r_bitmask=r_bitmask,
+                ),
+            )
+            for offset in cutlass.range(1, partial_count, unroll=1):
+                partial_ordinal = partial_count - Int32(1) - offset
+                n_block = partial_indices[partial_ordinal]
+                payload_idx = payload_base + partial_ordinal
+                r_bitmask = load_mask_payload(
+                    mask_payloads,
+                    payload_idx,
+                    payload_group_idx,
+                    subtile_idx=payload_subtile_idx,
+                    payload_words=payload_words,
+                )
+                (
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                ) = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                    n_block,
+                    mask_fn=partial(
+                        apply_loaded_arbitrary_forward_mask,
+                        r_bitmask=r_bitmask,
+                    ),
+                )
+
+        if full_count > 0:
+            full_ordinal = full_count - Int32(1)
+            n_block = full_indices[full_ordinal]
+            if partial_count == 0:
+                (
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                ) = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                    n_block,
+                    is_first=True,
+                    mask_fn=None,
+                )
+            else:
+                (
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                ) = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                    n_block,
+                    mask_fn=None,
+                )
+            for offset in cutlass.range(1, full_count, unroll=1):
+                n_block = full_indices[full_count - Int32(1) - offset]
+                (
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                ) = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                    n_block,
+                    mask_fn=None,
+                )
+
+    return (
+        mma_si_consumer_phase,
+        si_corr_producer_phase,
+        s0_s1_sequence_phase,
+        total_count == 0,
+    )
+
+
+@cute.jit
 def softmax_block_sparse_sm100(
     blocksparse_tensors: BlockSparseTensors,
     batch_idx,
@@ -1855,7 +2210,6 @@ def softmax_block_sparse_sm100(
     q_stage: cutlass.Constexpr,
     stage_idx: Int32,
     check_m_boundary: bool,
-    is_arbitrary: cutlass.Constexpr[bool],
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
@@ -1898,7 +2252,7 @@ def softmax_block_sparse_sm100(
                 is_first=True,
                 mask_fn=partial(
                     mask_fn,
-                    mask_seqlen=not is_arbitrary,
+                    mask_seqlen=True,
                     check_q_boundary=check_m_boundary,
                 ),
             )
@@ -1983,7 +2337,6 @@ def softmax_block_sparse_sm100_linear(
     q_stage: cutlass.Constexpr,
     stage_idx: Int32,
     check_m_boundary: bool,
-    is_arbitrary: cutlass.Constexpr[bool],
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
@@ -2026,22 +2379,23 @@ def softmax_block_sparse_sm100_linear(
                     mask_fn=partial(mask_fn, mask_seqlen=False),
                 )
 
-        if curr_full_block_cnt > 0:
-            for i in cutlass.range(0, curr_full_block_cnt):
-                full_n_block = curr_full_block_idx[
-                    curr_full_block_offset + curr_full_block_cnt - 1 - i
-                ]
-                (
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                ) = softmax_step(
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    full_n_block,
-                    mask_fn=None,
-                )
+        if const_expr(curr_full_block_idx is not None):
+            if curr_full_block_cnt > 0:
+                for i in cutlass.range(0, curr_full_block_cnt):
+                    full_n_block = curr_full_block_idx[
+                        curr_full_block_offset + curr_full_block_cnt - 1 - i
+                    ]
+                    (
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        s0_s1_sequence_phase,
+                    ) = softmax_step(
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        s0_s1_sequence_phase,
+                        full_n_block,
+                        mask_fn=None,
+                    )
 
     return (
         mma_si_consumer_phase,
@@ -2076,20 +2430,16 @@ def get_total_q_block_count_bwd(
     n_blocks_per_sample: int = 0,
 ):
     """Count total tile iterations for given n_block (KV tile) in backward."""
-    if const_expr(blocksparse_tensors.mask_block_masks is not None):
-        curr_q_cnt, _, curr_full_cnt, _, _, _ = get_curr_arbitrary_blocksparse_tensors_bwd(
-            batch_idx,
-            head_idx,
-            n_block,
-            blocksparse_tensors,
-            n_blocks_per_sample,
-        )
-    else:
-        curr_q_cnt, _, curr_full_cnt, _ = get_curr_blocksparse_tensors_fixed(
-            batch_idx, head_idx, n_block, blocksparse_tensors
-        )
-    total = curr_q_cnt + curr_full_cnt
-    return total * subtile_factor
+    _, _, _, _, _, _, total = get_block_sparse_iteration_info_bwd(
+        blocksparse_tensors,
+        batch_idx,
+        head_idx,
+        n_block,
+        subtile_factor=subtile_factor,
+        m_block_max=m_block_max,
+        n_blocks_per_sample=n_blocks_per_sample,
+    )
+    return total
 
 
 @cute.jit
@@ -2126,6 +2476,7 @@ def produce_block_sparse_q_loads_bwd_sm100(
     # Subtiling factor and bounds
     subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    n_blocks_per_sample: int = 0,
 ):
     """SM100 backward block sparse loading with subtiling.
 
@@ -2137,9 +2488,17 @@ def produce_block_sparse_q_loads_bwd_sm100(
         curr_q_idx,
         curr_full_cnt,
         curr_full_idx,
+        _,
+        _,
         loop_count,
     ) = get_block_sparse_iteration_info_bwd(
-        blocksparse_tensors, batch_idx, head_idx, n_block, subtile_factor, m_block_max
+        blocksparse_tensors,
+        batch_idx,
+        head_idx,
+        n_block,
+        subtile_factor,
+        m_block_max,
+        n_blocks_per_sample,
     )
 
     split_sparse_blocks = const_expr(curr_full_idx is not None)
@@ -2187,12 +2546,11 @@ def produce_block_sparse_q_loads_bwd_sm100(
                     load_Q(m_block_safe, producer_state=producer_state_Q_LSE)
                     pipeline_Q.producer_commit(producer_state_Q_LSE)
                     pipeline_LSE.producer_acquire(producer_state_Q_LSE)
-                    with cute.arch.elect_one():
-                        copy_stats(
-                            gLSE[None, m_block_safe],
-                            sLSE[None, producer_state_Q_LSE.index],
-                            mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
-                        )
+                    copy_stats(
+                        gLSE[None, m_block_safe],
+                        sLSE[None, producer_state_Q_LSE.index],
+                        mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                    )
                     producer_state_Q_LSE.advance()
                 if const_expr(should_load_dO):
                     pipeline_dO.producer_acquire(
@@ -2202,12 +2560,11 @@ def produce_block_sparse_q_loads_bwd_sm100(
                     load_dO(m_block_safe, producer_state=producer_state_dO_dPsum)
                     pipeline_dO.producer_commit(producer_state_dO_dPsum)
                     pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
-                    with cute.arch.elect_one():
-                        copy_stats(
-                            gdPsum[None, m_block_safe],
-                            sdPsum[None, producer_state_dO_dPsum.index],
-                            mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
-                        )
+                    copy_stats(
+                        gdPsum[None, m_block_safe],
+                        sdPsum[None, producer_state_dO_dPsum.index],
+                        mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                    )
                     producer_state_dO_dPsum.advance()
             else:
                 # Subsequent blocks: just load Q/dO (K/V already loaded)
@@ -2216,24 +2573,22 @@ def produce_block_sparse_q_loads_bwd_sm100(
                     load_Q(m_block_safe, producer_state=producer_state_Q_LSE)
                     pipeline_Q.producer_commit(producer_state_Q_LSE)
                     pipeline_LSE.producer_acquire(producer_state_Q_LSE)
-                    with cute.arch.elect_one():
-                        copy_stats(
-                            gLSE[None, m_block_safe],
-                            sLSE[None, producer_state_Q_LSE.index],
-                            mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
-                        )
+                    copy_stats(
+                        gLSE[None, m_block_safe],
+                        sLSE[None, producer_state_Q_LSE.index],
+                        mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                    )
                     producer_state_Q_LSE.advance()
                 if const_expr(should_load_dO):
                     pipeline_dO.producer_acquire(producer_state_dO_dPsum)
                     load_dO(m_block_safe, producer_state=producer_state_dO_dPsum)
                     pipeline_dO.producer_commit(producer_state_dO_dPsum)
                     pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
-                    with cute.arch.elect_one():
-                        copy_stats(
-                            gdPsum[None, m_block_safe],
-                            sdPsum[None, producer_state_dO_dPsum.index],
-                            mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
-                        )
+                    copy_stats(
+                        gdPsum[None, m_block_safe],
+                        sdPsum[None, producer_state_dO_dPsum.index],
+                        mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                    )
                     producer_state_dO_dPsum.advance()
 
     return producer_state_Q_LSE, producer_state_dO_dPsum
@@ -2247,21 +2602,50 @@ def get_block_sparse_iteration_info_bwd(
     n_block,
     subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    n_blocks_per_sample: int = 0,
 ):
     """Extract block-sparse iteration info for backward pass.
 
-    Returns (curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx, total_count).
+    Returns partial/full counts and indices, their compact payload bases, and
+    the total physical iteration count.  Every SM100 role uses this accessor
+    so fixed and varlen K2Q rows cannot drift between producer and consumers.
     """
-    curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx = get_curr_blocksparse_tensors_fixed(
-        batch_idx, head_idx, n_block, blocksparse_tensors
-    )
+    partial_base = Int32(0)
+    full_base = Int32(0)
+    if const_expr(blocksparse_tensors.mask_block_masks is not None):
+        (
+            curr_q_cnt,
+            curr_q_idx,
+            curr_full_cnt,
+            curr_full_idx,
+            partial_base,
+            full_base,
+        ) = get_curr_arbitrary_blocksparse_tensors_bwd(
+            batch_idx,
+            head_idx,
+            n_block,
+            blocksparse_tensors,
+            n_blocks_per_sample,
+        )
+    else:
+        curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx = get_curr_blocksparse_tensors_fixed(
+            batch_idx, head_idx, n_block, blocksparse_tensors
+        )
 
     sparse_block_count = curr_q_cnt
     if const_expr(curr_full_idx is not None):
         sparse_block_count = sparse_block_count + curr_full_cnt
     total_count = sparse_block_count * subtile_factor
 
-    return curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx, total_count
+    return (
+        curr_q_cnt,
+        curr_q_idx,
+        curr_full_cnt,
+        curr_full_idx,
+        partial_base,
+        full_base,
+        total_count,
+    )
 
 
 @cute.jit
@@ -2270,6 +2654,7 @@ def get_curr_dq_write_order_bwd(
     batch_idx,
     head_idx,
     n_block,
+    n_blocks_per_sample: int = 0,
 ):
     curr_dq_write_order = None
     curr_dq_write_order_full = None
@@ -2278,11 +2663,12 @@ def get_curr_dq_write_order_bwd(
         if const_expr(len(blocksparse_tensors.mask_block_cnt.shape) == 2):
             mask_block_cnt = blocksparse_tensors.mask_block_cnt
             mask_block_offset = blocksparse_tensors.mask_block_offset
-            cu_total_k_blocks = blocksparse_tensors.cu_total_m_blocks
             assert mask_block_offset is not None
-            assert cu_total_k_blocks is not None
             plan_head = Int32(0) if mask_block_cnt.shape[0] == 1 else head_idx
-            outer_row = cu_total_k_blocks[batch_idx] + n_block
+            outer_row = batch_idx * n_blocks_per_sample + n_block
+            cu_total_k_blocks = blocksparse_tensors.cu_total_m_blocks
+            if const_expr(cu_total_k_blocks is not None):
+                outer_row = cu_total_k_blocks[batch_idx] + n_block
             offset_idx = plan_head * mask_block_cnt.shape[1] + outer_row
             curr_dq_write_order = cute.domain_offset(
                 mask_block_offset[offset_idx], blocksparse_tensors.dq_write_order
@@ -2649,7 +3035,7 @@ def consume_block_sparse_mma_bwd_sm90(
             sparse_idx = iter_idx // subtile_factor
             subtile_offset = iter_idx % subtile_factor
             packed_mask_fn = partial(
-                load_packed_mask_payload,
+                load_mask_payload,
                 mask_payloads,
                 mask_payload_base + sparse_idx,
                 consumer_tidx,
@@ -2699,7 +3085,7 @@ def consume_block_sparse_mma_bwd_sm90(
                     m_block = sparse_m_block + subtile_offset
                     if m_block < m_block_max:
                         packed_mask_fn = partial(
-                            load_packed_mask_payload,
+                            load_mask_payload,
                             mask_payloads,
                             mask_payload_base + sparse_idx,
                             consumer_tidx,

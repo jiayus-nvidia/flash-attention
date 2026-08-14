@@ -34,11 +34,12 @@ from flash_attn_cute.tile_scheduler import (
 )
 
 import flash_attn_cute.copy_utils as fa_copy_utils
-from flash_attn_cute.mask import Sm100FusedMask as FusedMask
 from flash_attn_cute.block_sparsity import BlockSparseTensors
 from flash_attn_cute.block_sparse_utils import (
+    apply_loaded_arbitrary_mask,
     get_block_sparse_iteration_info_bwd,
     get_m_block_from_iter_bwd,
+    load_mask_payload,
 )
 
 LAYOUT_RANK_CONSTANT = 3
@@ -98,14 +99,18 @@ def _hd256_bwd_sparse_m_block(
     iter_idx: Int32,
     subtile_factor: cutlass.Constexpr[int],
     m_block_max: Int32,
+    n_blocks_per_sample: Int32,
 ):
-    curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx, _ = get_block_sparse_iteration_info_bwd(
-        block_sparse_tensors,
-        batch_idx,
-        head_idx,
-        n_block,
-        subtile_factor=subtile_factor,
-        m_block_max=m_block_max,
+    curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx, partial_base, _, _ = (
+        get_block_sparse_iteration_info_bwd(
+            block_sparse_tensors,
+            batch_idx,
+            head_idx,
+            n_block,
+            subtile_factor=subtile_factor,
+            m_block_max=m_block_max,
+            n_blocks_per_sample=n_blocks_per_sample,
+        )
     )
     m_block, is_full_block = get_m_block_from_iter_bwd(
         iter_idx,
@@ -117,7 +122,104 @@ def _hd256_bwd_sparse_m_block(
         m_block_max=m_block_max,
     )
     m_block_safe = cutlass.min(m_block, m_block_max - 1)
-    return m_block, m_block_safe, is_full_block
+    coarse_ordinal = iter_idx // subtile_factor
+    q_subtile = iter_idx % subtile_factor
+    is_partial_block = coarse_ordinal < curr_q_cnt
+    payload_idx = partial_base + coarse_ordinal
+    return (
+        m_block,
+        m_block_safe,
+        is_full_block,
+        is_partial_block,
+        payload_idx,
+        q_subtile,
+    )
+
+
+@cute.jit
+def _hd256_bwd_sparse_head_loop_count(
+    block_sparse_tensors: BlockSparseTensors,
+    batch_idx: Int32,
+    head_idx: Int32,
+    n_block: Int32,
+    subtile_factor: cutlass.Constexpr[int],
+    m_block_max: Int32,
+    n_blocks_per_sample: Int32,
+):
+    """Return the physical Q-subtile count for one Q head and K2Q row."""
+
+    return get_block_sparse_iteration_info_bwd(
+        block_sparse_tensors,
+        batch_idx,
+        head_idx,
+        n_block,
+        subtile_factor=subtile_factor,
+        m_block_max=m_block_max,
+        n_blocks_per_sample=n_blocks_per_sample,
+    )[-1]
+
+
+@cute.jit
+def _hd256_bwd_sparse_group_loop_count(
+    block_sparse_tensors: BlockSparseTensors,
+    batch_idx: Int32,
+    kv_head_idx: Int32,
+    n_block: Int32,
+    qhead_per_kvhead: cutlass.Constexpr[int],
+    subtile_factor: cutlass.Constexpr[int],
+    m_block_max: Int32,
+    n_blocks_per_sample: Int32,
+):
+    """Sum the K2Q work owned by every Q head in one KV group."""
+
+    total_count = Int32(0)
+    for qhead_offset in cutlass.range_constexpr(qhead_per_kvhead):
+        head_idx = kv_head_idx * qhead_per_kvhead + qhead_offset
+        total_count += _hd256_bwd_sparse_head_loop_count(
+            block_sparse_tensors,
+            batch_idx,
+            head_idx,
+            n_block,
+            subtile_factor,
+            m_block_max,
+            n_blocks_per_sample,
+        )
+    return total_count
+
+
+@cute.jit
+def _hd256_bwd_sparse_group_work_item(
+    block_sparse_tensors: BlockSparseTensors,
+    batch_idx: Int32,
+    kv_head_idx: Int32,
+    n_block: Int32,
+    group_iter_idx: Int32,
+    qhead_per_kvhead: cutlass.Constexpr[int],
+    subtile_factor: cutlass.Constexpr[int],
+    m_block_max: Int32,
+    n_blocks_per_sample: Int32,
+):
+    """Map a KV-group iteration to its Q head and head-local K2Q ordinal."""
+
+    selected_qhead_offset = Int32(0)
+    selected_iter_idx = Int32(0)
+    prefix_count = Int32(0)
+    for qhead_offset in cutlass.range_constexpr(qhead_per_kvhead):
+        head_idx = kv_head_idx * qhead_per_kvhead + qhead_offset
+        head_count = _hd256_bwd_sparse_head_loop_count(
+            block_sparse_tensors,
+            batch_idx,
+            head_idx,
+            n_block,
+            subtile_factor,
+            m_block_max,
+            n_blocks_per_sample,
+        )
+        if group_iter_idx >= prefix_count and group_iter_idx < prefix_count + head_count:
+            selected_qhead_offset = Int32(qhead_offset)
+            selected_iter_idx = group_iter_idx - prefix_count
+        prefix_count += head_count
+    return selected_qhead_offset, selected_iter_idx
 
 
 def Tmemory_offset(lane, col):
@@ -140,6 +242,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         window_size_right: int | None,
         qhead_per_kvhead: int = 1,
         is_arbitrary: bool = False,
+        mask_payload_valid_words: int = 1,
+        mask_payload_padded_words: int = 1,
         use_clc_scheduler: bool = False,
         subtile_factor: int = 2,
     ):
@@ -194,7 +298,20 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             self.window_size_right = 0
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_arbitrary = is_arbitrary
+        self.mask_payload_valid_words = mask_payload_valid_words
+        self.mask_payload_padded_words = mask_payload_padded_words
         self.subtile_factor = subtile_factor
+        if self.is_arbitrary:
+            assert self.qhead_per_kvhead >= 1
+            assert not self.use_clc_scheduler, (
+                "SM100 hd256 arbitrary dKdV requires STATIC scheduling"
+            )
+            assert self.subtile_factor == 2, (
+                "SM100 hd256 arbitrary dKdV requires two Q128 subtiles per Q256 entry"
+            )
+            assert self.mask_payload_valid_words == 1 and self.mask_payload_padded_words == 1, (
+                "SM100 hd256 arbitrary dKdV payload requires one valid/padded word"
+            )
 
         self.compute_warp_id = (0, 1, 2, 3, 4, 5, 6, 7)
         self.mma_warp_id = 8
@@ -262,20 +379,42 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         scale_softmax: cutlass.Float32,
         aux_tensors: Optional[list],
         block_sparse_tensors: Optional[BlockSparseTensors],
+        max_seqlen_k_runtime: Int32,
         stream: cuda.CUstream,
     ):
         """Host function to launch CuTeDSL kernel."""
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
         self.use_block_sparsity = cutlass.const_expr(block_sparse_tensors is not None)
+        if cutlass.const_expr(self.is_arbitrary):
+            assert cutlass.const_expr(self.use_block_sparsity), (
+                "SM100 hd256 arbitrary dKdV requires a compact K2Q plan"
+            )
         if cutlass.const_expr(self.use_block_sparsity):
             assert block_sparse_tensors is not None
-            assert self.is_arbitrary, "SM100 hd256 backward CSR block sparsity requires arbitrary=True"
-            assert not varlen, "SM100 hd256 backward CSR block sparsity does not support varlen"
+            assert self.is_arbitrary, (
+                "SM100 hd256 backward CSR block sparsity requires arbitrary=True"
+            )
             assert not self.use_clc_scheduler, (
                 "SM100 hd256 backward CSR block sparsity does not support CLC scheduling"
             )
             assert block_sparse_tensors.mask_block_offset is not None, (
                 "SM100 hd256 backward block sparsity only supports linear CSR tensors"
+            )
+            assert (cumulative_s_q is None) == (cumulative_s_k is None), (
+                "SM100 hd256 arbitrary dKdV varlen requires both cu_seqlens tensors"
+            )
+            if cutlass.const_expr(cumulative_s_k is not None):
+                assert block_sparse_tensors.cu_total_m_blocks is not None, (
+                    "SM100 hd256 arbitrary varlen dKdV requires compact K128 row prefixes"
+                )
+            assert len(block_sparse_tensors.mask_block_cnt.shape) == 2, (
+                "SM100 hd256 arbitrary dKdV requires compact rank-2 K2Q counts"
+            )
+            assert block_sparse_tensors.mask_block_masks is not None, (
+                "SM100 hd256 arbitrary dKdV requires mask_block_masks"
+            )
+            assert len(block_sparse_tensors.mask_block_masks.shape) == 4, (
+                "SM100 hd256 arbitrary dKdV payload must be rank 4"
             )
         # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D).
         h_r = Q.shape[3]
@@ -524,7 +663,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
         tiled_mma = dSQ_tiled_mma
         is_k_major = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.K
-        a_major_mode = cute.nvgpu.OperandMajorMode.K if is_k_major else cute.nvgpu.OperandMajorMode.MN
+        a_major_mode = (
+            cute.nvgpu.OperandMajorMode.K if is_k_major else cute.nvgpu.OperandMajorMode.MN
+        )
         tmp = cute.dice(self.dSQ_mma_tiler, (1, None, 1))
         a_smem_shape = tiled_mma.partition_shape_A(
             cute.dice(self.dSQ_mma_tiler, (1, None, 1)),
@@ -770,6 +911,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         # =============================== bwd ===============================
         K_val = problem_shape[1]
+        if cutlass.const_expr(varlen):
+            K_val = max_seqlen_k_runtime
         _, H_K = problem_shape[3][0]
         B = problem_shape[3][1]
         problem_shape_mbh = (
@@ -788,7 +931,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 is_persistent=False,
                 problem_shape_mbh=problem_shape_mbh,
             )
-            bwd_grid = self._compute_bwd_grid(problem_shape, self.cta_tiler[1])
+            grid_problem_shape = (
+                problem_shape[0],
+                K_val,
+                problem_shape[2],
+                problem_shape[3],
+            )
+            bwd_grid = self._compute_bwd_grid(grid_problem_shape, self.cta_tiler[1])
             bwd_grid = cute.round_up(bwd_grid, self.cluster_shape_mnk)
 
         self.dkdv_bwd(
@@ -1591,22 +1740,30 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             if cutlass.const_expr(self.use_block_sparsity):
                 assert block_sparse_tensors is not None
                 n_block_sparse = blk_coord[1] // cute.size(KQ_tiled_mma.thr_id.shape)
-                head_idx_q = bidy * self.qhead_per_kvhead
-                _, _, _, _, sparse_loop_count = get_block_sparse_iteration_info_bwd(
-                    block_sparse_tensors,
-                    bidz,
-                    head_idx_q,
-                    n_block_sparse,
-                    subtile_factor=self.subtile_factor,
-                    m_block_max=m_block_max,
-                )
+                sparse_loop_count = Int32(0)
+                valid_sparse_row = n_block_sparse * self.KQ_mma_tiler[0] < seqlen_k_cur_batch
+                if valid_sparse_row:
+                    sparse_loop_count = _hd256_bwd_sparse_group_loop_count(
+                        block_sparse_tensors,
+                        bidz,
+                        bidy,
+                        n_block_sparse,
+                        self.qhead_per_kvhead,
+                        self.subtile_factor,
+                        m_block_max,
+                        cute.ceil_div(problem_shape[1], self.KQ_mma_tiler[0]),
+                    )
                 iter_start = Int32(0)
                 iter_end = sparse_loop_count
 
             # Cluster wait
             pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
-            iter_count = (iter_end - iter_start) * problem_shape[3][0][0]
+            iter_count = (
+                iter_end - iter_start
+                if cutlass.const_expr(self.use_block_sparsity)
+                else (iter_end - iter_start) * problem_shape[3][0][0]
+            )
             problem_shape_cur_batch = (
                 seqlen_q_cur_batch,
                 seqlen_k_cur_batch,
@@ -1895,6 +2052,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         blk_coord_h_r = Int32(0)
         blk_coord_h = (blk_coord_h_r, blk_coord_h_k)
         iter_index = iter_start
+        sparse_group_iter_idx = Int32(0)
         mma_tile_coord_v = blk_coord_k % cute.size(KQ_tiled_mma.thr_id.shape)
         mma_tile_coord_m = blk_coord_k // cute.size(KQ_tiled_mma.thr_id.shape)
 
@@ -2000,8 +2158,20 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         m_block_for_load = iter_index
         if cutlass.const_expr(self.use_block_sparsity):
             assert block_sparse_tensors is not None
+            blk_coord_h_r, iter_index = _hd256_bwd_sparse_group_work_item(
+                block_sparse_tensors,
+                blk_coord_b,
+                blk_coord_h_k,
+                mma_tile_coord_m,
+                sparse_group_iter_idx,
+                self.qhead_per_kvhead,
+                self.subtile_factor,
+                m_block_max,
+                cute.ceil_div(problem_shape[1], self.KQ_mma_tiler[0]),
+            )
+            blk_coord_h = (blk_coord_h_r, blk_coord_h_k)
             head_idx_q = blk_coord_h_k * self.qhead_per_kvhead + blk_coord_h_r
-            _, m_block_for_load, _ = _hd256_bwd_sparse_m_block(
+            _, m_block_for_load, _, _, _, _ = _hd256_bwd_sparse_m_block(
                 block_sparse_tensors,
                 blk_coord_b,
                 head_idx_q,
@@ -2009,6 +2179,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 iter_index,
                 self.subtile_factor,
                 m_block_max,
+                cute.ceil_div(problem_shape[1], self.KQ_mma_tiler[0]),
             )
 
         q_handle = load_mma_Q_producer.acquire_and_advance()
@@ -2032,11 +2203,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # Warp-coalesced: at each i, lane T accesses index `T + i*W` (stride-1
         # across the warp) instead of `T*N + i` (stride-N across the warp).
         for i in cutlass.range_constexpr(async_copy_num_elts):
-            LSE_idx = (
-                self.tile_shape_Q * m_block_for_load
-                + thread_idx
-                + i * self.threads_per_warp
-            )
+            LSE_idx = self.tile_shape_Q * m_block_for_load + thread_idx + i * self.threads_per_warp
             sLSE_idx = thread_idx + i * self.threads_per_warp
             if cute.elem_less(LSE_idx, problem_shape[0]):
                 cute.copy(
@@ -2069,9 +2236,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sum_OdO_for_copy = cute.flat_divide(sum_OdO, (1,))
         for i in cutlass.range_constexpr(async_copy_num_elts):
             sum_OdO_idx = (
-                self.tile_shape_Q * m_block_for_load
-                + thread_idx
-                + i * self.threads_per_warp
+                self.tile_shape_Q * m_block_for_load + thread_idx + i * self.threads_per_warp
             )
             sSum_OdO_idx = thread_idx + i * self.threads_per_warp
             if cute.elem_less(sum_OdO_idx, problem_shape[0]):
@@ -2101,10 +2266,27 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
 
         iter_count -= 1
-        iter_index += 1
+        if cutlass.const_expr(self.use_block_sparsity):
+            sparse_group_iter_idx += 1
+        else:
+            iter_index += 1
 
         while iter_count > 0:
-            if iter_index == iter_end:
+            if cutlass.const_expr(self.use_block_sparsity):
+                assert block_sparse_tensors is not None
+                blk_coord_h_r, iter_index = _hd256_bwd_sparse_group_work_item(
+                    block_sparse_tensors,
+                    blk_coord_b,
+                    blk_coord_h_k,
+                    mma_tile_coord_m,
+                    sparse_group_iter_idx,
+                    self.qhead_per_kvhead,
+                    self.subtile_factor,
+                    m_block_max,
+                    cute.ceil_div(problem_shape[1], self.KQ_mma_tiler[0]),
+                )
+                blk_coord_h = (blk_coord_h_r, blk_coord_h_k)
+            elif iter_index == iter_end:
                 iter_index = iter_start
                 blk_coord_h_r += 1
                 blk_coord_h = (blk_coord_h_r, blk_coord_h_k)
@@ -2113,7 +2295,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             if cutlass.const_expr(self.use_block_sparsity):
                 assert block_sparse_tensors is not None
                 head_idx_q = blk_coord_h_k * self.qhead_per_kvhead + blk_coord_h_r
-                _, m_block_for_load, _ = _hd256_bwd_sparse_m_block(
+                _, m_block_for_load, _, _, _, _ = _hd256_bwd_sparse_m_block(
                     block_sparse_tensors,
                     blk_coord_b,
                     head_idx_q,
@@ -2121,6 +2303,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     iter_index,
                     self.subtile_factor,
                     m_block_max,
+                    cute.ceil_div(problem_shape[1], self.KQ_mma_tiler[0]),
                 )
 
             q_handle = load_mma_Q_producer.acquire_and_advance()
@@ -2135,7 +2318,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             sLSE_for_copy = cute.flat_divide(sLSE, (1,))
             LSE_for_copy = cute.flat_divide(LSE, (1,))
             for i in cutlass.range_constexpr(async_copy_num_elts):
-                LSE_idx = self.tile_shape_Q * m_block_for_load + thread_idx + i * self.threads_per_warp
+                LSE_idx = (
+                    self.tile_shape_Q * m_block_for_load + thread_idx + i * self.threads_per_warp
+                )
                 sLSE_idx = thread_idx + i * self.threads_per_warp
                 if cute.elem_less(LSE_idx, problem_shape[0]):
                     cute.copy(
@@ -2190,7 +2375,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             )
 
             iter_count -= 1
-            iter_index += 1
+            if cutlass.const_expr(self.use_block_sparsity):
+                sparse_group_iter_idx += 1
+            else:
+                iter_index += 1
 
         if not cutlass.const_expr(self.use_clc_scheduler):
             load_mma_K_producer.tail()
@@ -2634,6 +2822,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         iter_index = iter_start
         blk_coord_h_r = Int32(0)
+        sparse_group_iter_idx = Int32(0)
 
         # adi: TMEM_ST, TMEM_DPT
         tmem_load_op = tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16))
@@ -2675,11 +2864,31 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         while iter_count > 0:
             m_block = iter_index
-            is_full_block = False
+            is_partial_block = False
+            payload_idx = Int32(0)
+            q_subtile = Int32(0)
             if cutlass.const_expr(self.use_block_sparsity):
                 assert block_sparse_tensors is not None
+                blk_coord_h_r, iter_index = _hd256_bwd_sparse_group_work_item(
+                    block_sparse_tensors,
+                    blk_coord[3][1],
+                    blk_coord[3][0][1],
+                    blk_coord_k // 2,
+                    sparse_group_iter_idx,
+                    self.qhead_per_kvhead,
+                    self.subtile_factor,
+                    m_block_max,
+                    cute.ceil_div(problem_shape[1], self.KQ_mma_tiler[0]),
+                )
                 head_idx_q = blk_coord[3][0][1] * self.qhead_per_kvhead + blk_coord_h_r
-                m_block, _, is_full_block = _hd256_bwd_sparse_m_block(
+                (
+                    m_block,
+                    _,
+                    _,
+                    is_partial_block,
+                    payload_idx,
+                    q_subtile,
+                ) = _hd256_bwd_sparse_m_block(
                     block_sparse_tensors,
                     blk_coord[3][1],
                     head_idx_q,
@@ -2687,6 +2896,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     iter_index,
                     self.subtile_factor,
                     m_block_max,
+                    cute.ceil_div(problem_shape[1], self.KQ_mma_tiler[0]),
                 )
             s_handle = mma_compute_S_consumer.wait_and_advance()
             p_handle = compute_mma_P_producer.acquire_and_advance()
@@ -2724,10 +2934,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             apply_arbitrary_mask = False
             if cutlass.const_expr(self.is_arbitrary):
-                if cutlass.const_expr(self.use_block_sparsity):
-                    apply_arbitrary_mask = not is_full_block
-                else:
-                    apply_arbitrary_mask = True
+                apply_arbitrary_mask = is_partial_block
 
             # For causal, every tile may contain (q,k) with k > q; we must apply per-element mask for all Q tiles.
             is_masked_tile = (
@@ -2742,8 +2949,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cute.copy(tiled_t2r, tTR_tST, tTR_rST)
 
             if is_masked_tile:
-                batch_coord = blk_coord[3][1]
-                head_coord = blk_coord[3][0][1] * self.qhead_per_kvhead + blk_coord_h_r
                 for i in cutlass.range(cute.size(tTR_rST), unroll_full=True):
                     c_transpose = tTR_cST[i]
                     pos = (
@@ -2773,16 +2978,25 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         tTR_rST[i] = -cutlass.Float32.inf
                 if cutlass.const_expr(self.is_arbitrary):
                     if apply_arbitrary_mask:
-                        FusedMask.apply_arbitrary_mask(
+                        assert block_sparse_tensors is not None
+                        assert block_sparse_tensors.mask_block_masks is not None
+                        assert cutlass.const_expr(
+                            cute.size(tTR_rST) == self.mask_payload_valid_words * 32
+                        ), "SM100 hd256 arbitrary dKdV payload does not cover the score fragment"
+                        payload_subtile_idx = q_subtile * 2 + blk_coord_k % 2
+                        payload_group_idx = wg_idx * 128 + dp_idx
+                        r_bitmask = load_mask_payload(
+                            block_sparse_tensors.mask_block_masks,
+                            payload_idx,
+                            payload_group_idx,
+                            subtile_idx=payload_subtile_idx,
+                            payload_words=self.mask_payload_padded_words,
+                        )
+                        apply_loaded_arbitrary_mask(
                             tTR_rST,
-                            tTR_cST,
-                            batch_coord,
-                            head_coord,
-                            aux_tensors,
-                            index_transform=lambda index_k, index_q: (
-                                index_q + m_block * self.tile_shape_Q,
-                                index_k + blk_coord_k * self.tile_shape_K,
-                            ),
+                            m_block,
+                            r_bitmask,
+                            self.mask_payload_valid_words,
                         )
 
             log2_e = cutlass.Float32(math.log2(math.e))
@@ -2890,10 +3104,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             sum_odo_handle.release()
 
             iter_count -= 1
-            iter_index += 1
-            if iter_index == iter_end:
-                iter_index = iter_start
-                blk_coord_h_r += 1
+            if cutlass.const_expr(self.use_block_sparsity):
+                sparse_group_iter_idx += 1
+            else:
+                iter_index += 1
+                if iter_index == iter_end:
+                    iter_index = iter_start
+                    blk_coord_h_r += 1
 
         # Epilogue
         mma_compute_dKdV_consumer = self.epilogue(

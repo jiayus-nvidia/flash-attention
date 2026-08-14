@@ -101,14 +101,44 @@ def to_cute_aux_tensor(t, enable_tvm_ffi=True):
 
 
 def get_aux_tensor_metadata(aux_tensors):
+    """Return every aux-tensor property that remains static in CuTe lowering."""
+
     return tuple(
         (
-            getattr(t, "__assumed_align__", 0),
-            getattr(t, "__leading_dim__", -1),
+            t.dtype,
+            t.ndim,
+            get_broadcast_dims(t),
+            getattr(t, "__assumed_align__", None),
+            getattr(t, "__leading_dim__", None),
             hasattr(t, "__leading_dim__"),
+            _get_implicit_leading_dim(t),
         )
         for t in aux_tensors
     )
+
+
+def _get_implicit_leading_dim(tensor: torch.Tensor):
+    """Mirror the unit-stride axis inferred by ``mark_layout_dynamic()``.
+
+    CuTe keeps this axis static even when the caller does not set
+    ``__leading_dim__``.  It therefore belongs in the JIT cache key.  An
+    explicit non-None leading dimension bypasses inference and is already
+    recorded separately by :func:`get_aux_tensor_metadata`.
+    """
+
+    if getattr(tensor, "__leading_dim__", None) is not None:
+        return None
+    unit_stride_dims = tuple(idx for idx, stride in enumerate(tensor.stride()) if stride == 1)
+    if len(unit_stride_dims) == 1:
+        return unit_stride_dims[0]
+    if len(unit_stride_dims) > 1:
+        nontrivial_dims = tuple(idx for idx in unit_stride_dims if tensor.shape[idx] > 1)
+        if len(nontrivial_dims) == 1:
+            return nontrivial_dims[0]
+        # CuTe will reject this ambiguous layout.  Preserve enough information
+        # to keep the metadata conservative until that validation runs.
+        return ("ambiguous", unit_stride_dims, nontrivial_dims)
+    return None
 
 
 def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:

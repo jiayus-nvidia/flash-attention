@@ -6,7 +6,10 @@ from typing import Callable, NamedTuple, Tuple
 
 import cutlass.cute as cute
 import torch
-
+from flash_attn_cute.arbitrary_plan import (
+    ArbitraryPlanSignature,
+    ArbitraryTopologyTensors,
+)
 from flash_attn_cute.cute_dsl_utils import get_broadcast_dims, to_cute_tensor
 from flash_attn_cute.testing import is_fake_mode
 
@@ -56,6 +59,13 @@ class BlockSparseTensorsTorch(NamedTuple):
     mask_block_masks: torch.Tensor | None = None
     pack_gqa: bool | None = None
     bwd_tensors: "BlockSparseTensorsTorch | None" = None
+    plan_signature: ArbitraryPlanSignature | None = None
+    topology_tensors: ArbitraryTopologyTensors | None = None
+    # Dedicated SM100/SM103 hd256 backward has two independent score
+    # consumers.  ``dq_tensors`` carries the Q-major dQ payload while
+    # ``bwd_tensors`` carries the K-major dKdV payload.  Keep this optional
+    # field at the end so existing positional construction remains valid.
+    dq_tensors: "BlockSparseTensorsTorch | None" = None
 
 
 class LinearBlockSparseTensors(NamedTuple):
@@ -824,6 +834,9 @@ def normalize_block_sparse_tensors(
         mask_block_masks=tensors.mask_block_masks,
         pack_gqa=tensors.pack_gqa,
         bwd_tensors=tensors.bwd_tensors,
+        plan_signature=tensors.plan_signature,
+        topology_tensors=tensors.topology_tensors,
+        dq_tensors=tensors.dq_tensors,
     )
 
 
@@ -900,6 +913,9 @@ def normalize_linear_block_sparse_tensors(
         mask_block_masks=getattr(tensors, "mask_block_masks", None),
         pack_gqa=getattr(tensors, "pack_gqa", None),
         bwd_tensors=getattr(tensors, "bwd_tensors", None),
+        plan_signature=getattr(tensors, "plan_signature", None),
+        topology_tensors=getattr(tensors, "topology_tensors", None),
+        dq_tensors=getattr(tensors, "dq_tensors", None),
     )
 
 
@@ -912,6 +928,7 @@ def normalize_arbitrary_block_sparse_config(
     is_varlen: bool,
     block_size: tuple[int, int],
     pack_gqa: bool,
+    physical_subtiles: int,
     num_mask_payload_groups: int,
     payload_padded_words: int,
     expected_fixed_total_m_blocks: int | None = None,
@@ -923,6 +940,8 @@ def normalize_arbitrary_block_sparse_config(
             "arbitrary attention requires BlockSparseTensorsTorch returned by "
             "create_arbitrary_block_sparse_tensors"
         )
+    if type(physical_subtiles) is not int or physical_subtiles <= 0:
+        raise ValueError("physical_subtiles must be a positive int")
     if tensors.block_size != block_size:
         raise ValueError(
             f"arbitrary plan block_size={tensors.block_size} does not match "
@@ -978,7 +997,7 @@ def normalize_arbitrary_block_sparse_config(
 
     expected_payload_shape = (
         tensors.mask_block_idx.numel(),
-        1,
+        physical_subtiles,
         num_mask_payload_groups,
         payload_padded_words,
     )
@@ -1030,6 +1049,7 @@ def normalize_arbitrary_block_sparse_config_bwd(
     expected_hmask: int | None = None,
     expected_spt: bool = False,
     expected_fixed_total_n_blocks: int | None = None,
+    require_dq_write_order: bool = True,
 ) -> BlockSparseTensorsTorch:
     """Validate the compact arbitrary K2Q plan without synchronizing the device."""
 
@@ -1055,10 +1075,15 @@ def normalize_arbitrary_block_sparse_config_bwd(
         "full_block_cnt": (tensors.full_block_cnt, torch.int32, 2),
         "full_block_offset": (tensors.full_block_offset, torch.int32, 1),
         "full_block_idx": (tensors.full_block_idx, torch.int32, 1),
-        "dq_write_order": (tensors.dq_write_order, torch.int32, 1),
-        "dq_write_order_full": (tensors.dq_write_order_full, torch.int32, 1),
         "mask_block_masks": (tensors.mask_block_masks, torch.uint32, 4),
     }
+    if require_dq_write_order:
+        required.update(
+            {
+                "dq_write_order": (tensors.dq_write_order, torch.int32, 1),
+                "dq_write_order_full": (tensors.dq_write_order_full, torch.int32, 1),
+            }
+        )
     for name, (tensor, dtype, ndim) in required.items():
         if tensor is None:
             raise ValueError(f"arbitrary backward plan requires {name}")
@@ -1098,10 +1123,13 @@ def normalize_arbitrary_block_sparse_config_bwd(
         raise ValueError("mask_block_offset must have Hmask * total_n_blocks + 1 elements")
     if tensors.full_block_offset.numel() != num_plan_rows + 1:
         raise ValueError("full_block_offset must have Hmask * total_n_blocks + 1 elements")
-    if tensors.dq_write_order.shape != tensors.mask_block_idx.shape:
-        raise ValueError("dq_write_order must be parallel to mask_block_idx")
-    if tensors.dq_write_order_full.shape != tensors.full_block_idx.shape:
-        raise ValueError("dq_write_order_full must be parallel to full_block_idx")
+    if require_dq_write_order:
+        if tensors.dq_write_order.shape != tensors.mask_block_idx.shape:
+            raise ValueError("dq_write_order must be parallel to mask_block_idx")
+        if tensors.dq_write_order_full.shape != tensors.full_block_idx.shape:
+            raise ValueError("dq_write_order_full must be parallel to full_block_idx")
+    elif tensors.dq_write_order is not None or tensors.dq_write_order_full is not None:
+        raise ValueError("this arbitrary backward consumer requires dq_write_order=None")
 
     expected_payload_shape = (
         tensors.mask_block_idx.numel(),
@@ -1133,10 +1161,14 @@ def normalize_arbitrary_block_sparse_config_bwd(
         raise ValueError("fixed arbitrary backward plan must not provide cu_total_m_blocks")
     if tensors.cu_block_idx_offsets is not None:
         raise ValueError("arbitrary backward plan requires cu_block_idx_offsets=None")
-    if tensors.spt is None or tensors.spt != expected_spt:
-        raise ValueError(
-            f"arbitrary backward plan spt={tensors.spt} does not match consumer spt={expected_spt}"
-        )
+    if require_dq_write_order:
+        if tensors.spt is None or tensors.spt != expected_spt:
+            raise ValueError(
+                f"arbitrary backward plan spt={tensors.spt} does not match "
+                f"consumer spt={expected_spt}"
+            )
+    elif tensors.spt is not None:
+        raise ValueError("this arbitrary backward consumer requires spt=None")
     return tensors
 
 
