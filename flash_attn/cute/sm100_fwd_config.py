@@ -235,13 +235,23 @@ def make_sm100_fwd_tiled_mma_qk(
 
 
 @cute.jit
-def make_sm100_fwd_tmem_load(tSAcc: cute.Tensor, tidx: cutlass.Int32):
-    """Build the exact score TMEM-to-register copy used by softmax."""
+def make_sm100_fwd_tmem_load(
+    tSAcc: cute.Tensor,
+    tidx: cutlass.Int32,
+    use_ldred: cutlass.Constexpr[bool] = False,
+):
+    """Build the score TMEM-to-register copy used by softmax.
 
-    tmem_load_atom = cute.make_copy_atom(
-        tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
-        Float32,
+    The plan materializer keeps the default load because ``ld.red`` preserves
+    the score fragment layout and only adds a reduction side output.
+    """
+
+    tmem_load_op = (
+        tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(32))
+        if cutlass.const_expr(use_ldred)
+        else tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
     )
+    tmem_load_atom = cute.make_copy_atom(tmem_load_op, Float32)
     return tcgen05.make_tmem_copy(tmem_load_atom, tSAcc).get_slice(tidx)
 
 
