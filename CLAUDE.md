@@ -1,136 +1,173 @@
-# CLAUDE.md
+# Flex Attention
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## 协作前置条件
 
-## Project Overview
+在实施前，必须明确需求、方案和目标。存在任何不清楚或歧义时，不得开始行动，
+必须先向用户确认清楚。
 
-FFA_FA4 is the MagiAttention-specific FlashAttention-4 backend written in Python using CuTeDSL (NVIDIA CUTLASS DSL). Kernels are compiled to PTX/CUBIN at runtime. Targets Hopper (SM90) and Blackwell (SM100/SM110) GPUs. Package name: `flash-attn-cute`.
+## 算法约束
 
-The repository also contains older generations (FA2 in top-level `csrc/`, FA3 in `hopper/`) but active development is on FFA_FA4 in `flash_attn/cute/`, exposed through the `flash_attn_cute` Python namespace.
+- **变长不可走定长 fast path**：varlen 场景禁止复用 fixed-length fast path；
+  varlen benchmark 必须使用真实变长代码路径，不得用定长代码近似。
 
-## Agent Scratch Space
+## 编码规范
 
-Use `agent_space/` for project-local scratch work such as lab notes, profiling outputs, temporary repro scripts, and experiment artifacts. Treat it as disposable workspace rather than product code.
+- **张量前缀**：`m*`（GMEM）、`g*`（GMEM tile）、`s*`（SMEM）、
+  `t*`（线程视图）、`acc_*`（累加器）。
+- **命名规范**：遵循 FlashAttention CuTe DSL（FA/FA4）风格；变量和函数优先使用
+  描述性 `snake_case`，类使用 PascalCase，架构后缀使用 `Sm100` 等清晰命名。
+- **Kernel 类结构**：`__init__`（host 配置）→ `@cute.jit __call__`（launch）→
+  `@cute.kernel`（设备主体）。
+- **代码格式**：注释使用英文，代码使用 4 空格缩进；类型标注使用
+  `cute.Tensor`、`Optional[cute.Tensor]`、`cutlass.Constexpr[...]`。
+- **导入顺序**：`cutlass` → `cutlass.cute as cute` → `cutlass.cute.nvgpu` → `cuda.bindings`
 
-## Build & Install
+FA4 风格参考：
 
-```bash
-pip install flash-attn-cute
-# or dev install:
-pip install -e "flash_attn/cute[dev]"
-```
+- `/home/scratch.cjerry_sw/ref4agent/attention/flash-attention/flash_attn/cute/flash_fwd_sm100.py`
+- `/home/scratch.cjerry_sw/ref4agent/attention/flash-attention/flash_attn/cute/flash_fwd_sm100.py`
+- `/home/scratch.cjerry_sw/ref4agent/attention/flash-attention/flash_attn/cute/flash_bwd_sm100.py`
+- `/home/scratch.cjerry_sw/ref4agent/attention/flash-attention/flash_attn/cute/interface.py`
 
-Dependencies: `nvidia-cutlass-dsl>=4.4.2`, `torch`, `einops`, `apache-tvm-ffi`, `quack-kernels>=0.4.0`.
+## 计算精度规范
 
-## Running Tests
+- **Tensor Core GEMM**：accumulator 必须为 FP32。
+- **CUDA Core 计算**：乘加及 `sin`、`cos`、`tan`、`ex2` 等特殊函数必须在
+  FP32 上执行；禁止在 CUDA Core 上用 FP16/BF16 做算术或 transcendental 计算。
+- **数据流精度**：GMEM/SMEM 中的数据可以是 BF16/FP16 或更低精度量化格式；
+  允许先转换为 FP32，再在 CUDA Core 上执行 FP32 计算。该“低精度存储 + FP32
+  计算”路径合规。
+- **输出精度**：按各路径既有约定（如 O 为 MXFP8）在 FP32 计算完成后显式
+  downcast；不得在累加或归约阶段提前截断到低精度。
+- **非确定性累加**：只要数学语义、数据类型和 FP32 累加精度不变，
+  online-softmax、reduce、atomic、NVLS/AllReduce 等路径因并行调度或输入处理
+  顺序不同而改变 FP32 累加顺序，不属于精度问题。正确性测试不要求确定性累加
+  顺序或 bitwise-identical 输出，不得仅因合法的累加顺序变化判定为 bug。
 
-```bash
-pytest tests/cute/test_flash_attn.py
-pytest tests/cute/test_flash_attn.py -k "test_flash_attn_output" -x  # single test
-pytest tests/cute/test_flash_attn_varlen.py
-pytest tests/cute/test_mask_mod.py
-pytest tests/cute/test_score_mod.py
-pytest tests/cute/test_block_sparsity.py
-```
+## 验证流程
 
-### Fast two-pass testing
+1. 修改 kernel 后，**先运行对应单元测试**。
+2. 确认**全部用例 PASS** 后再 commit。
+3. 若修改共享组件，必须运行全部测试。
+4. 新增功能必须有测试覆盖；优先扩展已有测试函数，无必要不要新增测试函数。
+5. 完成 code clean：
+   - 不保留 debug 代码或冗余分支。
+   - 正确性和性能不得回退。
+   - 完成编码规范审查；变量命名、函数命名、warp-specialization 写法和 interface
+     接口写法必须与 FA/FA4 风格保持一致。
+   - compile key 只包含影响 codegen 的静态配置，不得包含 batch size、
+     `total_q`、`total_kv`、`max_seqlen_q`、`max_seqlen_kv` 或具体
+     `cu_seqlens` 值等运行时变量。
+   - 尽可能使用 CuTe DSL 已有封装以及 tiled/cute copy；TopK indices、LSE、
+     `cu_seqlens` 等 metadata tensor 可以不使用 tiled/cute copy。
 
-Compilation dominates test time. The fast workflow separates compilation (parallel, no GPU needed) from execution (uses cached binaries):
+## 开发测试规范
 
-```bash
-# Pass 1: compile all kernels in parallel using FakeTensorMode (no GPU memory allocation)
-FLASH_ATTENTION_FAKE_TENSOR=1 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -n 64 -x tests/cute/test_flash_attn.py
+- **编译计时**：每次 `cute.compile(...)` 后必须打印编译耗时，区分编译慢和 kernel 死锁：
 
-# Pass 2: run tests using cached compiled kernels
-FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -x tests/cute/test_flash_attn.py
-```
+  ```python
+  import time
 
-- `FLASH_ATTENTION_FAKE_TENSOR=1` — uses PyTorch FakeTensorMode to compile kernels without allocating GPU memory or running them.
-- `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1` — enables persistent disk cache at `/tmp/${USER}/flash_attention_cute_dsl_cache/`.
-- `-n 256` — pytest-xdist parallel workers (only useful in the compilation pass).
+  t0 = time.time()
+  compiled = cute.compile(demo, ...)
+  print(f"Compiled in {time.time() - t0:.1f}s")
+  compiled(...)  # If this times out, treat it as a deadlock.
+  ```
 
-Tests are parametrized over dtype (fp16/bf16), head dimension (64, 96, 128), sequence length, causal/non-causal, and MHA/GQA/MQA.
+- **超时 30s = 死锁**：kernel 运行超过 30s 认定为死锁，不是编译慢（编译通常 < 10s）
+- **提交前删除 `printf`**：kernel/device 侧 `printf` 及临时调试输出仅允许用于
+  本地开发和 debug，commit 前必须全部删除。用于记录 `cute.compile(...)` 耗时的
+  host 侧 `print(...)` 必须保留。
 
-If you get OOM errors running tests or benchmarks, use `nvidia-smi` to find a free GPU and select it with `CUDA_VISIBLE_DEVICES=<id>`.
+## 文件组织规范
 
-## Linting
+- **统一 agent 工作目录**：agent 创建的临时测试、benchmark、profile、分析脚本、
+  日志、JSON/CSV 汇总和 NCU/NSYS 报告均放在
+  `/home/scratch.cjerry_sw/Framework/Keling/sparse_attn-sparse_attention/agent/`，
+  不得散落在仓库顶层或源码目录。
+- **Git 跟踪规则**：整个 `agent/` 目录仅用于本地 agent 工作，不得被 Git 跟踪或提交。
+- **测试文件**：`/home/scratch.cjerry_sw/Framework/Keling/sparse_attn-sparse_attention/agent/tests`
+- **Benchmark 文件**：`/home/scratch.cjerry_sw/Framework/Keling/sparse_attn-sparse_attention/agent/agent_benchmark`
+- **Profile 文件**：`/home/scratch.cjerry_sw/Framework/Keling/sparse_attn-sparse_attention/agent/profile`
+- **记忆总结目录**：`/home/scratch.cjerry_sw/Framework/Keling/sparse_attn-sparse_attention/agent/memory`
 
-Pre-commit uses ruff on `flash_attn/cute/` files. Large kernel files (`flash_bwd.py`, `flash_fwd.py`, `flash_fwd_sm100.py`, `interface.py`) are excluded from auto-formatting.
+## 性能优化 Skill
 
-```bash
-ruff check flash_attn/cute/ --fix
-ruff format flash_attn/cute/
-```
+- **Codex Skill 根目录**：`/home/cjerry/.codex/skills`
+  - 更新 `ref4agent` 或 DKG 后，运行：
+    `bash /home/cjerry/.codex/sync-kernel-skills.sh`
+  - 若 Codex 目录缺失某个 skill，再回退到
+    `/home/scratch.cjerry_sw/ref4agent` 下的 canonical 源路径读取对应
+    `SKILL.md`。
+- **架构设计**：`/home/cjerry/.codex/skills/design-cutedsl/SKILL.md`
+- **现有 kernel 理解**：`/home/cjerry/.codex/skills/ask-cutedsl/SKILL.md`
+- **实现与更新**：
+  `/home/cjerry/.codex/skills/generate-cutedsl/SKILL.md`、
+  `/home/cjerry/.codex/skills/update-cutedsl/SKILL.md`
+- **源码级性能优化**：
+  `/home/cjerry/.codex/skills/optimize-cutedsl/SKILL.md`
+- **pipeline timeline 分析**：
+  `/home/cjerry/.codex/skills/iket-cutedsl/SKILL.md`
+- **寄存器 spill 诊断**：
+  `/home/cjerry/.codex/skills/diagnose-register-spilling/SKILL.md`
+- 不得直接调用 `cutlass-ir/cudeepy`；由上述 action skill 按需加载。
+- **KAT**：`/home/cjerry/.codex/skills/kat/SKILL.md`，用于 kernel 自动调优、
+  PIC/perf 分析和优化循环。
+- **kernel-optimization-agent**：
+  `/home/cjerry/.codex/skills/sass-optimize/SKILL.md`，用于 SASS 级分析、
+  patch、校验和测速。
+- **ncu-report-skill**：
+  `/home/cjerry/.codex/skills/ncu-report-skill/SKILL.md`，用于 Nsight Compute
+  profile、指标解析和性能报告。
 
-## Code Architecture
+## 性能调优 Reference
 
-### Public API (`flash_attn/cute/interface.py`)
+- **MiniMax MSA forward**：
+  `/home/scratch.cjerry_sw/MiniMax-infer/agent/worktrees/msa_v2/msa_v2/attention/fwd/atten_fwd.py`
+- **BSA SM100 blk64 CuTe DSL**：
+  `/home/scratch.cjerry_sw/BSA/csrc/fwd/sm100_blk64/cutedsl`
+- **FlashAttention CuTe DSL（FA/FA4）**：作为命名、softmax、mask、scheduler、
+  TMA/UMMA 和 warp specialization 的主要参考；重点阅读：
+  - `/home/scratch.cjerry_sw/ref4agent/attention/flash-attention/flash_attn/cute/flash_fwd_sm100.py`
+  - `/home/scratch.cjerry_sw/ref4agent/attention/flash-attention/flash_attn/cute/flash_bwd_sm100.py`
+- **FlashMLA DSA sparse forward head64**：
+  `/home/scratch.cjerry_sw/ref4agent/attention/FlashMLA/csrc/sm100/prefill/sparse/fwd/head64`
 
-Two entry points exported from `flash_attn/cute/__init__.py`:
-- `flash_attn_func(q, k, v, ...)` — standard attention
-- `flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)` — variable-length
+参考实现与本项目方法差异较大，只提取局部优化思路并通过实测验证。
 
-Key parameters: `causal`, `window_size_left/right`, `softmax_scale`, `softcap`, `score_mod`, `mask_mod`, `block_sparse_tensors`, `num_splits`, `pack_gqa`, `m_block_size`, `n_block_size`, `num_threads`.
+## 性能优化记录规范
 
-Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-byte aligned.
+- 进行性能优化时，必须记录每一项优化对性能的影响，不得只记录最终结果。
+- 所有候选必须使用统一初始版本作为基线，同时记录相对初始基线的累计提升和
+  相对上一有效版本的增量提升。
+- 每项优化记录：原因、具体改动、benchmark case、测试环境、优化前后 runtime、
+  TFLOPS、cycles，以及提升或下降百分比。
+- 未采用或正确性失败的候选也要记录，并注明拒绝原因。功耗、频率或测量窗口
+  不一致时必须单独说明，不得直接比较不同口径的数据。
+- 多项优化不得捆绑后只报告整体提升；若必须同时修改，补充逐项 ablation
+  benchmark，确保收益可以独立归因。
 
-### Forward Kernels
+## 性能分析规范
 
-- `flash_fwd.py` — `FlashAttentionForwardSm90`: Hopper forward. No SplitKV or paged KV.
-- `flash_fwd_sm100.py` — `FlashAttentionForwardSm100`: Blackwell forward. Full features including SplitKV, paged KV cache, persistent kernels, 2CTA instructions.
-- `flash_fwd_combine.py` — `FlashAttentionForwardCombine`: merges SplitKV partial results.
+### NCU 性能指标
+- NCU的路径，请注意 arch 的路径: `/home/scratch.cjerry_sw/tools`
+- 优化判断以 `gpu__cycles_elapsed.avg` 为主。
+- 同时输出并关注 Tensor Core SOL / TC active。
+- 使用 ncu report skill：
+  `/home/cjerry/.codex/skills/ncu-report-skill/SKILL.md`。
 
-### Backward Kernels
+### 优化检查项
 
-- `flash_bwd.py` — `FlashAttentionBackwardSm80`: Ampere backward (base).
-- `flash_bwd_sm90.py` — `FlashAttentionBackwardSm90`: Hopper backward.
-- `flash_bwd_sm100.py` — `FlashAttentionBackwardSm100`: Blackwell backward with 2CTA and block sparse support.
-- `flash_bwd_preprocess.py` / `flash_bwd_postprocess.py` — auxiliary backward kernels.
+- 不应出现 scalar load/store，以及 `STS`、`LDS`、`STG`、`LDG.16` 等指令；
+  尽可能使用 tiled copy 和 cute copy。
+- 允许少量编译器产生的寄存器 spill 及对应 `LDL`/`STL`，但必须量化并通过
+  benchmark 证明没有性能回退；禁止 stack object、local array 或动态 stack
+  allocation。
+- 不应出现非合并访存。
+- 不应出现大量共享内存冲突。
+- pipeline 编排必须合理，尽可能隐藏 load、softmax、`atomicAdd` 延迟。
 
-### Core Abstractions
+### Runtime TFLOPS 口径
 
-- `softmax.py` — Online softmax with row_max/row_sum tracking, score modifier support.
-- `mask.py` — `AttentionMask`: causal, local/sliding window, block sparse, mask_mod application.
-- `block_info.py` — `BlockInfo`: tile dimensions, n/m block range computation for causal/local masking.
-- `seqlen_info.py` — `SeqlenInfoQK`: sequence length and offset tracking for varlen.
-- `pipeline.py` — `PipelineStateSimple`: circular buffer index/phase management for pipelined loads.
-- `tile_scheduler.py` — Tile scheduling strategies (single tile, varlen-aware, persistent).
-- `copy_utils.py` — Type-converting copies, shared-to-register loads, TMA copy atoms.
-- `named_barrier.py` — Named barrier enums for warp synchronization.
-
-### Architecture-Specific Helpers
-
-- `hopper_helpers.py` — SM90 warp-group GEMM, shared memory layout creation, fence/commit/wait.
-- `blackwell_helpers.py` — SM100 UMMA-based GEMM, PTX-optimized paths, 2CTA support.
-- `mma_sm100_desc.py` — Hardware MMA descriptor enums (formats, saturation, scaling).
-
-### Other Components
-
-- `pack_gqa.py` — Packs multiple Q heads per KV head for efficient GQA.
-- `paged_kv.py` — `PagedKVManager`: paged KV cache with TMA support.
-- `fast_math.py` — exp2 polynomial coefficients, softcap score_mod creation.
-- `utils.py` — Hash functions for compile cache keys, warp reductions, predicates.
-- `cache_utils.py` — JIT compilation cache management.
-- `cute_dsl_utils.py` — Patched `cute.compile` that optionally dumps SASS.
-
-### Compilation & Caching
-
-Kernels are JIT-compiled. Cache key includes dtype, head_dim, causal, mask/score_mod hashes, architecture, block sizes. Caching levels: in-memory LRU + optional disk cache via `get_jit_cache()`.
-
-Env vars: `CUTE_CUBIN_PATH` (dump CUBIN/SASS), `CUTE_DSL_KEEP_PTX=1` (inspect PTX), `CUTE_DSL_PTXAS_PATH` (custom ptxas).
-
-## Key Patterns
-
-- Compile-time constants use `cutlass.Constexpr[type]` for kernel specialization.
-- Score/mask modifiers are user-defined `@cute.jit` callables injected into the kernel at compile time.
-- Forward execution: load Q tile → loop over K/V blocks (pipelined) → online softmax accumulation → store O and LSE.
-- 2CTA instructions (SM100, hdim=128): both CTAs in a cluster coordinate via shared mbarriers; tx_count must be multiplied by `cta_group_size`.
-
-## Debugging GPU Kernels
-
-See `AI/DEBUG_2CTA.md` for kernel hang/deadlock debugging (printf bisection, pipeline barrier analysis, 2CTA pitfalls). See `AI/RACECHECK_TMA_HAZARD.md` for `compute-sanitizer` false positives with `cp.async.bulk`. See `AI/CLC_TRACE_DEBUG.md` for visualization of CLC scheduling.
-
-Key tools:
-- `cute.printf` with thread guards (`tidx % 32 == 0`, `elect_one()`) for targeted output
-- `compute-sanitizer --tool=racecheck` (beware false positives with raw TMA)
-- `CUTE_DSL_KEEP_PTX=1` and `CUTE_DSL_LINEINFO=1` for PTX inspection and sanitizer source mapping
+- Sparse dense-equivalent causal case 的 FLOPs 必须按实际 causal attention
+  计算量统计。

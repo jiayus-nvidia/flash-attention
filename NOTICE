@@ -1,0 +1,9 @@
+Flex Attention contains code derived from FlashAttention's CuTe DSL backend.
+
+Original project: https://github.com/Dao-AILab/flash-attention
+Upstream authors and contributors are listed in AUTHORS.
+License: BSD 3-Clause License, reproduced in LICENSE.
+
+The arbitrary interval-mask planner and packed predicate payload integration
+were developed on the jiayus-nvidia/flash-attention varlen-arbitrary-mask branch
+before being reorganized under the flex_attn package namespace.

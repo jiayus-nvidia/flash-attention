@@ -1,0 +1,278 @@
+"""Host-side validation for public FlexAttention inputs."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+
+import torch
+
+from flex_attn.runtime.arch import get_device_arch
+
+
+SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+SM100_STANDARD_HEAD_DIMS = tuple(
+    (head_dim, head_dim_v)
+    for head_dim in range(8, 129, 8)
+    for head_dim_v in range(8, 129, 8)
+)
+SUPPORTED_HEAD_DIMS = (*SM100_STANDARD_HEAD_DIMS, (192, 128), (256, 256))
+SUPPORTED_HEAD_DIM_RULE = (
+    "Dqk and Dv independently in [8, 128] and divisible by 8, "
+    "or (192, 128), or (256, 256)"
+)
+
+
+def is_supported_head_dims(head_dim: int, head_dim_v: int) -> bool:
+    """Return whether a public head shape has a supported kernel family."""
+
+    return (head_dim, head_dim_v) in SUPPORTED_HEAD_DIMS
+
+
+@dataclass(frozen=True)
+class PlanGeometry:
+    is_varlen: bool
+    arch: int
+    batch_size: int
+    seqlen_q: int | None
+    seqlen_k: int | None
+    total_q: int
+    total_k: int
+    max_seqlen_q: int
+    max_seqlen_k: int
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int
+    head_dim_v: int
+    hmask: int
+    nfunc: int
+    cu_seqlens_q: torch.Tensor | None
+    cu_seqlens_k: torch.Tensor | None
+
+
+def _validate_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, is_varlen: bool) -> None:
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if not tensor.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor")
+        if tensor.dtype not in SUPPORTED_DTYPES:
+            raise TypeError(f"{name} must have dtype torch.float16 or torch.bfloat16")
+        if tensor.stride(-1) != 1:
+            raise ValueError(f"{name} must be contiguous in the last dimension")
+
+    expected_rank = 3 if is_varlen else 4
+    if any(tensor.ndim != expected_rank for tensor in (q, k, v)):
+        raise ValueError(f"q, k, and v must be rank-{expected_rank} tensors")
+    if q.device != k.device or q.device != v.device:
+        raise ValueError("q, k, and v must be on the same CUDA device")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise TypeError("q, k, and v must have the same dtype")
+    if q.shape[-1] != k.shape[-1]:
+        raise ValueError("q and k must have the same head dimension")
+    if q.shape[-2] <= 0 or k.shape[-2] <= 0:
+        raise ValueError("Hq and Hkv must be positive")
+    if k.shape[-3] != v.shape[-3] or k.shape[-2] != v.shape[-2]:
+        raise ValueError("k and v must have the same sequence and head extents")
+    if q.shape[-2] % k.shape[-2] != 0:
+        raise ValueError("Hq must be divisible by Hkv")
+    dims = (q.shape[-1], v.shape[-1])
+    if not is_supported_head_dims(*dims):
+        raise ValueError(
+            f"supported head dimensions are {SUPPORTED_HEAD_DIM_RULE}; got {dims}"
+        )
+
+
+def _validate_prefix(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    total: int,
+    max_seqlen: int,
+) -> list[int]:
+    if tensor.ndim != 1 or tensor.numel() < 2:
+        raise ValueError(f"{name} must be rank-1 with at least two elements")
+    if tensor.dtype != torch.int32:
+        raise TypeError(f"{name} must have dtype torch.int32")
+    if not tensor.is_cuda or not tensor.is_contiguous():
+        raise ValueError(f"{name} must be a contiguous CUDA tensor")
+    values = tensor.detach().cpu().tolist()
+    if values[0] != 0 or values[-1] != total:
+        raise ValueError(f"{name} must start at 0 and end at {total}")
+    lengths = [end - begin for begin, end in zip(values, values[1:])]
+    if any(length < 0 for length in lengths):
+        raise ValueError(f"{name} must be nondecreasing")
+    if any(length > max_seqlen for length in lengths):
+        raise ValueError(f"{name} contains a sequence longer than its max_seqlen")
+    return lengths
+
+
+def validate_create_mask_plan_inputs(
+    mask_func: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
+    max_seqlen_q: int | None,
+    max_seqlen_k: int | None,
+) -> PlanGeometry:
+    """Validate public plan inputs and clone all mutable varlen geometry."""
+
+    varlen_args = (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+    is_varlen = all(value is not None for value in varlen_args)
+    if not is_varlen and any(value is not None for value in varlen_args):
+        raise ValueError(
+            "cu_seqlens_q, cu_seqlens_k, max_seqlen_q, and max_seqlen_k "
+            "must be provided together"
+        )
+    _validate_qkv(q, k, v, is_varlen=is_varlen)
+
+    if is_varlen:
+        if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
+            raise TypeError("max_seqlen_q and max_seqlen_k must be Python ints")
+        if max_seqlen_q < 0 or max_seqlen_k < 0:
+            raise ValueError("max_seqlen_q and max_seqlen_k must be non-negative")
+        if cu_seqlens_q.device != q.device or cu_seqlens_k.device != q.device:
+            raise ValueError("cu_seqlens_q/k must be on the same device as q")
+        if cu_seqlens_q.shape != cu_seqlens_k.shape:
+            raise ValueError("cu_seqlens_q and cu_seqlens_k must have the same shape")
+        batch_size = cu_seqlens_q.numel() - 1
+        total_q, total_k = q.shape[0], k.shape[0]
+        _validate_prefix(
+            cu_seqlens_q,
+            name="cu_seqlens_q",
+            total=total_q,
+            max_seqlen=max_seqlen_q,
+        )
+        k_lengths_host = _validate_prefix(
+            cu_seqlens_k,
+            name="cu_seqlens_k",
+            total=total_k,
+            max_seqlen=max_seqlen_k,
+        )
+        cu_q_owned = cu_seqlens_q.detach().clone()
+        cu_k_owned = cu_seqlens_k.detach().clone()
+        q_lengths = cu_q_owned[1:] - cu_q_owned[:-1]
+        k_lengths = torch.tensor(k_lengths_host, dtype=torch.int32, device=q.device)
+        row_k_lengths = torch.repeat_interleave(
+            k_lengths,
+            q_lengths.to(torch.int64),
+            output_size=total_q,
+        )
+        seqlen_q = None
+        seqlen_k = None
+    else:
+        batch_size, seqlen_q = q.shape[:2]
+        if batch_size <= 0:
+            raise ValueError("fixed attention batch size must be positive")
+        if k.shape[0] != batch_size or v.shape[0] != batch_size:
+            raise ValueError("fixed q, k, and v must have the same batch size")
+        seqlen_k = k.shape[1]
+        total_q = batch_size * seqlen_q
+        total_k = batch_size * seqlen_k
+        max_seqlen_q = seqlen_q
+        max_seqlen_k = seqlen_k
+        cu_q_owned = None
+        cu_k_owned = None
+        row_k_lengths = torch.full(
+            (total_q,), seqlen_k, dtype=torch.int32, device=q.device
+        )
+
+    if not isinstance(mask_func, torch.Tensor):
+        raise TypeError("mask_func must be a torch.Tensor")
+    if mask_func.ndim != 3:
+        raise ValueError("mask_func must have shape [Hmask, nfunc, total_q]")
+    if mask_func.dtype != torch.int32:
+        raise TypeError("mask_func must have dtype torch.int32")
+    if mask_func.device != q.device or not mask_func.is_contiguous():
+        raise ValueError("mask_func must be contiguous and on the same CUDA device as q")
+    hmask, nfunc, func_total_q = mask_func.shape
+    if func_total_q != total_q:
+        raise ValueError(
+            f"mask_func last extent must equal total_q ({total_q}); got {func_total_q}"
+        )
+    if hmask not in (1, q.shape[-2]):
+        raise ValueError(f"Hmask must be 1 or Hq ({q.shape[-2]}); got {hmask}")
+    if nfunc <= 0 or nfunc % 2 == 0:
+        raise ValueError("nfunc must be a positive odd number")
+    if total_q:
+        invalid_range = (mask_func < 0) | (mask_func > row_k_lengths[None, None, :])
+        invalid_order = (
+            (mask_func[:, 1:, :] < mask_func[:, :-1, :]).any()
+            if nfunc > 1
+            else torch.zeros((), dtype=torch.bool, device=q.device)
+        )
+        if bool(invalid_range.any().item()):
+            raise ValueError("mask_func endpoints must lie in each row's local-K range")
+        if bool(invalid_order.item()):
+            raise ValueError("mask_func endpoints must be nondecreasing for every Q row")
+
+    return PlanGeometry(
+        is_varlen=is_varlen,
+        arch=get_device_arch(q.device.index),
+        batch_size=batch_size,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        total_q=total_q,
+        total_k=total_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        num_q_heads=q.shape[-2],
+        num_kv_heads=k.shape[-2],
+        head_dim=q.shape[-1],
+        head_dim_v=v.shape[-1],
+        hmask=hmask,
+        nfunc=nfunc,
+        cu_seqlens_q=cu_q_owned,
+        cu_seqlens_k=cu_k_owned,
+    )
+
+
+def make_internal_mask_func(mask_func: torch.Tensor, geometry: PlanGeometry) -> torch.Tensor:
+    """Convert sample-local endpoints to the padded planner representation."""
+
+    if geometry.is_varlen:
+        q_lengths = geometry.cu_seqlens_q[1:] - geometry.cu_seqlens_q[:-1]
+        row_k_offsets = torch.repeat_interleave(
+            geometry.cu_seqlens_k[:-1],
+            q_lengths.to(torch.int64),
+            output_size=geometry.total_q,
+        )
+    else:
+        row_k_offsets = torch.arange(
+            geometry.batch_size, dtype=torch.int32, device=mask_func.device
+        ).repeat_interleave(geometry.seqlen_q) * geometry.seqlen_k
+    internal = torch.zeros(
+        (geometry.hmask, geometry.nfunc, geometry.total_q + 256),
+        dtype=torch.int32,
+        device=mask_func.device,
+    )
+    internal[:, :, : geometry.total_q] = mask_func + row_k_offsets[None, None, :]
+    return internal
+
+
+def validate_call_options(
+    *, softmax_scale: float | None, deterministic: bool, return_lse: bool
+) -> None:
+    if softmax_scale is not None:
+        if not isinstance(softmax_scale, (float, int)) or not math.isfinite(softmax_scale):
+            raise ValueError("softmax_scale must be a finite number or None")
+    if type(deterministic) is not bool:
+        raise TypeError("deterministic must be a bool")
+    if type(return_lse) is not bool:
+        raise TypeError("return_lse must be a bool")
+
+
+__all__ = [
+    "PlanGeometry",
+    "SM100_STANDARD_HEAD_DIMS",
+    "SUPPORTED_DTYPES",
+    "SUPPORTED_HEAD_DIM_RULE",
+    "SUPPORTED_HEAD_DIMS",
+    "is_supported_head_dims",
+    "make_internal_mask_func",
+    "validate_call_options",
+    "validate_create_mask_plan_inputs",
+]

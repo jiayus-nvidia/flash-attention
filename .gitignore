@@ -3,8 +3,7 @@
 *.ptx
 *.cubin
 *.plk
-.DS_store
-.vscode
+.DS_Store
 worktrees/
 
 # Byte-compiled / optimized / DLL files
@@ -38,9 +37,7 @@ var/
 venv
 agent_space/
 benchmarks/results/
+benchmarks/AiCheng_bwd_ut.zip
 
 # compile-time generated file
-flash_attn_config.py
-
-# generated files
-hopper/instantiations/*
+flex_attn_config.py

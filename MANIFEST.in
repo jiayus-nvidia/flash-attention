@@ -1,12 +1,3 @@
-recursive-include csrc *.cu
-recursive-include csrc *.h
-recursive-include csrc *.cuh
-recursive-include csrc *.cpp
-recursive-include csrc *.hpp
-recursive-include csrc *.py
-
-recursive-include flash_attn *.cu
-recursive-include flash_attn *.h
-recursive-include flash_attn *.cuh
-recursive-include flash_attn *.cpp
-recursive-include flash_attn *.hpp
+exclude .gitignore
+exclude AGENTS.md
+exclude CLAUDE.md
