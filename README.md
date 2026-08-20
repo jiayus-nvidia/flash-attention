@@ -1,31 +1,30 @@
 # Flex Attention
 
-本项目提供基于 NVIDIA CuTe DSL 的训练态 FlexAttention backend。它从
-FlashAttention CuTe DSL 的 SM90/SM100 实现演化而来，只保留 interval mask plan
-与 packed predicate mask 路径。
+FlexAttention provides high-performance arbitrary-mask attention through interval mask plans
+and packed predicate masks.
 
-## 支持范围
+## Supported Configurations
 
-- GPU：SM90、SM100、SM103；
-- 布局：定长 BSHD、真实变长 THD；
-- 数据类型：FP16、BF16；
-- 模式：forward、backward、MHA、GQA、MQA；
-- head 维度：SM100/SM103 generic 支持 Dqk、Dv 独立取
-  `{8,16,...,128}`，另支持 `(192,128)`；`(256,256)` 使用专用 kernel；
-- mask：`[0,F0), [F1,F2), [F3,F4), ...` interval union。
+- GPUs: SM90, SM100, and SM103.
+- Layouts: fixed-length BSHD and true-variable-length THD.
+- Data types: FP16 and BF16.
+- Modes: forward, backward, MHA, GQA, and MQA.
+- Head dimensions: the SM100/SM103 generic kernels independently support `Dqk` and `Dv`
+  from `{8,16,...,128}`; `(192,128)` is also supported, while `(256,256)` uses a dedicated
+  kernel.
+- Masks: unions of intervals in the form `[0,F0), [F1,F2), [F3,F4), ...`.
 
-不提供 score-mod、mask-mod callable、paged KV、SplitKV、MLA、FP8、SM80 或
-SM120 路径。
+Paged KV, SplitKV, MLA, FP8, SM80, and SM120 paths are not currently supported.
 
-## 安装
+## Installation
 
 ```bash
 python -m pip install -e '.[dev]'
 ```
 
-项目固定使用 `nvidia-cutlass-dsl==4.5.2` 和 `quack-kernels==0.5.0`。
+The project pins `nvidia-cutlass-dsl==4.5.2` and `quack-kernels==0.5.0`.
 
-## 接口
+## API
 
 ```python
 from flex_attn import create_mask_plan, flex_attn_func
@@ -38,11 +37,13 @@ plan = create_mask_plan(mask_func, q, k, v)
 out, lse = flex_attn_func(q, k, v, mask_plan=plan, return_lse=True)
 ```
 
-`mask_func` endpoint 是样本内 local-K 坐标，公开 tensor 不需要 planner padding。
-`MaskPlan` 构建后不保留 `mask_func`，并自行持有变长 prefix 的副本。
-`return_lse=False` 时接口返回 `out`；设为 `True` 时返回 `(out, lse)`。
+Each `mask_func` endpoint uses sample-local K coordinates. The public tensor does not require
+planner padding. After construction, `MaskPlan` does not retain `mask_func`; for variable-length
+inputs, it owns copies of the sequence-prefix tensors.
 
-变长 geometry 只在构建 plan 时提供：
+With `return_lse=False`, the API returns `out`. With `return_lse=True`, it returns `(out, lse)`.
+
+Variable-length geometry is provided only when constructing the plan:
 
 ```python
 from flex_attn import create_mask_plan, flex_attn_varlen_func
@@ -60,7 +61,12 @@ plan = create_mask_plan(
 out, lse = flex_attn_varlen_func(q, k, v, mask_plan=plan, return_lse=True)
 ```
 
-## 测试
+## Design Documentation
+
+- [Arbitrary Mask Design (English)](docs/design.md)
+- [Arbitrary Mask Design (Simplified Chinese)](docs/design_zh.md)
+
+## Testing
 
 ```bash
 PYTHONPATH=src:. python -m pytest tests/unit
@@ -68,11 +74,12 @@ PYTHONPATH=src:. python -m pytest tests/gpu --run-gpu
 PYTHONPATH=src:. python -m pytest tests/gpu --run-gpu --full-random-cases
 ```
 
-默认 GPU smoke 包含原 144 个随机 strata 代表和 10 个 SM100 head-dim directed
-case，共 154 个。`--full-random-cases` 仍运行固定 seed 生成的原 1024 个 case。
+The default GPU smoke suite contains the original 144 randomly stratified representatives plus
+10 directed SM100 head-dimension cases, for a total of 154 cases. `--full-random-cases` runs all
+1,024 cases generated with the fixed seed.
 
-## 来源与许可证
+## Attribution and License
 
-核心 kernel 来源于 FlashAttention CuTe DSL，并保留原作者版权声明。详细迁移边界
-见 [docs/design.md](docs/design.md) 和 [NOTICE](NOTICE)。项目使用 BSD 3-Clause
-License。
+Thanks to FlashAttention. The core implementation is derived from the FlashAttention CuTe DSL
+code and retains the original authors' copyright notices. See [NOTICE](NOTICE) for attribution
+details. This project is licensed under the BSD 3-Clause License.

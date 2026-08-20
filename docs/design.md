@@ -1,193 +1,281 @@
-# Flex Attention backend 设计
+# Arbitrary Mask Design
 
-## 范围
+## Scope
 
-本项目是训练态 FlexAttention backend，只保留 interval mask plan、packed predicate
-mask、普通 QKV attention forward/backward，以及 fixed BSHD 和 true-varlen THD 两种
-数据路径。
+This document describes only the public arbitrary-mask semantics, plan construction, packed
+predicate payload, and the protocol used by forward and backward consumers.
 
-不提供 score-mod、mask-mod callable、paged KV、SplitKV、MLA、FP8、SM80、SM120
-或 D512。SM90 保留 Hopper 实现；SM100 与 SM103 共用 Blackwell consumer family。
+Kernel pipelines, warp roles, CLC scheduling, Q stages, 1CTA/2CTA topologies, head-dimension
+performance tuning, benchmarks, and test matrices are outside its scope.
 
-## Mask 语义
+## Public Mask Semantics
 
-公开 `mask_func` 是 contiguous CUDA `int32` tensor，形状为
-`[Hmask,nfunc,total_q]`。`nfunc` 为奇数，每一行表示以下 sample-local KV interval
-并集：
+The public `mask_func` input is a contiguous CUDA `int32` tensor:
 
 ```text
-[0, F0), [F1, F2), [F3, F4), ...
+mask_func[Hmask, nfunc, total_q]
 ```
 
-endpoint 必须位于当前 sample 的 local-K 范围内并保持非递减。builder 内部把 endpoint
-转换为 planner 坐标并添加 256 行安全 padding；临时表示不进入公开 `MaskPlan`。
+- `Hmask` must be either `1` or `Hq`; `1` means that all Q heads share the mask.
+- `nfunc` must be a positive odd integer.
+- `total_q` is `B * Sq` for flattened fixed-length BSHD inputs, or the total number of Q tokens
+  for true-variable-length THD inputs.
+- Every endpoint uses local-K coordinates within its sample, rather than global K coordinates in
+  the flattened THD tensor.
 
-## Plan 构建
+For each Q row, endpoints `F0, F1, ..., F(nfunc-1)` represent the following union of half-open
+intervals:
 
 ```text
-sample-local mask_func
-        |
-        v
-输入验证、坐标转换和 padding
-        |
-        v
-Q2K classify -> empty / partial / full
-        |
-        +--> partial/full count -> exclusive offsets
-        |
-        v
-Q2K materialize -> raw CSR indices + packed partial payload
-        |
-        +--> K2Q count/materialize（仅 backward）
-        |
-        +--> SM100 forward schedule preprocess
-        |
-        v
+[0, F0) U [F1, F2) U [F3, F4) U ...
+```
+
+For example:
+
+```text
+endpoints = [32, 64, 96]
+visible K = [0, 32) U [64, 96)
+```
+
+The endpoints of every row must satisfy:
+
+```text
+0 <= F0 <= F1 <= ... <= F(nfunc-1) <= sample_k_len
+```
+
+Equal adjacent endpoints naturally represent an empty interval. The public API accepts neither a
+Python callable mask modifier nor a block mask or packed bit tensor constructed by the caller.
+
+## Coordinates and Ownership
+
+### Fixed Length
+
+Every sample in fixed-length BSHD has the same `Sq` and `Sk`. The last dimension of `mask_func`
+still flattens Q rows in batch-major order, but every endpoint remains a sample-local K coordinate.
+
+### True Variable Length
+
+True-variable-length THD inputs use `cu_seqlens_q/k` to define sample boundaries. The builder
+first validates that each prefix tensor:
+
+- is a rank-1, contiguous CUDA `int32` tensor;
+- starts at 0 and ends at `total_q/total_k`;
+- is monotonically nondecreasing; and
+- gives each sample a length no greater than the corresponding `max_seqlen`.
+
+The builder then clones `cu_seqlens_q/k`, and the resulting `MaskPlan` owns the clones. Mutating
+the originally supplied prefix tensors in place therefore cannot alter the sample partition of an
+existing plan.
+
+### Internal Planner Coordinates
+
+Before GPU planning, the builder adds the current sample's global K offset to every public
+endpoint. This converts sample-local coordinates into the planner's internal coordinate system.
+The internal `mask_func` also has 256 zero-padded Q rows for safe planner reads; this temporary
+tensor is not retained in the public `MaskPlan`.
+
+Block indices in the final CSR remain sample-local. A consumer forms actual Q/K/V addresses by
+combining a sample offset with a local block index, so a plan row cannot cross a sample boundary.
+
+## Plan Construction
+
+```text
+sample-local interval endpoints
+            |
+            v
+input validation, prefix cloning, internal coordinate conversion, and padding
+            |
+            v
+Q2K classify
+  each Q plan row x K block -> empty / partial / full
+            |
+            v
+partial/full count -> exclusive CSR offsets
+            |
+            v
+Q2K compact materialize
+  partial/full indices + partial packed payload
+            |
+            +-----------------------------+
+            | build_backward=True         |
+            v                             |
+K2Q count + compact materialize           |
+  K-major indices + backward payload      |
+            |                             |
+            +-----------------------------+
+            v
 MaskPlan
 ```
 
-Q2K 与 K2Q 均使用两组相互独立的 raw CSR：
+### Block Classification
 
-- partial block：`mask_block_offset`、`mask_block_idx`；
-- full block：`full_block_offset`、`full_block_idx`。
+The target consumer determines the plan tile size. For every valid Q plan row and sample-local K
+block, the classifier assigns one of three states:
 
-consumer 不假设 block index 连续，不生成 full-block run，也不动态合并 partial/full
-两组索引。只有 partial block 携带 `mask_block_masks`；full block 不加载 mask payload。
+- `empty`: all valid attention elements are invisible;
+- `full`: the Q and K tiles lie entirely within the current sample's valid range, and every
+  attention element in the tile is visible; or
+- `partial`: the tile contains visible elements, but the mask is not fully visible or the tile is
+  a Q/K tail that requires boundary protection.
 
-变长 plan 克隆并持有 `cu_seqlens_q/k`。attention 调用使用 plan 持有的 prefix，调用方
-后续原地修改输入 prefix 不会改变 plan。plan runtime binding 同时记录 tensor identity、
-version 和 geometry，防止错误复用。
+Classification produces temporary `visible_bits`, `full_bits`, and per-row partial/full counts.
+These bitsets are planner intermediates rather than public attention-consumer inputs.
 
-## SM100 forward schedule
+### Independent CSR Streams
 
-SM100/SM103 的所有 forward 均使用 Blackwell 硬件 CLC persistent scheduler。fixed、
-true-varlen、generic、D192 和 D256 都不得静默回退 static；无法构造合法 CLC launch
-时必须显式报错。
-
-plan preprocess 生成：
+Both Q2K and K2Q use two independent CSR streams:
 
 ```text
-sequence_desc[B,8]（true-varlen 与 D256 fixed 使用）
-  0 q_offset
-  1 k_offset
-  2 q_len
-  3 k_len
-  4 q_plan_row_begin
-  5 q_plan_row_count
-  6 num_k_blocks
-  7 reserved
+partial CSR
+  mask_block_cnt
+  mask_block_offset
+  mask_block_idx
 
-fwd_work_desc[T,4]
-  0 m_block
-  1 head_idx
-  2 batch_idx
-  3 q_valid_rows
+full CSR
+  full_block_cnt
+  full_block_offset
+  full_block_idx
 ```
 
-`fwd_work_desc` 让一个 CLC work item 精确对应一个有效 Q plan row 和一个调度 head。
-true-varlen main kernel 从 descriptor 取得 sample offset、长度和尾 tile 边界，不重新
-枚举 sample task。
+For each stream:
 
-task cost 定义为当前 plan row 的 `partial_count + full_count`，即 full 与 partial
-block 等价。任务先按 sample/KV-head 的 L2 section 分组，再执行稳定 LPT 排序；零
-cost task 保留在队尾，由 forward 写出 `O=0`、`LSE=-inf`。
+- `*_cnt[mask_head, plan_row]` is the number of blocks in the row;
+- `*_offset` is the exclusive offset into the flattened CSR data; and
+- `*_idx` stores sample-local block indices.
 
-## SM100 forward kernel
+The design does not assume that block indices are contiguous, does not generate full-block runs,
+and does not dynamically combine partial and full blocks into one index stream. Empty blocks do
+not enter either CSR.
 
-支持范围：
+## Q2K and K2Q
+
+### Q2K
+
+Q2K is Q-major: each outer row lists the K blocks visited by one Q tile. Forward uses a Q2K plan;
+a backward consumer requiring an independent Q-major traversal may own a separate Q2K view.
+
+### K2Q
+
+Within the same backward topology, K2Q is the transpose of the Q2K sparse block pairs. Each
+K-major row lists the related Q blocks. The dK/dV consumer uses the K2Q plan to visit only the Q
+blocks actually related to each KV task, without rescanning every Q row.
+
+K2Q may also carry `dq_write_order` and `dq_write_order_full`. They describe only the ordering of
+parallel dQ writes and do not change the mathematical mask semantics.
+
+## Packed Predicate Payload
+
+Only partial blocks carry `mask_block_masks`; full blocks neither allocate nor load a mask payload.
+
+The logical shape is:
 
 ```text
-generic:   Dqk,Dv 独立取 {8,16,...,128}
-generic:   (Dqk,Dv) = (192,128)
-dedicated: (Dqk,Dv) = (256,256)
+mask_block_masks[
+    partial_nnz,
+    physical_subtile,
+    payload_group,
+    uint32_word,
+]
 ```
 
-generic kernel 的静态 topology 为：
+The payload is not a generic row-major bitmap. The planner uses the target consumer's MMA
+accumulator ownership to map every score element to its thread or payload group, then writes its
+bit in the linear order in which the consumer will read the final register fragment:
 
 ```text
-默认  (q_stage=2, cta_group_size=1)
-可选  (q_stage=1, cta_group_size=1)
-可选  (q_stage=1, cta_group_size=2)
+bit = 1  -> keep the score
+bit = 0  -> replace the score with -inf
 ```
 
-generic forward 按 pipeline 拆分，同时只保留一个公共 kernel 外壳：
+The attention kernel therefore does not need to reevaluate intervals, compare coordinates, or
+execute a generic mask modifier. The consumer only loads its packed `uint32` words and applies a
+constexpr bit-select to the accumulator.
+
+Here, R2P names the data-flow semantics of selecting a register fragment with a packed predicate;
+the source does not require a distinct intrinsic literally named `R2P`. On SM100, a
+TMEM-to-register load followed by the unrolled bit-select implements this path. SM90 applies the
+same semantics to a WGMMA register fragment.
+
+The final `uint32` can contain padding bits beyond the fragment's actual element count. The
+consumer generates accesses only for constexpr elements satisfying
+`col < size(accumulator_fragment)`, preventing an out-of-bounds accumulator access.
+
+## Consumer Protocol
+
+### Forward
+
+Forward reads the partial and full CSR streams of a Q2K row separately:
 
 ```text
-sm100/fwd/
-├── forward.py             # launch、warp roles、公共 softmax/epilogue/helpers
-├── forward_config.py      # generic compile-time 配置
-├── forward_qstage1.py     # qstage1 load/MMA/correction，统一 1CTA/2CTA 类
-├── forward_qstage2.py     # qstage2 load/MMA/correction
-├── forward_hd256.py       # D256 专用实现
-├── forward_config_hd256.py
-└── named_barrier.py
+for block in partial CSR:
+    load K/V
+    compute score
+    load packed predicate
+    masked softmax step
+
+for block in full CSR:
+    load K/V
+    compute score
+    unmasked softmax step
 ```
 
-qstage1 的 1CTA/2CTA 不使用两个 wrapper class；同一个
-`FlexAttentionForwardQStage1Sm100` 由 compile key 中的静态
-`use_2cta_instrs` 参数化。该拆分只改变代码归属，不改变 pipeline、barrier、TMEM、
-CLC 或 mask plan 协议。
+A row with zero blocks writes `O=0` and `LSE=-inf`. Sequence tails are encoded by the plan and
+payload together with consumer-side boundary protection; the consumer must not access the next
+sample.
 
-默认 plan 始终选择 `(2,1)`。qstage1 两个候选必须通过内部 plan variant 显式构建，
-不会根据 causal/local、sequence length 或具体 mask shape 自动选择。qstage1 只允许
-使用当前 N-direction pipeline；旧的单流 qstage1 pipeline 不可构造。
+### Backward
 
-D256 使用独立实现，固定 `q_stage=1`，维护 1CTA/2CTA 两种 compile-key 变体；默认
-为 1CTA。generic 与 D256 都先遍历 partial CSR 并应用 packed mask，再遍历 full CSR
-且不应用 mask：
+A backward kernel consumes a Q2K or K2Q view according to its mathematical traversal:
 
-```text
-for partial block:
-    softmax_step(apply_mask=True)
+- a partial block loads its packed predicate;
+- a full block reads only `full_block_idx`;
+- a concrete kernel pipeline may choose its traversal order, but the two CSR streams retain their
+  independent semantics; and
+- no singleton-heavy raw-index bypass exists.
 
-for full block:
-    softmax_step(apply_mask=False)
-```
+## Architecture and Consumer Boundary
 
-fixed 输出使用 TMA O store；true-varlen 使用带完整尾维保护的 register-to-GMEM
-路径。变长禁止复用 fixed fast path。
+The arbitrary-mask interval semantics and CSR organization are identical on SM90, SM100, and
+SM103, but a materialized payload is tied to its concrete consumer:
 
-## SM100 backward kernel
+- an SM90 payload follows WGMMA accumulator partitioning;
+- an SM100/SM103 payload follows register ownership after a tcgen05/TMEM load; and
+- forward, generic backward, D256 dQ, and D256 dKdV may use different tiles, subtiles, CTA groups,
+  and payload word counts.
 
-generic backward 负责标准 head dim 与 `(192,128)`，D256 使用独立 dQ、dKdV kernel。
-backward 保持各 kernel 既有调度，不套用 forward 的统一 CLC 规则。
+`MaskPlan` carries an `ArbitraryPlanSignature` that records the architecture family, direction,
+tile topology, MMA layout, payload layout, PackGQA configuration, and dQ order format. Dispatch
+must compare this signature field by field with the consumer about to launch.
 
-K2Q plan 让 dKdV 以 KV block 为 task 直接遍历关联 Q block。所有 backward consumer
-都分别读取 `mask_block_idx` 与 `full_block_idx`；singleton-heavy mask 不存在额外 raw
-index 旁路。
+The same public `mask_func` may therefore be planned separately for different architectures or
+kernel topologies. One `MaskPlan` may contain distinct materialized views for forward and
+backward, but no view may be interpreted as another direction or by an incompatible consumer.
+The complete `MaskPlan` also cannot be reused across architectures or incompatible tile
+geometries.
 
-需要 head padding 或 head reduction 的 dK/dV 写入 FP32 workspace，再由公共
-postprocess 按真实 head dim 裁剪并转换输出。fixed 无 padding MHA 可以使用既有 TMA
-direct-store；true-varlen 保持 ragged 输出路径。
+## Plan Lifecycle
 
-## 精度
+`MaskPlan` is an opaque, consumer-specific, read-only object:
 
-QK、PV、dP、dQ、dK、dV 的 Tensor Core accumulator 均为 FP32。softmax、scale、
-归约及 CUDA Core 特殊函数均在 FP32 上执行，最终再显式转换到输出 dtype。
+- Q/K/V tensor identity is not a binding condition, so a plan can process new values with the
+  same geometry;
+- a fixed-length plan binds batch size, Sq, Sk, head counts, head dimensions, dtype, and device;
+- a variable-length plan additionally owns clones of `cu_seqlens_q/k`;
+- runtime binding records geometry plus prefix-tensor identity and version, and rejects stale
+  prefixes;
+- a training call requires a plan that contains backward payloads; and
+- `debug_snapshot()` returns only tensor clones and never exposes mutable internal plan storage.
 
-并行调度导致的合法 FP32 累加顺序变化不要求 bitwise-identical；正确性以 CUDA eager
-FP32 reference 为 gate，低精度 reordered PyTorch 结果只用于误差基准。
+## Design Invariants
 
-## Compile key
-
-compile key 只包含影响 codegen 的静态配置，例如 architecture、dtype、head dim、
-layout、kernel topology、plan signature、payload layout 和是否 true-varlen。
-
-以下运行时值不得直接进入 compile key：batch size、`total_q`、`total_k`、
-`max_seqlen_q`、`max_seqlen_k`、具体 `cu_seqlens` 内容、task 数和 sparse nnz。
-qstage1 1CTA 可以消费 plan 归约得到的 `narrow_workset` 布尔提示，选择同一 kernel
-内部的静态 overlap 策略；它不根据 causal/local 名称分派，也不改变 topology。
-
-## 测试
-
-默认 GPU smoke 包含 144 个随机 strata 代表和 10 个 SM100 directed head-dim case，
-共 154 个。`--full-random-cases` 运行固定 seed 生成的 1024 个随机 case。fixed 与
-true-varlen 共用 case 规范，测试覆盖 forward、LSE、dQ、dK、dV、MHA/GQA/MQA、
-空 mask、full mask、discontiguous full block、deterministic 和三个 generic forward
-topology。
-
-## TODO
-
-- SM100/SM103 D256 fixed-causal forward 在 GB300、BF16、B=8、Sq=Sk=8192、
-  Hq/Hkv=16/4 下为 `3360.212 us`，FA4 为 `2834.209 us`，ratio `1.1856`。
-  当前正确性与统一 CLC 约束均已满足，后续需要继续优化到 `flex/fa <= 1.05`。
+1. Public endpoints always use sample-local K coordinates.
+2. CSR block indices always use sample-local block coordinates.
+3. Partial and full blocks always use independent CSR streams.
+4. Only partial blocks carry packed predicate payloads.
+5. Payload bit order must exactly match the target consumer's accumulator ownership.
+6. Full blocks perform neither packed-mask loads nor bit-selects.
+7. Consumers do not rely on block contiguity and neither generate nor consume full-block runs.
+8. True-variable-length inputs never reuse fixed-length addressing paths.
+9. A plan-signature mismatch must raise an explicit error rather than silently reinterpret a
+   different layout.
+10. Tail padding bits in a packed payload must never cause an out-of-bounds accumulator access.
