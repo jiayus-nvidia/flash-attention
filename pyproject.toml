@@ -14,14 +14,14 @@ authors = [
     {name = "FlashAttention CuTe DSL contributors"},
 ]
 dependencies = [
-    "nvidia-cutlass-dsl==4.5.2",
+    "nvidia-cutlass-dsl>=4.5.2",
     "torch",
     "typing_extensions",
     "quack-kernels==0.5.0",
 ]
 
 [project.optional-dependencies]
-cu13 = ["nvidia-cutlass-dsl[cu13]==4.5.2"]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.2"]
 dev = ["pytest", "pytest-xdist", "ruff"]
 
 [tool.setuptools.packages.find]

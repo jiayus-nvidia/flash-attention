@@ -601,7 +601,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             tmem_holding_buf: Int32
             # CLC pipeline barriers and response buffer
             clc_mbar_ptr: cute.struct.MemRange[Int64, 2]
-            clc_response: cute.struct.MemRange[Int32, 4]
+            clc_response: cute.struct.Align[
+                cute.struct.MemRange[Int32, 4], 16
+            ]
 
         self.shared_storage = SharedStorage
 

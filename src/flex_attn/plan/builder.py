@@ -80,6 +80,12 @@ from flex_attn.kernels.sm100.fwd.forward_config_hd256 import (
 from flex_attn.runtime.fake_tensor import is_fake_mode
 
 _QSTAGE1_OVERLAP_MIN_AVERAGE_BLOCKS = 7
+_SM100_GENERIC_DEFAULT_FWD_VARIANT = "qstage1_2cta"
+_Sm100FwdVariant = Literal[
+    "qstage2_1cta",
+    "qstage1_1cta",
+    "qstage1_2cta",
+]
 
 _CLASSIFY_COMPILE_CACHE = get_jit_cache("arbitrary_plan_classify")
 _MATERIALIZE_COMPILE_CACHE = get_jit_cache("arbitrary_plan_materialize")
@@ -818,11 +824,16 @@ def _build_packed_mask_plan(
     max_seqlen_k: int | None = None,
     pack_gqa: bool | None = None,
     build_backward: bool = False,
-    _fwd_variant: Literal["qstage1_1cta", "qstage1_2cta"] | None = None,
+    _fwd_variant: _Sm100FwdVariant | None = None,
 ) -> BlockSparseTensorsTorch:
     """Build the internal consumer-specific packed-mask payloads."""
 
-    if _fwd_variant not in (None, "qstage1_1cta", "qstage1_2cta"):
+    if _fwd_variant not in (
+        None,
+        "qstage2_1cta",
+        "qstage1_1cta",
+        "qstage1_2cta",
+    ):
         raise ValueError(f"unknown internal forward variant: {_fwd_variant!r}")
 
     metadata = _validate_builder_inputs(
@@ -880,6 +891,10 @@ def _build_packed_mask_plan(
         if build_backward and arch not in (100, 103):
             raise NotImplementedError("arbitrary backward currently supports SM100/SM103 only")
         use_hd256_consumer = q.shape[-1] == 256 and v.shape[-1] == 256
+        if use_hd256_consumer and _fwd_variant == "qstage2_1cta":
+            raise NotImplementedError(
+                "dedicated SM100 D256 forward does not support qstage2"
+            )
         if use_hd256_consumer:
             fwd_config = resolve_sm100_hd256_fwd_consumer_config(
                 arch=arch,
@@ -907,7 +922,10 @@ def _build_packed_mask_plan(
                     use_2cta_instrs=True,
                     deterministic=False,
                 )
-        elif _fwd_variant == "qstage1_1cta":
+        generic_fwd_variant = (
+            _fwd_variant or _SM100_GENERIC_DEFAULT_FWD_VARIANT
+        )
+        if not use_hd256_consumer and generic_fwd_variant == "qstage1_1cta":
             fwd_config = resolve_sm100_fwd_qstage1_1cta_consumer_config(
                 arch=arch,
                 dtype=q.dtype,
@@ -919,7 +937,7 @@ def _build_packed_mask_plan(
                 hmask=metadata["hmask"],
                 pack_gqa=pack_gqa,
             )
-        elif _fwd_variant == "qstage1_2cta":
+        elif not use_hd256_consumer and generic_fwd_variant == "qstage1_2cta":
             fwd_config = resolve_sm100_fwd_qstage1_2cta_consumer_config(
                 arch=arch,
                 dtype=q.dtype,
@@ -931,7 +949,7 @@ def _build_packed_mask_plan(
                 hmask=metadata["hmask"],
                 pack_gqa=pack_gqa,
             )
-        else:
+        elif not use_hd256_consumer:
             fwd_config = resolve_sm100_fwd_consumer_config(
                 arch=arch,
                 dtype=q.dtype,
@@ -1699,7 +1717,7 @@ def create_mask_plan(
     max_seqlen_k: int | None = None,
     pack_gqa: bool | None = None,
     build_backward: bool | None = None,
-    _fwd_variant: Literal["qstage1_1cta", "qstage1_2cta"] | None = None,
+    _fwd_variant: _Sm100FwdVariant | None = None,
 ) -> MaskPlan:
     """Create an opaque plan from sample-local interval endpoints."""
 

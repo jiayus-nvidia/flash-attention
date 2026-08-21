@@ -609,7 +609,9 @@ class _FlexAttentionForwardSm100Base:
             # PipelineClcFetchAsync expects 2 * sched_stages mbarriers (full + empty).
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
             # CLC response storage (16 bytes per stage, stored as 4 Int32s).
-            clc_response: cute.struct.MemRange[Int32, clc_response_size]
+            clc_response: cute.struct.Align[
+                cute.struct.MemRange[Int32, clc_response_size], 16
+            ]
             # Large TMA buffers with 1024-byte alignment
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, sO_size], self.buffer_align_bytes

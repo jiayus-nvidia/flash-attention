@@ -12,8 +12,8 @@ from tests.datas.sequence_cases import smoke_cases
 
 pytestmark = pytest.mark.gpu
 
-_QSTAGE1_CASE_IDS = {0, 7, 14, 28, 43, 57, 339, 1027}
-assert _QSTAGE1_CASE_IDS <= {
+_FWD_TOPOLOGY_CASE_IDS = {0, 7, 14, 28, 43, 57, 339, 1027}
+assert _FWD_TOPOLOGY_CASE_IDS <= {
     case.case_id for case in smoke_cases("fixed")
 }
 
@@ -21,6 +21,18 @@ assert _QSTAGE1_CASE_IDS <= {
 def _selected_rows(seqlen: int) -> tuple[int, ...]:
     candidates = (0, 1, 127, 128, 255, seqlen // 2, seqlen - 2, seqlen - 1)
     return tuple(sorted({index for index in candidates if 0 <= index < seqlen}))
+
+
+def _assert_default_sm100_forward_topology(plan, case) -> None:
+    if torch.cuda.get_device_capability()[0] != 10:
+        return
+    packed_plan, _, _ = plan._runtime_args
+    expected_family = (
+        "sm100_hd256_fwd"
+        if (case.head_dim, case.head_dim_v) == (256, 256)
+        else "sm100_qstage1_2cta_fwd"
+    )
+    assert packed_plan.plan_signature.kernel_family == expected_family
 
 
 def _visible_columns(endpoints: torch.Tensor, seqlen_k: int) -> torch.Tensor:
@@ -202,9 +214,10 @@ def test_flex_attn(case):
     )
     mask_func = make_mask_func(case)
     plan = create_mask_plan(mask_func, q, k, v)
-    run_qstage1_variants = (
+    _assert_default_sm100_forward_topology(plan, case)
+    run_fwd_topology_variants = (
         torch.cuda.get_device_capability()[0] == 10
-        and case.case_id in _QSTAGE1_CASE_IDS
+        and case.case_id in _FWD_TOPOLOGY_CASE_IDS
     )
     qstage1_2cta_plan = (
         create_mask_plan(
@@ -215,7 +228,19 @@ def test_flex_attn(case):
             build_backward=False,
             _fwd_variant="qstage1_2cta",
         )
-        if run_qstage1_variants
+        if run_fwd_topology_variants
+        else None
+    )
+    qstage2_1cta_plan = (
+        create_mask_plan(
+            mask_func,
+            q,
+            k,
+            v,
+            build_backward=False,
+            _fwd_variant="qstage2_1cta",
+        )
+        if run_fwd_topology_variants and case.head_dim != 256
         else None
     )
     qstage1_1cta_plan = (
@@ -227,7 +252,7 @@ def test_flex_attn(case):
             build_backward=False,
             _fwd_variant="qstage1_1cta",
         )
-        if run_qstage1_variants
+        if run_fwd_topology_variants
         else None
     )
     (
@@ -256,7 +281,11 @@ def test_flex_attn(case):
     )
     _assert_fa_error(sampled_out, ref_out, pytorch_out)
     _assert_fa_error(sampled_lse, ref_lse, pytorch_lse)
-    for candidate_plan in (qstage1_1cta_plan, qstage1_2cta_plan):
+    for candidate_plan in (
+        qstage1_1cta_plan,
+        qstage1_2cta_plan,
+        qstage2_1cta_plan,
+    ):
         if candidate_plan is None:
             continue
         with torch.no_grad():
@@ -283,7 +312,7 @@ def test_flex_attn(case):
         )
         _assert_fa_error(candidate_sampled_out, ref_out, pytorch_out)
         _assert_fa_error(candidate_sampled_lse, ref_lse, pytorch_lse)
-    if run_qstage1_variants and case.case_id == 0:
+    if run_fwd_topology_variants and case.case_id == 0:
         empty_mask_func = torch.zeros(
             (1, 1, case.batch_size * seqlen_q),
             dtype=torch.int32,

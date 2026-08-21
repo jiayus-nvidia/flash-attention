@@ -957,7 +957,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tmem_holding_buf: cutlass.Int32
             tmem_dealloc_mbar_ptr: cutlass.Int64
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-            clc_response: cute.struct.MemRange[Int32, 4]
+            clc_response: cute.struct.Align[
+                cute.struct.MemRange[Int32, 4], 16
+            ]
             # Smem tensors
             sK: cute.struct.Align[
                 cute.struct.MemRange[K.element_type, cute.cosize(K_smem_layout_staged)],
