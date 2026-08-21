@@ -35,6 +35,26 @@ def _assert_default_sm100_forward_topology(plan, case) -> None:
     assert packed_plan.plan_signature.kernel_family == expected_family
 
 
+def _make_input(
+    batch_size: int,
+    seqlen: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    *,
+    noncontiguous: bool,
+) -> torch.Tensor:
+    shape = (
+        (batch_size, num_heads, seqlen, head_dim)
+        if noncontiguous
+        else (batch_size, seqlen, num_heads, head_dim)
+    )
+    tensor = torch.randn(shape, dtype=dtype, device="cuda")
+    if noncontiguous:
+        tensor = tensor.transpose(1, 2)
+    return tensor.requires_grad_()
+
+
 def _visible_columns(endpoints: torch.Tensor, seqlen_k: int) -> torch.Tensor:
     columns = torch.arange(seqlen_k, device=endpoints.device)
     visible = columns < endpoints[0]
@@ -185,32 +205,30 @@ def test_flex_attn(case):
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[case.dtype]
     torch.manual_seed(case.seed)
     seqlen_q, seqlen_k = case.q_lengths[0], case.k_lengths[0]
-    q = torch.randn(
+    noncontiguous = case.case_id == 43
+    q = _make_input(
         case.batch_size,
         seqlen_q,
         case.num_q_heads,
         case.head_dim,
-        dtype=dtype,
-        device="cuda",
-        requires_grad=True,
+        dtype,
+        noncontiguous=noncontiguous,
     )
-    k = torch.randn(
+    k = _make_input(
         case.batch_size,
         seqlen_k,
         case.num_kv_heads,
         case.head_dim,
-        dtype=dtype,
-        device="cuda",
-        requires_grad=True,
+        dtype,
+        noncontiguous=noncontiguous,
     )
-    v = torch.randn(
+    v = _make_input(
         case.batch_size,
         seqlen_k,
         case.num_kv_heads,
         case.head_dim_v,
-        dtype=dtype,
-        device="cuda",
-        requires_grad=True,
+        dtype,
+        noncontiguous=noncontiguous,
     )
     mask_func = make_mask_func(case)
     plan = create_mask_plan(mask_func, q, k, v)

@@ -89,6 +89,10 @@ The default GPU smoke suite contains the original 144 randomly stratified repres
 
 ![Static-mask attention performance on NVIDIA GB300](docs/assets/static_mask_benchmark.png)
 
+![Static-mask attention performance on NVIDIA GB300, Dqk=192 and Dv=128](docs/assets/static_mask_benchmark_d192.png)
+
+![Static-mask attention performance on NVIDIA GB300, Dqk=Dv=256](docs/assets/static_mask_benchmark_d256.png)
+
 ## Attribution and License
 
 Thanks to FlashAttention. The core implementation is derived from the FlashAttention CuTe DSL

@@ -11,12 +11,15 @@ from benchmarks.benchmark_flex_attn import (
     DOCUMENT_LENGTHS_128K,
     HSTU_DOCUMENT_MAX,
     HSTU_DOCUMENT_MIN,
+    HEAD_DIM_CONFIGS,
     MASK_NAMES,
     STANDARD_SEQLEN,
     Workload,
     _causal_block_stats,
+    _fa4_block_mask_size,
     _make_fa4_runner,
     _phase_flops,
+    _torch_kernel_options,
     endpoint_visible,
     main,
     make_mask_spec,
@@ -150,6 +153,48 @@ def test_active_flop_formulas():
     )
 
 
+@pytest.mark.parametrize(
+    "head_dim,head_dim_v",
+    HEAD_DIM_CONFIGS.values(),
+)
+def test_standard_workload_head_dim_configs(head_dim, head_dim_v):
+    workload = Workload(seqlen=128, head_dim=head_dim, head_dim_v=head_dim_v)
+    assert (workload.head_dim, workload.head_dim_v) == (head_dim, head_dim_v)
+
+
+def test_standard_workload_rejects_unsupported_head_dim_pair():
+    with pytest.raises(ValueError, match="supports"):
+        Workload(seqlen=128, head_dim=192, head_dim_v=192)
+
+
+@pytest.mark.parametrize(
+    "head_dim,expected_block_size",
+    ((128, (256, 128)), (192, (256, 256)), (256, (256, 128))),
+)
+def test_fa4_block_mask_size_matches_supported_metadata_abi(head_dim, expected_block_size):
+    head_dim_qk, head_dim_v = HEAD_DIM_CONFIGS[head_dim]
+    workload = Workload(
+        seqlen=128,
+        head_dim=head_dim_qk,
+        head_dim_v=head_dim_v,
+    )
+    assert _fa4_block_mask_size(workload) == expected_block_size
+
+
+@pytest.mark.parametrize(
+    "head_dim,expected_options",
+    ((128, None), (192, {"fwd_num_stages": 2}), (256, {"fwd_num_stages": 2})),
+)
+def test_torch_kernel_options_fit_gb300_shared_memory(head_dim, expected_options):
+    head_dim_qk, head_dim_v = HEAD_DIM_CONFIGS[head_dim]
+    workload = Workload(
+        seqlen=128,
+        head_dim=head_dim_qk,
+        head_dim_v=head_dim_v,
+    )
+    assert _torch_kernel_options(workload) == expected_options
+
+
 def test_fa4_causal_uses_native_path():
     workload = Workload(seqlen=256)
     shape = (1, workload.seqlen, workload.num_q_heads, workload.head_dim)
@@ -187,9 +232,20 @@ def test_fa4_causal_uses_native_path():
 
 
 def test_benchmark_dry_run_does_not_require_cuda_runtime(capsys):
-    main(["--dry-run", "--seqlen", "256", "--mask", "causal,hstu"])
+    main(
+        [
+            "--dry-run",
+            "--seqlen",
+            "256",
+            "--head-dim",
+            "192",
+            "--mask",
+            "causal,hstu",
+        ]
+    )
     output = capsys.readouterr().out
     assert "masks=2" in output
+    assert "Dqk=192 Dv=128" in output
     assert "causal: nfunc=1" in output
     assert "hstu: nfunc=5" in output
 

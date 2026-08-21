@@ -27,6 +27,11 @@ from flex_attn.plan.kernels.packed_mask import (
     apply_loaded_arbitrary_mask,
     load_mask_payload,
 )
+from flex_attn.runtime.dsl_utils import (
+    as_bshkrd_tensor,
+    assume_tensor_aligned,
+    struct_scalar_ptr,
+)
 
 
 @cute.jit
@@ -333,52 +338,74 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_output = 1.0
         s_lse = s_q
         h_r = h_q // h_k
-        s_q64 = Int64(s_q)
-        s_k64 = Int64(s_k)
         s_lse64 = Int64(s_lse)
-        d64 = cute.assume(Int64(d), divby=128)
         h_r64 = Int64(h_r)
         h_k64 = Int64(h_k)
         b64 = Int64(b)
-        s_q_total = (
-            q_tensor.shape[1]
-            if cum_seqlen_q is not None and q_rank == 5
-            else (q_tensor.shape[0] if cum_seqlen_q is not None else s_q64)
-        )
-        s_k_total = (
-            k_tensor.shape[1]
-            if cum_seqlen_k is not None and k_rank == 5
-            else (k_tensor.shape[0] if cum_seqlen_k is not None else s_k64)
-        )
-        stride_b_qo = h_r64 * h_k64 * s_q64 * d64 if cum_seqlen_q is None else 0
-        stride_b_kv = h_k64 * s_k64 * d64 if cum_seqlen_k is None else 0
         b_lse = b64 if cum_seqlen_q is None else 1
         stride_b_lse = h_r64 * h_k64 * s_lse64 if cum_seqlen_q is None else 0
 
+        varlen_q = cum_seqlen_q is not None
+        varlen_k = cum_seqlen_k is not None
+        q_norm = as_bshkrd_tensor(q_tensor, h_k, h_r, varlen_q)
+        o_norm = as_bshkrd_tensor(o_tensor, h_k, h_r, varlen_q)
+        k_norm = as_bshkrd_tensor(k_tensor, h_k, 1, varlen_k)
+        v_norm = as_bshkrd_tensor(v_tensor, h_k, 1, varlen_k)
+        q_norm, k_norm, v_norm, o_norm = [
+            assume_tensor_aligned(tensor)
+            for tensor in (q_norm, k_norm, v_norm, o_norm)
+        ]
+        s_q_total = q_norm.shape[1]
+        s_k_total = k_norm.shape[1]
+
         # (s, d, ((h_r, h_k), b))
-        q_layout = cute.make_layout(
-            (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+        q = cute.make_tensor(
+            q_norm.iterator,
+            cute.make_layout(
+                (s_q_total, d, ((h_r, h_k), b)),
+                stride=(
+                    q_norm.stride[1],
+                    q_norm.stride[4],
+                    ((q_norm.stride[3], q_norm.stride[2]), q_norm.stride[0]),
+                ),
+            ),
         )
-        q = cute.make_tensor(q_tensor.iterator, q_layout)
         # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-        k_layout = cute.make_layout(
-            (s_k_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_k64, 1, ((0, d64), stride_b_kv)),
+        k = cute.make_tensor(
+            k_norm.iterator,
+            cute.make_layout(
+                (s_k_total, d, ((h_r, h_k), b)),
+                stride=(
+                    k_norm.stride[1],
+                    k_norm.stride[4],
+                    ((0, k_norm.stride[2]), k_norm.stride[0]),
+                ),
+            ),
         )
-        k = cute.make_tensor(k_tensor.iterator, k_layout)
         # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-        v_layout = cute.make_layout(
-            (d, s_k_total, ((h_r, h_k), b)),
-            stride=(1, d64 * h_k64, ((0, d64), stride_b_kv)),
+        v = cute.make_tensor(
+            v_norm.iterator,
+            cute.make_layout(
+                (d, s_k_total, ((h_r, h_k), b)),
+                stride=(
+                    v_norm.stride[4],
+                    v_norm.stride[1],
+                    ((0, v_norm.stride[2]), v_norm.stride[0]),
+                ),
+            ),
         )
-        v = cute.make_tensor(v_tensor.iterator, v_layout)
         # (s, d, ((h_r, h_k), b))
-        o_layout = cute.make_layout(
-            (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+        o = cute.make_tensor(
+            o_norm.iterator,
+            cute.make_layout(
+                (s_q_total, d, ((h_r, h_k), b)),
+                stride=(
+                    o_norm.stride[1],
+                    o_norm.stride[4],
+                    ((o_norm.stride[3], o_norm.stride[2]), o_norm.stride[0]),
+                ),
+            ),
         )
-        o = cute.make_tensor(o_tensor.iterator, o_layout)
         if cutlass.const_expr(lse_tensor is not None):
             # (s, ((h_r, h_k), b))
             lse_layout = cute.make_layout(
@@ -565,7 +592,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 Int64, self.mma_corr_stage * 2
             ]  # mma_corr_{producer,consumer}
             # A CTA-wide "TMEM lifetime" barrier used to safely deallocate TMEM after all users finish.
-            tmem_dealloc_mbar_ptr: Int64
+            tmem_dealloc_mbar: Int64
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # CLC pipeline barriers and response buffer
@@ -766,11 +793,11 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            struct_scalar_ptr(storage.tmem_holding_buf),
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=struct_scalar_ptr(storage.tmem_dealloc_mbar),
         )
         clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_clc_consumer_threads = self.cta_group_size * self.threads_per_warp * (

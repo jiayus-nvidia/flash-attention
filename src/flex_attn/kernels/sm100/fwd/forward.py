@@ -28,7 +28,7 @@ from flex_attn.plan.kernels.packed_mask import (
     softmax_arbitrary_forward_qstage1_n_direction_sm100,
 )
 from flex_attn.plan.kernels import BlockSparseTensors
-from flex_attn.runtime.dsl_utils import assume_tensor_aligned
+from flex_attn.runtime.dsl_utils import assume_tensor_aligned, struct_scalar_ptr
 from flex_attn.runtime.logging import flex_log
 from flex_attn.kernels.sm100.fwd.named_barrier import NamedBarrierFwdSm100
 from flex_attn.kernels.common.pack_gqa import (
@@ -596,7 +596,7 @@ class _FlexAttentionForwardSm100Base:
             mbar_load_epi: cute.struct.MemRange[Int64, load_epi_mbar_size]
             mbar_s0_s1_sequence: cute.struct.MemRange[Int64, 2 * 2]
             # Tmem dealloc cluster barrier
-            tmem_dealloc_mbar_ptr: Int64
+            tmem_dealloc_mbar: Int64
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # Smem tensors
@@ -739,11 +739,11 @@ class _FlexAttentionForwardSm100Base:
         )
         # Tensor memory dealloc barrier init
         tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            struct_scalar_ptr(storage.tmem_holding_buf),
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=struct_scalar_ptr(storage.tmem_dealloc_mbar),
         )
 
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
@@ -1599,7 +1599,7 @@ class _FlexAttentionForwardSm100Base:
         softmax.apply_exp2_convert(
             tSrS_t2r,
             tSrP_r2t,
-            ex2_emu_freq=self.ex2_emu_freq if const_expr(mask_fn is None) else 0,
+            ex2_emu_freq=self.ex2_emu_freq,
             ex2_emu_start_frg=self.ex2_emu_start_frg,
         )
         # Sequence barrier arrive

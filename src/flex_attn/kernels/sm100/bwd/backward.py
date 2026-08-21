@@ -12,7 +12,6 @@ from cutlass.pipeline import PipelineAsync
 from cutlass.utils import LayoutEnum
 
 import cuda.bindings.driver as cuda
-import quack.activation
 from flex_attn.kernels.common import barrier, copy_utils, pipeline
 from flex_attn.kernels.common import device_utils as utils
 from flex_attn.kernels.sm100.blackwell_helpers import gemm_ptx_w_idx, gemm_w_idx  # noqa
@@ -3256,7 +3255,7 @@ class FlexAttentionBackwardSm100:
                                     utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
                                 )
                             tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
-                                quack.activation.sub_packed_f32x2(
+                                utils.sub_packed_f32x2(
                                     (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
                                 )
                             )

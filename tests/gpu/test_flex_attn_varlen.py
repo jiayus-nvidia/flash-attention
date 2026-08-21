@@ -35,6 +35,25 @@ def _assert_default_sm100_forward_topology(plan, case) -> None:
     assert packed_plan.plan_signature.kernel_family == expected_family
 
 
+def _make_input(
+    total_seqlen: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    *,
+    noncontiguous: bool,
+) -> torch.Tensor:
+    shape = (
+        (num_heads, total_seqlen, head_dim)
+        if noncontiguous
+        else (total_seqlen, num_heads, head_dim)
+    )
+    tensor = torch.randn(shape, dtype=dtype, device="cuda")
+    if noncontiguous:
+        tensor = tensor.transpose(0, 1)
+    return tensor.requires_grad_()
+
+
 def _visible_columns(endpoints: torch.Tensor, seqlen_k: int) -> torch.Tensor:
     columns = torch.arange(seqlen_k, device=endpoints.device)
     visible = columns < endpoints[0]
@@ -190,17 +209,27 @@ def test_flex_attn_varlen(case):
     torch.manual_seed(case.seed)
     cu_q = _prefix(case.q_lengths, torch.device("cuda"))
     cu_k = _prefix(case.k_lengths, torch.device("cuda"))
-    q = torch.randn(
-        sum(case.q_lengths), case.num_q_heads, case.head_dim,
-        dtype=dtype, device="cuda", requires_grad=True,
+    noncontiguous = case.case_id == 554
+    q = _make_input(
+        sum(case.q_lengths),
+        case.num_q_heads,
+        case.head_dim,
+        dtype,
+        noncontiguous=noncontiguous,
     )
-    k = torch.randn(
-        sum(case.k_lengths), case.num_kv_heads, case.head_dim,
-        dtype=dtype, device="cuda", requires_grad=True,
+    k = _make_input(
+        sum(case.k_lengths),
+        case.num_kv_heads,
+        case.head_dim,
+        dtype,
+        noncontiguous=noncontiguous,
     )
-    v = torch.randn(
-        sum(case.k_lengths), case.num_kv_heads, case.head_dim_v,
-        dtype=dtype, device="cuda", requires_grad=True,
+    v = _make_input(
+        sum(case.k_lengths),
+        case.num_kv_heads,
+        case.head_dim_v,
+        dtype,
+        noncontiguous=noncontiguous,
     )
     mask_func = make_mask_func(case)
     plan = create_mask_plan(

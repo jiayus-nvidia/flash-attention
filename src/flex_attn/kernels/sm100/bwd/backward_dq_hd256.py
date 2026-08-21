@@ -32,6 +32,7 @@ from flex_attn.plan.kernels.packed_mask import (
     load_mask_payload,
 )
 from flex_attn.plan.kernels import BlockSparseTensors
+from flex_attn.runtime.dsl_utils import struct_scalar_ptr
 
 
 @cute.jit
@@ -596,7 +597,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 cutlass.Int64, self.load_compute_sum_OdO_stage * 2
             ]
             # A CTA-wide "TMEM lifetime" barrier used to safely deallocate TMEM after all users finish.
-            tmem_dealloc_mbar_ptr: Int64
+            tmem_dealloc_mbar: Int64
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # CLC pipeline barriers and response buffer
@@ -827,11 +828,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            struct_scalar_ptr(storage.tmem_holding_buf),
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_ids[0],
             is_two_cta=True,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=struct_scalar_ptr(storage.tmem_dealloc_mbar),
         )
         tmem.allocate(self.tmem_alloc_cols)
         tmem.wait_for_alloc()

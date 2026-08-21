@@ -78,6 +78,11 @@ BACKEND_NAMES = ("flex", "fa4", "magi", "torch")
 DEFAULT_BACKEND_NAMES = ("flex", "magi", "torch")
 PHASE_NAMES = ("forward", "backward", "combined")
 TORCH_RECOMPILE_LIMIT = 64
+HEAD_DIM_CONFIGS = {
+    128: (128, 128),
+    192: (192, 128),
+    256: (256, 256),
+}
 
 
 @dataclass(frozen=True)
@@ -97,8 +102,10 @@ class Workload:
             raise ValueError("seqlen must be positive")
         if self.num_q_heads != self.num_kv_heads:
             raise ValueError("the standard benchmark requires Hq=Hkv")
-        if (self.head_dim, self.head_dim_v) != (128, 128):
-            raise ValueError("the standard benchmark requires Dqk=Dv=128")
+        if (self.head_dim, self.head_dim_v) not in HEAD_DIM_CONFIGS.values():
+            raise ValueError(
+                f"the standard benchmark supports (Dqk,Dv) in {tuple(HEAD_DIM_CONFIGS.values())}"
+            )
         if self.dtype != torch.bfloat16:
             raise ValueError("the standard benchmark requires BF16")
 
@@ -899,7 +906,7 @@ def _make_fa4_runner(
     fa4: Fa4Modules,
     compiled_create_block_mask: Callable[..., Any],
 ) -> BackendRunner:
-    block_size = (256, 128)
+    block_size = _fa4_block_mask_size(workload)
     if spec.name == "causal":
 
         def build_metadata():
@@ -971,6 +978,12 @@ def _make_fa4_runner(
     )
 
 
+def _fa4_block_mask_size(workload: Workload) -> tuple[int, int]:
+    if (workload.head_dim, workload.head_dim_v) == (192, 128):
+        return (256, 256)
+    return (256, 128)
+
+
 def _magi_linear_from_csr(
     csr_tensors: Sequence[torch.Tensor],
     block_size: tuple[int, int],
@@ -1010,8 +1023,17 @@ def _make_magi_runner(
             headdim_v=workload.head_dim_v,
         )
     )
-    if bwd_block_size != (128, 256):
-        raise RuntimeError(f"unexpected Magi backend D128 backward tile: {bwd_block_size}")
+    expected_bwd_block_size = {
+        (128, 128): (128, 256),
+        (192, 128): (128, 256),
+        (256, 256): (256, 128),
+    }[(workload.head_dim, workload.head_dim_v)]
+    if bwd_block_size != expected_bwd_block_size:
+        raise RuntimeError(
+            "unexpected Magi backend backward tile for "
+            f"Dqk={workload.head_dim}, Dv={workload.head_dim_v}: "
+            f"expected {expected_bwd_block_size}, got {bwd_block_size}"
+        )
 
     arbitrary_func = torch.zeros(
         1,
@@ -1080,6 +1102,7 @@ def _make_torch_runner(
 ) -> BackendRunner:
     block_size = (128, 128)
     mask_mod = make_torch_mask_mod(spec, endpoints)
+    kernel_options = _torch_kernel_options(workload)
 
     def build_metadata():
         return compiled_create_block_mask(
@@ -1101,7 +1124,7 @@ def _make_torch_runner(
             scale=1.0 / math.sqrt(workload.head_dim),
             enable_gqa=False,
             return_lse=return_lse,
-            kernel_options=None,
+            kernel_options=kernel_options,
         )
 
     return BackendRunner(
@@ -1112,6 +1135,12 @@ def _make_torch_runner(
         normalize_bshd=lambda tensor: tensor.transpose(1, 2).contiguous(),
         normalize_lse=lambda tensor: tensor,
     )
+
+
+def _torch_kernel_options(workload: Workload) -> dict[str, int] | None:
+    if max(workload.head_dim, workload.head_dim_v) > 128:
+        return {"fwd_num_stages": 2}
+    return None
 
 
 def make_backend_runners(
@@ -1391,6 +1420,8 @@ def benchmark_mask(
     result: dict[str, Any] = {
         "mask": spec.name,
         "title": spec.title,
+        "head_dim": workload.head_dim,
+        "head_dim_v": workload.head_dim_v,
         "nfunc": spec.nfunc,
         "visible_pairs": spec.visible_pairs,
         "element_density": spec.density,
@@ -1771,6 +1802,8 @@ def add_comparisons(results: dict[str, Any]) -> None:
 def write_csv(path: Path, cases: Sequence[dict[str, Any]]) -> None:
     fields = (
         "mask",
+        "head_dim",
+        "head_dim_v",
         "backend",
         "status",
         "density",
@@ -1795,6 +1828,8 @@ def write_csv(path: Path, cases: Sequence[dict[str, Any]]) -> None:
                 writer.writerow(
                     {
                         "mask": case["mask"],
+                        "head_dim": case["head_dim"],
+                        "head_dim_v": case["head_dim_v"],
                         "backend": backend,
                         "status": backend_result["status"],
                         "density": case["element_density"],
@@ -1837,7 +1872,8 @@ def render_readme_tables(results: dict[str, Any]) -> str:
         "definitions below.",
         "",
         f"All values are medians on {provenance.get('gpu', 'B300/SM103')} with BF16, "
-        f"B=1, S={seqlen_label}, Hq=Hkv=4, and Dqk=Dv=128.",
+        f"B=1, S={seqlen_label}, Hq=Hkv=4, Dqk={workload.get('head_dim')}, "
+        f"and Dv={workload.get('head_dim_v')}.",
         f"Each kernel metric uses {protocol.get('warmup', 5)} warmups and "
         f"{protocol.get('runs', 10)} measured runs; metadata uses "
         f"{protocol.get('metadata_runs', 3)} measured runs. L2 is flushed before every "
@@ -2065,6 +2101,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seqlen", type=int, default=STANDARD_SEQLEN)
     parser.add_argument("--correctness-seqlen", type=int, default=CORRECTNESS_SEQLEN)
+    parser.add_argument(
+        "--head-dim",
+        type=int,
+        choices=tuple(HEAD_DIM_CONFIGS),
+        default=128,
+        help="128=(128,128), 192=(192,128), 256=(256,256)",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--metadata-runs", type=int, default=3)
@@ -2101,9 +2144,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.warmup < 0 or args.runs <= 0 or args.metadata_runs <= 0:
         parser.error("warmup must be non-negative; runs and metadata-runs must be positive")
     if args.dry_run:
+        head_dim, head_dim_v = HEAD_DIM_CONFIGS[args.head_dim]
         print(
             f"mode={args.mode} seqlen={args.seqlen} masks={len(masks)} "
-            f"backends={','.join(backends)} phases={','.join(phases)}"
+            f"Dqk={head_dim} Dv={head_dim_v} backends={','.join(backends)} "
+            f"phases={','.join(phases)}"
         )
         for name in masks:
             spec = make_mask_spec(name, args.seqlen)
@@ -2118,11 +2163,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     fa4 = load_fa4(args.fa4_root) if "fa4" in backends else None
     magi = load_magi(args.magi_root) if "magi" in backends else None
     output_dir = (args.output_dir or _default_output_dir()).resolve()
+    head_dim, head_dim_v = HEAD_DIM_CONFIGS[args.head_dim]
+    workload = Workload(
+        seqlen=args.seqlen,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+    )
     results: dict[str, Any] = {
         "schema_version": 1,
         "mode": args.mode,
         "provenance": collect_provenance(fa4, magi),
-        "workload": _workload_json(Workload(seqlen=args.seqlen)),
+        "workload": _workload_json(workload),
         "protocol": {
             "warmup": args.warmup,
             "runs": args.runs,
@@ -2143,7 +2194,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         flush=True,
     )
     if args.mode == "benchmark":
-        workload = Workload(seqlen=args.seqlen)
         for name in masks:
             spec = make_mask_spec(name, workload.seqlen)
             case = benchmark_mask(
@@ -2162,8 +2212,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             _write_result_files(output_dir, results)
     else:
         reference_seqlen = min(args.correctness_seqlen, args.seqlen)
-        reference_workload = Workload(seqlen=reference_seqlen)
-        full_workload = Workload(seqlen=args.seqlen)
+        reference_workload = Workload(
+            seqlen=reference_seqlen,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+        )
+        full_workload = workload
         for name in masks:
             reference_spec = make_mask_spec(name, reference_seqlen)
             results["correctness_fp32"].append(

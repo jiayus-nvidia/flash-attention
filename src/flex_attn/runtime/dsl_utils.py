@@ -6,6 +6,7 @@ import re
 from typing import Tuple
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 
 try:
     from triton.tools.disasm import extract
@@ -94,6 +95,43 @@ def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
     return torch.cuda.get_device_capability(device)
 
 
+def _has_aligned_pointer(tensor: torch.Tensor, align_bytes: int) -> bool:
+    address = (
+        tensor.storage_offset() * tensor.element_size()
+        if isinstance(tensor, FakeTensor)
+        else tensor.data_ptr()
+    )
+    return address % align_bytes == 0
+
+
+def _is_aligned_layout(tensor: torch.Tensor, align_bytes: int) -> bool:
+    if tensor.stride(-1) != 1 or not _has_aligned_pointer(tensor, align_bytes):
+        return False
+    stride_alignment = max(1, align_bytes // tensor.element_size())
+    return all(
+        stride == 0 or stride % stride_alignment == 0
+        for stride in tensor.stride()[:-1]
+    )
+
+
+def maybe_contiguous(
+    tensor: torch.Tensor | None,
+    align_bytes: int = 16,
+) -> torch.Tensor | None:
+    """Canonicalize a tensor to the pointer and stride alignment kernel ABI."""
+    if tensor is None:
+        return None
+    if tensor.is_contiguous():
+        return (
+            tensor
+            if _has_aligned_pointer(tensor, align_bytes)
+            else tensor.clone(memory_format=torch.contiguous_format)
+        )
+    if not _has_aligned_pointer(tensor, align_bytes):
+        return tensor.clone(memory_format=torch.contiguous_format)
+    return tensor if _is_aligned_layout(tensor, align_bytes) else tensor.contiguous()
+
+
 def assume_strides_aligned(t):
     """Assume all strides except the last are divisible by 128 bits.
 
@@ -112,7 +150,67 @@ def assume_tensor_aligned(t):
     return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t)))
 
 
-def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
+def as_bshkrd_tensor(
+    tensor: cute.Tensor,
+    h_k: cutlass.Int32,
+    h_r: cutlass.Int32,
+    varlen: bool,
+) -> cute.Tensor:
+    """Normalize (B,S,H,D)/(S,H,D) to a (B,S,H_k,H_r,D) view."""
+    if cutlass.const_expr(cute.rank(tensor.layout) == 5):
+        if cutlass.const_expr(varlen):
+            return cute.make_tensor(
+                tensor.iterator,
+                cute.make_layout(
+                    tensor.shape,
+                    stride=(
+                        0,
+                        tensor.stride[1],
+                        tensor.stride[2],
+                        tensor.stride[3],
+                        tensor.stride[4],
+                    ),
+                ),
+            )
+        return tensor
+    if cutlass.const_expr(cute.rank(tensor.layout) == 4):
+        return cute.make_tensor(
+            tensor.iterator,
+            cute.make_layout(
+                (tensor.shape[0], tensor.shape[1], h_k, h_r, tensor.shape[3]),
+                stride=(
+                    tensor.stride[0],
+                    tensor.stride[1],
+                    tensor.stride[2] * h_r,
+                    tensor.stride[2],
+                    tensor.stride[3],
+                ),
+            ),
+        )
+    assert cutlass.const_expr(cute.rank(tensor.layout) == 3), "Expected rank-3 varlen tensor"
+    assert cutlass.const_expr(varlen), "Rank-3 input is only valid for varlen"
+    return cute.make_tensor(
+        tensor.iterator,
+        cute.make_layout(
+            (1, tensor.shape[0], h_k, h_r, tensor.shape[2]),
+            stride=(
+                0,
+                tensor.stride[0],
+                tensor.stride[1] * h_r,
+                tensor.stride[1],
+                tensor.stride[2],
+            ),
+        ),
+    )
+
+
+def to_cute_tensor(
+    t,
+    assumed_align=16,
+    leading_dim=-1,
+    fully_dynamic=False,
+    enable_tvm_ffi=True,
+):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
     tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
     if fully_dynamic:
@@ -120,7 +218,6 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     if leading_dim == -1:
         leading_dim = t.ndim - 1
     return tensor.mark_layout_dynamic(leading_dim=leading_dim)
-
 
 
 def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:

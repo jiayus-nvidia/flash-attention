@@ -71,7 +71,11 @@ from flex_attn.kernels.sm100.fwd.forward_hd256 import (
 )
 from flex_attn.runtime.arch import SUPPORTED_ARCHES, get_device_arch
 from flex_attn.runtime.compile_cache import get_jit_cache
-from flex_attn.runtime.dsl_utils import get_broadcast_dims, to_cute_tensor
+from flex_attn.runtime.dsl_utils import (
+    get_broadcast_dims,
+    maybe_contiguous,
+    to_cute_tensor,
+)
 from flex_attn.runtime.fake_tensor import is_fake_mode
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH") is not None:
@@ -127,14 +131,6 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, alignment: int) -> None:
         )
     if head_dim % alignment != 0 or head_dim_v % alignment != 0:
         raise ValueError(f"head dimensions must be divisible by {alignment}")
-
-
-def _maybe_contiguous(tensor):
-    return (
-        tensor.contiguous()
-        if tensor is not None and tensor.stride(-1) != 1
-        else tensor
-    )
 
 
 def _validate_tensor(
@@ -405,7 +401,7 @@ def _flex_attn_fwd(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run packed arbitrary-mask forward."""
 
-    q, k, v = [_maybe_contiguous(tensor) for tensor in (q, k, v)]
+    q, k, v = [maybe_contiguous(tensor) for tensor in (q, k, v)]
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError("Q/K/V must be FP16 or BF16")
     if q.dtype != k.dtype or q.dtype != v.dtype:
@@ -1086,10 +1082,13 @@ def _flex_attn_bwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run packed arbitrary-mask backward."""
 
-    q, k, v, out, dout, lse, dlse = [
-        _maybe_contiguous(tensor)
-        for tensor in (q, k, v, out, dout, lse, dlse)
+    use_hd256_input_abi = q.shape[-1] == 256 and v.shape[-1] == 256
+    input_align_bytes = 128 if use_hd256_input_abi else 16
+    q, k, v, out, dout = [
+        maybe_contiguous(tensor, align_bytes=input_align_bytes)
+        for tensor in (q, k, v, out, dout)
     ]
+    lse, dlse = [maybe_contiguous(tensor) for tensor in (lse, dlse)]
     (
         is_varlen,
         batch_size,

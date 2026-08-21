@@ -41,6 +41,7 @@ from flex_attn.plan.kernels.packed_mask import (
     get_physical_subtile_count_bwd_sm90,
     load_mask_payload,
 )
+from flex_attn.runtime.dsl_utils import struct_scalar_ptr
 
 LAYOUT_RANK_CONSTANT = 3
 
@@ -955,7 +956,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 cutlass.Int64, self.mma_compute_dKdV_stage * 2
             ]
             tmem_holding_buf: cutlass.Int32
-            tmem_dealloc_mbar_ptr: cutlass.Int64
+            tmem_dealloc_mbar: cutlass.Int64
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
             clc_response: cute.struct.Align[
                 cute.struct.MemRange[Int32, 4], 16
@@ -1296,7 +1297,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
         sLSE = storage.sLSE.get_tensor(LSE_smem_layout)
         sSum_OdO = storage.sSum_OdO.get_tensor(sum_OdO_smem_layout)
-        tmem_holding_buf = storage.tmem_holding_buf
         # for 2cta, QT use different mem from Q
 
         sQT = storage.sQT.get_tensor(
@@ -1335,11 +1335,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
 
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            struct_scalar_ptr(storage.tmem_holding_buf),
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.load_warp_id,
             is_two_cta=True,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=struct_scalar_ptr(storage.tmem_dealloc_mbar),
         )
 
         tmem.allocate(self.tmem_alloc_cols)
