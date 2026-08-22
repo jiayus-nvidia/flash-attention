@@ -12,7 +12,7 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.pipeline as cutlass_pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
-from cutlass import Float32, Int32, Int64, const_expr, pipeline
+from cutlass import Float32, Int32, Int64, Uint32, const_expr, pipeline
 from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import BaseDSL
@@ -155,6 +155,7 @@ class _FlexAttentionForwardSm100Base:
         self.q_subtile_factor = q_subtile_factor
         is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
         self.is_sm103 = is_sm103
+        self.use_smem_mask_pipeline = False
         # SM103 full blocks can consume the row maximum returned by TMEM ld.red.
         # Partial blocks use a normal TMEM load and reduce after applying the mask.
         self.use_ldred_rowmax = is_sm103 and self.n_direction_qstage1
@@ -579,12 +580,20 @@ class _FlexAttentionForwardSm100Base:
         clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
         clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0
         load_epi_mbar_size = 2 if const_expr(self.overlap_sO_sQ) else 0
+        mask_mbar_size = 2 if const_expr(self.use_smem_mask_pipeline) else 0
+        sMask_size = (
+            self.m_block_size * SM100_FWD_MASK_PAYLOAD_WORDS * self.score_stage
+            if const_expr(self.use_smem_mask_pipeline)
+            else 0
+        )
 
         @cute.struct
         class SharedStorage:
             # m_barriers for pipelines
             mbar_load_Q: cute.struct.MemRange[Int64, self.q_stage * 2]
             mbar_load_KV: cute.struct.MemRange[Int64, self.kv_stage * 2]
+            mbar_load_mask_s0: cute.struct.MemRange[Int64, mask_mbar_size]
+            mbar_load_mask_s1: cute.struct.MemRange[Int64, mask_mbar_size]
             mbar_S_full_P_full_O_rescaled: cute.struct.MemRange[
                 Int64, self.score_stage * 2
             ]
@@ -603,6 +612,9 @@ class _FlexAttentionForwardSm100Base:
             # store row max and row sum
             sScale: cute.struct.MemRange[
                 Float32, self.score_stage * self.m_block_size * 2
+            ]
+            sMask: cute.struct.Align[
+                cute.struct.MemRange[Uint32, sMask_size], 16
             ]
             # CLC buffers placed here to utilize padding before sO's 1024-byte alignment.
             # This avoids adding bytes at the end when we're at the smem limit.
@@ -751,6 +763,7 @@ class _FlexAttentionForwardSm100Base:
         tma_warp = ThreadCooperativeGroup(1)
         load_warps = ThreadCooperativeGroup(len(self.load_warp_ids))
         load_threads = ThreadCooperativeGroup(len(self.load_warp_ids) * cute.arch.WARP_SIZE)
+        softmax_warps = ThreadCooperativeGroup(len(self.softmax0_warp_ids))
         softmax_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE * len(self.softmax0_warp_ids))
         correction_threads = ThreadCooperativeGroup(
             cute.arch.WARP_SIZE * len(self.correction_warp_ids)
@@ -804,6 +817,29 @@ class _FlexAttentionForwardSm100Base:
                 producer_group=load_threads,
                 consumer_group=mma_warp,
                 cta_layout_vmnk=cta_layout_vmnk,
+                defer_sync=True,
+            )
+        pipeline_mask_s0 = None
+        pipeline_mask_s1 = None
+        if const_expr(self.use_smem_mask_pipeline):
+            # Each N-direction stream owns one independent 2-KB mask slot.
+            # PipelineTmaAsync releases once per consumer warp, so this group
+            # counts warps rather than threads.
+            mask_tx_count = self.m_block_size * SM100_FWD_MASK_PAYLOAD_WORDS * 4
+            pipeline_mask_s0 = cutlass_pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.mbar_load_mask_s0.data_ptr(),
+                num_stages=1,
+                producer_group=tma_warp,
+                consumer_group=softmax_warps,
+                tx_count=mask_tx_count,
+                defer_sync=True,
+            )
+            pipeline_mask_s1 = cutlass_pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.mbar_load_mask_s1.data_ptr(),
+                num_stages=1,
+                producer_group=tma_warp,
+                consumer_group=softmax_warps,
+                tx_count=mask_tx_count,
                 defer_sync=True,
             )
         # This pipeline is not the typical producer-consumer pipeline. The "producer" mma warp
@@ -902,6 +938,22 @@ class _FlexAttentionForwardSm100Base:
         sScale = storage.sScale.get_tensor(
             cute.make_layout(self.score_stage * self.m_block_size * 2)
         )
+        sMask = None
+        if const_expr(self.use_smem_mask_pipeline):
+            sMask = storage.sMask.get_tensor(
+                cute.make_layout(
+                    (
+                        self.m_block_size,
+                        SM100_FWD_MASK_PAYLOAD_WORDS,
+                        self.score_stage,
+                    ),
+                    stride=(
+                        SM100_FWD_MASK_PAYLOAD_WORDS,
+                        1,
+                        self.m_block_size * SM100_FWD_MASK_PAYLOAD_WORDS,
+                    ),
+                )
+            )
 
         thr_mma_qk = tiled_mma_qk.get_slice(mma_tile_coord_v)
         thr_mma_pv = tiled_mma_pv.get_slice(mma_tile_coord_v)
@@ -1020,6 +1072,9 @@ class _FlexAttentionForwardSm100Base:
                 gmem_tiled_copy_Q,
                 pipeline_q,
                 pipeline_kv,
+                pipeline_mask_s0,
+                pipeline_mask_s1,
+                sMask,
                 pipeline_load_epi,
                 SeqlenInfoCls,
                 blocksparse_tensors,
@@ -1101,6 +1156,9 @@ class _FlexAttentionForwardSm100Base:
                 pipeline_p_lastsplit=pipeline_p_lastsplit,
                 pipeline_sm_stats=pipeline_sm_stats,
                 sm_stats_barrier=sm_stats_barrier,
+                pipeline_mask_s0=pipeline_mask_s0,
+                pipeline_mask_s1=pipeline_mask_s1,
+                sMask=sMask,
                 pipeline_s0_s1_sequence=pipeline_s0_s1_sequence,
                 SeqlenInfoCls=SeqlenInfoCls,
                 blocksparse_tensors=blocksparse_tensors,
@@ -1179,6 +1237,9 @@ class _FlexAttentionForwardSm100Base:
         gmem_tiled_copy_Q: Optional[cute.TiledCopy],
         pipeline_q: pipeline.PipelineAsync,
         pipeline_kv: pipeline.PipelineAsync,
+        pipeline_mask_s0: Optional[pipeline.PipelineAsync],
+        pipeline_mask_s1: Optional[pipeline.PipelineAsync],
+        sMask: Optional[cute.Tensor],
         pipeline_load_epi: Optional[pipeline.PipelineAsync],
         SeqlenInfoCls: Callable,
         blocksparse_tensors: BlockSparseTensors,
@@ -1202,6 +1263,15 @@ class _FlexAttentionForwardSm100Base:
         kv_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.kv_stage
         )
+        mask_s0_producer_state = None
+        mask_s1_producer_state = None
+        if const_expr(self.use_smem_mask_pipeline):
+            mask_s0_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 1
+            )
+            mask_s1_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 1
+            )
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
@@ -1277,19 +1347,44 @@ class _FlexAttentionForwardSm100Base:
                 K_or_V="V",
             )
 
-            kv_producer_state, q_producer_phase = self._produce_loads(
-                blocksparse_tensors,
-                batch_idx,
-                head_idx,
-                m_block,
-                seqlen,
-                kv_producer_state,
-                load_Q,
-                load_K,
-                load_V,
-                q_producer_phase,
-                thr_mma_qk.thr_idx,
-            )
+            if const_expr(self.use_smem_mask_pipeline):
+                (
+                    kv_producer_state,
+                    q_producer_phase,
+                    mask_s0_producer_state,
+                    mask_s1_producer_state,
+                ) = self._produce_loads(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    seqlen,
+                    kv_producer_state,
+                    load_Q,
+                    load_K,
+                    load_V,
+                    q_producer_phase,
+                    thr_mma_qk.thr_idx,
+                    pipeline_mask_s0,
+                    pipeline_mask_s1,
+                    mask_s0_producer_state,
+                    mask_s1_producer_state,
+                    sMask,
+                )
+            else:
+                kv_producer_state, q_producer_phase = self._produce_loads(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    seqlen,
+                    kv_producer_state,
+                    load_Q,
+                    load_K,
+                    load_V,
+                    q_producer_phase,
+                    thr_mma_qk.thr_idx,
+                )
 
             work_tile = tile_scheduler.advance_to_next_work()
             if const_expr(pipeline_load_epi is not None):
@@ -1301,6 +1396,9 @@ class _FlexAttentionForwardSm100Base:
 
         if issue_kv_for_this_warp:
             pipeline_kv.producer_tail(kv_producer_state)
+            if const_expr(self.use_smem_mask_pipeline):
+                pipeline_mask_s0.producer_tail(mask_s0_producer_state)
+                pipeline_mask_s1.producer_tail(mask_s1_producer_state)
         # This is equivalent to pipeline_q.producer_tail for the TMA-Q producer warp.
         if issue_q_for_this_warp:
             pipeline_q.producer_acquire_w_index_phase(
@@ -1321,6 +1419,9 @@ class _FlexAttentionForwardSm100Base:
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
         sm_stats_barrier: pipeline.NamedBarrier,
+        pipeline_mask_s0: Optional[pipeline.PipelineAsync],
+        pipeline_mask_s1: Optional[pipeline.PipelineAsync],
+        sMask: Optional[cute.Tensor],
         pipeline_s0_s1_sequence: Optional[pipeline.PipelineAsync],
         SeqlenInfoCls: Callable,
         blocksparse_tensors: BlockSparseTensors = None,
@@ -1381,6 +1482,11 @@ class _FlexAttentionForwardSm100Base:
         mma_si_consumer_phase = Int32(0)
         sm_stats_producer_phase = Int32(1)
         s0_s1_sequence_phase = Int32(1 if stage == 0 else 0)
+        mask_consumer_state = None
+        if const_expr(self.use_smem_mask_pipeline):
+            mask_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 1
+            )
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1430,27 +1536,56 @@ class _FlexAttentionForwardSm100Base:
             )
             sm_stats_producer_phase ^= 1
             if const_expr(self.n_direction_qstage1):
-                (
-                    mma_si_consumer_phase,
-                    sm_stats_producer_phase,
-                    empty_tile,
-                ) = softmax_arbitrary_forward_qstage1_n_direction_sm100(
-                    blocksparse_tensors,
-                    batch_idx,
-                    head_idx,
-                    m_block,
-                    seqlen,
-                    softmax_step,
-                    mma_si_consumer_phase,
-                    sm_stats_producer_phase,
-                    sm_stats_barrier,
-                    stage,
-                    thr_mma_qk.thr_idx,
-                    tidx,
-                    self.cta_tiler[0] * self.cta_group_size,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    SM100_FWD_MASK_PAYLOAD_WORDS,
-                )
+                if const_expr(self.use_smem_mask_pipeline):
+                    (
+                        mma_si_consumer_phase,
+                        sm_stats_producer_phase,
+                        empty_tile,
+                        mask_consumer_state,
+                    ) = softmax_arbitrary_forward_qstage1_n_direction_sm100(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        seqlen,
+                        softmax_step,
+                        mma_si_consumer_phase,
+                        sm_stats_producer_phase,
+                        sm_stats_barrier,
+                        stage,
+                        thr_mma_qk.thr_idx,
+                        tidx,
+                        self.cta_tiler[0] * self.cta_group_size,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        SM100_FWD_MASK_PAYLOAD_WORDS,
+                        pipeline_mask=(
+                            pipeline_mask_s0 if const_expr(stage == 0) else pipeline_mask_s1
+                        ),
+                        mask_consumer_state=mask_consumer_state,
+                        sMask=sMask[None, None, stage],
+                    )
+                else:
+                    (
+                        mma_si_consumer_phase,
+                        sm_stats_producer_phase,
+                        empty_tile,
+                    ) = softmax_arbitrary_forward_qstage1_n_direction_sm100(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        seqlen,
+                        softmax_step,
+                        mma_si_consumer_phase,
+                        sm_stats_producer_phase,
+                        sm_stats_barrier,
+                        stage,
+                        thr_mma_qk.thr_idx,
+                        tidx,
+                        self.cta_tiler[0] * self.cta_group_size,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        SM100_FWD_MASK_PAYLOAD_WORDS,
+                    )
             else:
                 (
                     mma_si_consumer_phase,

@@ -14,6 +14,9 @@ from cutlass import Boolean, Float32, Int32, const_expr
 from flex_attn.kernels.common import device_utils as utils
 from flex_attn.kernels.sm100 import blackwell_helpers as sm100_utils
 from flex_attn.kernels.sm100 import mma_desc as sm100_desc
+from flex_attn.kernels.sm100.fwd.forward_config import (
+    SM100_FWD_MASK_PAYLOAD_WORDS,
+)
 from flex_attn.kernels.sm100.fwd.named_barrier import NamedBarrierFwdSm100
 from flex_attn.plan.kernels import BlockSparseTensors
 from flex_attn.plan.kernels.packed_mask import (
@@ -105,6 +108,8 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
             use_clc_scheduler=use_clc_scheduler,
             _enable_qstage1_n_direction=True,
         )
+        # All generic 2CTA kernels share the same packed-mask pipeline.
+        self.use_smem_mask_pipeline = self.use_2cta_instrs
         if self.use_2cta_instrs:
             self._tune = _QSTAGE1_2CTA_TUNING_CONFIG.get(
                 (self.head_dim_padded, self.is_sm103), {}
@@ -146,7 +151,12 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
         load_K,
         load_V,
         q_producer_phase,
-        _mma_thread_idx,
+        mma_thread_idx,
+        pipeline_mask_s0=None,
+        pipeline_mask_s1=None,
+        mask_s0_producer_state=None,
+        mask_s1_producer_state=None,
+        sMask=None,
     ):
         return produce_arbitrary_forward_loads_qstage1_n_direction_sm100(
             blocksparse_tensors,
@@ -161,6 +171,14 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
             q_producer_phase,
             self.cta_tiler[0] * self.cta_group_size,
             self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            payload_subtile_idx=mma_thread_idx,
+            payload_groups=self.m_block_size,
+            payload_words=SM100_FWD_MASK_PAYLOAD_WORDS,
+            pipeline_mask_s0=pipeline_mask_s0,
+            pipeline_mask_s1=pipeline_mask_s1,
+            mask_s0_producer_state=mask_s0_producer_state,
+            mask_s1_producer_state=mask_s1_producer_state,
+            sMask=sMask,
         )
 
     @cute.jit

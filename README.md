@@ -76,7 +76,7 @@ PYTHONPATH=src:. python -m pytest tests/gpu --run-gpu --full-random-cases
 ```
 
 The default GPU smoke suite contains the original 144 randomly stratified representatives plus
-10 directed SM100 head-dimension cases, for a total of 154 cases. `--full-random-cases` runs all
+14 directed SM100 head-dimension cases, for a total of 158 cases. `--full-random-cases` runs all
 1,024 cases generated with the fixed seed.
 
 ## Standard Static-Mask Benchmark

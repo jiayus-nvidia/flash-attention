@@ -10,16 +10,18 @@ from typing import Callable, Optional
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import cpasync
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
 # Import data structures from block_sparsity
 from flex_attn.kernels.common import barrier
-from flex_attn.plan.kernels import BlockSparseTensors
-from flex_attn.kernels.sm90.named_barrier import NamedBarrierBwd
 from flex_attn.kernels.common.seqlen_info import SeqlenInfoQK
 from flex_attn.kernels.sm90.forward_config import _sm90_fwd_mask_payload_group_idx
+from flex_attn.kernels.sm90.named_barrier import NamedBarrierBwd
+from flex_attn.plan.kernels import BlockSparseTensors
+from flex_attn.runtime.dsl_utils import bulk_copy
 from quack import copy_utils
 
 
@@ -224,6 +226,65 @@ def load_mask_payload(
     r_mask = cute.make_rmem_tensor_like(g_mask, Uint32)
     cute.autovec_copy(g_mask, r_mask)
     return r_mask
+
+
+@cute.jit
+def load_mask_payload_to_smem(
+    mask_payloads: cute.Tensor,
+    payload_idx: Int32,
+    subtile_idx: Int32,
+    s_mask: cute.Tensor,
+    mask_pipeline,
+    producer_state,
+    payload_groups: cutlass.Constexpr[int],
+    payload_words: cutlass.Constexpr[int],
+):
+    """Stage one CTA-native mask payload with a bulk G2S copy."""
+
+    mask_iter = mask_payloads.iterator + cute.crd2idx(
+        (payload_idx, subtile_idx, Int32(0), Int32(0)),
+        mask_payloads.layout,
+    )
+    mask_ptr = cute.make_ptr(
+        Uint32,
+        mask_iter.toint(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    # Keep this view one-dimensional. A nested (group, word) layout lowers to
+    # one 16-byte bulk copy per group and can exhaust the async-copy queue.
+    mask_layout = cute.make_layout((payload_groups * payload_words,))
+    g_mask = cute.make_tensor(mask_ptr, mask_layout)
+    s_mask_linear = cute.make_tensor(s_mask.iterator, mask_layout)
+    copy_atom_mask = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Uint32)
+
+    mask_pipeline.producer_acquire(producer_state)
+    bulk_copy(
+        copy_atom_mask,
+        g_mask,
+        s_mask_linear,
+        mbar_ptr=mask_pipeline.producer_get_barrier(producer_state),
+    )
+    producer_state.advance()
+    return producer_state
+
+
+@cute.jit
+def consume_mask_payload_from_smem(
+    s_mask: cute.Tensor,
+    payload_group_idx: Int32,
+    mask_pipeline,
+    consumer_state,
+):
+    """Wait for one staged payload and copy this thread's words to registers."""
+
+    mask_pipeline.consumer_wait(consumer_state)
+    s_mask_thread = s_mask[payload_group_idx, None]
+    r_mask = cute.make_rmem_tensor_like(s_mask_thread, Uint32)
+    cute.autovec_copy(s_mask_thread, r_mask)
+    mask_pipeline.consumer_release(consumer_state)
+    consumer_state.advance()
+    return r_mask, consumer_state
 
 
 # NOTE [SM100 block-sparse empty tiles: mbarrier contract]
@@ -1036,6 +1097,50 @@ def _get_arbitrary_forward_block_by_traversal_ordinal(
 
 
 @cute.jit
+def _produce_arbitrary_forward_mask_by_traversal_ordinal(
+    traversal_ordinal: Int32,
+    partial_count: Int32,
+    payload_base: Int32,
+    mask_payloads: cute.Tensor,
+    payload_subtile_idx: Int32,
+    payload_groups: cutlass.Constexpr[int],
+    payload_words: cutlass.Constexpr[int],
+    pipeline_mask_s0,
+    pipeline_mask_s1,
+    mask_s0_producer_state,
+    mask_s1_producer_state,
+    sMask: cute.Tensor,
+):
+    """Issue the mask copy owned by one qstage1 traversal ordinal."""
+
+    if traversal_ordinal < partial_count:
+        partial_ordinal = partial_count - Int32(1) - traversal_ordinal
+        if (traversal_ordinal & Int32(1)) == Int32(0):
+            mask_s0_producer_state = load_mask_payload_to_smem(
+                mask_payloads,
+                payload_base + partial_ordinal,
+                payload_subtile_idx,
+                sMask[None, None, 0],
+                pipeline_mask_s0,
+                mask_s0_producer_state,
+                payload_groups,
+                payload_words,
+            )
+        else:
+            mask_s1_producer_state = load_mask_payload_to_smem(
+                mask_payloads,
+                payload_base + partial_ordinal,
+                payload_subtile_idx,
+                sMask[None, None, 1],
+                pipeline_mask_s1,
+                mask_s1_producer_state,
+                payload_groups,
+                payload_words,
+            )
+    return mask_s0_producer_state, mask_s1_producer_state
+
+
+@cute.jit
 def produce_arbitrary_forward_loads_qstage1_n_direction_sm100(
     blocksparse_tensors: BlockSparseTensors,
     batch_idx: Int32,
@@ -1049,6 +1154,14 @@ def produce_arbitrary_forward_loads_qstage1_n_direction_sm100(
     q_producer_phase: Int32,
     sparse_tile_m: cutlass.Constexpr[int],
     qhead_per_kvhead: cutlass.Constexpr[int],
+    payload_subtile_idx: Int32 = Int32(0),
+    payload_groups: cutlass.Constexpr[int] = 128,
+    payload_words: cutlass.Constexpr[int] = 4,
+    pipeline_mask_s0=None,
+    pipeline_mask_s1=None,
+    mask_s0_producer_state=None,
+    mask_s1_producer_state=None,
+    sMask: Optional[cute.Tensor] = None,
 ):
     """Produce K/K/V interleaving for the generic qstage1 N-direction mainloop."""
 
@@ -1057,7 +1170,7 @@ def produce_arbitrary_forward_loads_qstage1_n_direction_sm100(
         partial_indices,
         full_count,
         full_indices,
-        _,
+        payload_base,
     ) = get_curr_arbitrary_blocksparse_tensors(
         batch_idx,
         head_idx,
@@ -1068,6 +1181,11 @@ def produce_arbitrary_forward_loads_qstage1_n_direction_sm100(
         qhead_per_kvhead,
     )
     total_count = partial_count + full_count
+    mask_payloads = blocksparse_tensors.mask_block_masks
+    if const_expr(pipeline_mask_s0 is not None):
+        assert mask_payloads is not None
+        assert pipeline_mask_s1 is not None
+        assert sMask is not None
     if total_count > Int32(0):
         load_Q(block=0, stage=0)
         n_block_0 = _get_arbitrary_forward_block_by_traversal_ordinal(
@@ -1077,6 +1195,23 @@ def produce_arbitrary_forward_loads_qstage1_n_direction_sm100(
             full_count,
             full_indices,
         )
+        if const_expr(pipeline_mask_s0 is not None):
+            mask_s0_producer_state, mask_s1_producer_state = (
+                _produce_arbitrary_forward_mask_by_traversal_ordinal(
+                    Int32(0),
+                    partial_count,
+                    payload_base,
+                    mask_payloads,
+                    payload_subtile_idx,
+                    payload_groups,
+                    payload_words,
+                    pipeline_mask_s0,
+                    pipeline_mask_s1,
+                    mask_s0_producer_state,
+                    mask_s1_producer_state,
+                    sMask,
+                )
+            )
         load_K(block=n_block_0, producer_state=kv_producer_state)
         kv_producer_state.advance()
 
@@ -1091,6 +1226,23 @@ def produce_arbitrary_forward_loads_qstage1_n_direction_sm100(
                 full_count,
                 full_indices,
             )
+            if const_expr(pipeline_mask_s0 is not None):
+                mask_s0_producer_state, mask_s1_producer_state = (
+                    _produce_arbitrary_forward_mask_by_traversal_ordinal(
+                        Int32(1),
+                        partial_count,
+                        payload_base,
+                        mask_payloads,
+                        payload_subtile_idx,
+                        payload_groups,
+                        payload_words,
+                        pipeline_mask_s0,
+                        pipeline_mask_s1,
+                        mask_s0_producer_state,
+                        mask_s1_producer_state,
+                        sMask,
+                    )
+                )
             load_K(block=n_block_1, producer_state=kv_producer_state)
             kv_producer_state.advance()
 
@@ -1112,6 +1264,23 @@ def produce_arbitrary_forward_loads_qstage1_n_direction_sm100(
                     full_count,
                     full_indices,
                 )
+                if const_expr(pipeline_mask_s0 is not None):
+                    mask_s0_producer_state, mask_s1_producer_state = (
+                        _produce_arbitrary_forward_mask_by_traversal_ordinal(
+                            traversal_ordinal,
+                            partial_count,
+                            payload_base,
+                            mask_payloads,
+                            payload_subtile_idx,
+                            payload_groups,
+                            payload_words,
+                            pipeline_mask_s0,
+                            pipeline_mask_s1,
+                            mask_s0_producer_state,
+                            mask_s1_producer_state,
+                            sMask,
+                        )
+                    )
                 load_K(block=k_block, producer_state=kv_producer_state)
                 kv_producer_state.advance()
 
@@ -1127,6 +1296,13 @@ def produce_arbitrary_forward_loads_qstage1_n_direction_sm100(
                 kv_producer_state.advance()
 
         q_producer_phase ^= 1
+    if const_expr(pipeline_mask_s0 is not None):
+        return (
+            kv_producer_state,
+            q_producer_phase,
+            mask_s0_producer_state,
+            mask_s1_producer_state,
+        )
     return kv_producer_state, q_producer_phase
 
 
@@ -1408,6 +1584,9 @@ def softmax_arbitrary_forward_qstage1_n_direction_sm100(
     sparse_tile_m: cutlass.Constexpr[int],
     qhead_per_kvhead: cutlass.Constexpr[int],
     payload_words: cutlass.Constexpr[int],
+    pipeline_mask=None,
+    mask_consumer_state=None,
+    sMask: Optional[cute.Tensor] = None,
 ):
     """Consume one parity stream while preserving partial-then-full order."""
 
@@ -1437,13 +1616,22 @@ def softmax_arbitrary_forward_qstage1_n_direction_sm100(
         if first_traversal_ordinal < partial_count:
             partial_ordinal = partial_count - Int32(1) - first_traversal_ordinal
             n_block = partial_indices[partial_ordinal]
-            r_bitmask = load_mask_payload(
-                mask_payloads,
-                payload_base + partial_ordinal,
-                payload_group_idx,
-                subtile_idx=payload_subtile_idx,
-                payload_words=payload_words,
-            )
+            if const_expr(pipeline_mask is not None):
+                assert sMask is not None
+                r_bitmask, mask_consumer_state = consume_mask_payload_from_smem(
+                    sMask,
+                    payload_group_idx,
+                    pipeline_mask,
+                    mask_consumer_state,
+                )
+            else:
+                r_bitmask = load_mask_payload(
+                    mask_payloads,
+                    payload_base + partial_ordinal,
+                    payload_group_idx,
+                    subtile_idx=payload_subtile_idx,
+                    payload_words=payload_words,
+                )
             mma_si_consumer_phase, si_corr_producer_phase, _ = softmax_step(
                 mma_si_consumer_phase,
                 si_corr_producer_phase,
@@ -1461,13 +1649,21 @@ def softmax_arbitrary_forward_qstage1_n_direction_sm100(
                 traversal_ordinal = Int32(stage_idx) + stream_ordinal * Int32(2)
                 partial_ordinal = partial_count - Int32(1) - traversal_ordinal
                 n_block = partial_indices[partial_ordinal]
-                r_bitmask = load_mask_payload(
-                    mask_payloads,
-                    payload_base + partial_ordinal,
-                    payload_group_idx,
-                    subtile_idx=payload_subtile_idx,
-                    payload_words=payload_words,
-                )
+                if const_expr(pipeline_mask is not None):
+                    r_bitmask, mask_consumer_state = consume_mask_payload_from_smem(
+                        sMask,
+                        payload_group_idx,
+                        pipeline_mask,
+                        mask_consumer_state,
+                    )
+                else:
+                    r_bitmask = load_mask_payload(
+                        mask_payloads,
+                        payload_base + partial_ordinal,
+                        payload_group_idx,
+                        subtile_idx=payload_subtile_idx,
+                        payload_words=payload_words,
+                    )
                 mma_si_consumer_phase, si_corr_producer_phase, _ = softmax_step(
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
@@ -1510,6 +1706,13 @@ def softmax_arbitrary_forward_qstage1_n_direction_sm100(
     else:
         sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
 
+    if const_expr(pipeline_mask is not None):
+        return (
+            mma_si_consumer_phase,
+            si_corr_producer_phase,
+            not stream_has_work,
+            mask_consumer_state,
+        )
     return mma_si_consumer_phase, si_corr_producer_phase, not stream_has_work
 
 

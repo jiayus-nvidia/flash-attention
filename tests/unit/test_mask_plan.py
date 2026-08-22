@@ -23,7 +23,7 @@ from tests.datas.sequence_cases import RANDOM_CASES, smoke_cases
 
 def test_mask_plan_case_matrix():
     assert len(RANDOM_CASES) == 1024
-    assert len(smoke_cases("fixed")) + len(smoke_cases("varlen")) == 154
+    assert len(smoke_cases("fixed")) + len(smoke_cases("varlen")) == 158
     assert {case.batch_size for case in RANDOM_CASES} == {8}
     assert all(
         len(case.q_lengths) == case.batch_size

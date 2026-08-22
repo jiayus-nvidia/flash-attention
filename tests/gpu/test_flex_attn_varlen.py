@@ -12,7 +12,7 @@ from tests.datas.sequence_cases import smoke_cases
 
 pytestmark = pytest.mark.gpu
 
-_FWD_TOPOLOGY_CASE_IDS = {512, 519, 526, 540, 554, 568, 854, 1032}
+_FWD_TOPOLOGY_CASE_IDS = {512, 519, 526, 540, 554, 568, 854, 1034}
 assert _FWD_TOPOLOGY_CASE_IDS <= {
     case.case_id for case in smoke_cases("varlen")
 }

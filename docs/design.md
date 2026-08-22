@@ -1,33 +1,43 @@
 # Arbitrary Mask Design
 
-## Scope
+## 1. Purpose and Scope
 
-This document describes only the public arbitrary-mask semantics, plan construction, packed
-predicate payload, and the protocol used by forward and backward consumers.
+FlexAttention represents a static arbitrary attention mask as interval endpoints. A planner
+converts those endpoints into a reusable `MaskPlan`, and the attention kernels consume the plan
+without evaluating a Python mask function or rebuilding block visibility.
 
-Kernel pipelines, warp roles, CLC scheduling, Q stages, 1CTA/2CTA topologies, head-dimension
-performance tuning, benchmarks, and test matrices are outside its scope.
+This document specifies:
 
-## Public Mask Semantics
+- the public mask representation and coordinate system;
+- the planner stages and their intermediate data;
+- the partial/full block topology;
+- the consumer-specific packed predicate payload;
+- the forward and backward consumption protocols; and
+- plan ownership, compatibility, and correctness requirements.
 
-The public `mask_func` input is a contiguous CUDA `int32` tensor:
+General Q/K/V pipelines, scheduler policy, head-dimension tuning, benchmarks, and optimization
+history are outside the scope of this document.
+
+## 2. Public Mask Representation
+
+The public `mask_func` argument is a contiguous CUDA `int32` tensor:
 
 ```text
 mask_func[Hmask, nfunc, total_q]
 ```
 
-- `Hmask` must be either `1` or `Hq`; `1` means that all Q heads share the mask.
-- `nfunc` must be a positive odd integer.
-- `total_q` is `B * Sq` for flattened fixed-length BSHD inputs, or the total number of Q tokens
-  for true-variable-length THD inputs.
-- Every endpoint uses local-K coordinates within its sample, rather than global K coordinates in
-  the flattened THD tensor.
+`mask_func` is retained as the API name, but the value is a tensor rather than a callable.
 
-For each Q row, endpoints `F0, F1, ..., F(nfunc-1)` represent the following union of half-open
-intervals:
+- `Hmask` is `1` or `Hq`. `Hmask=1` shares one mask across all Q heads.
+- `nfunc` is a positive odd integer.
+- `total_q` is `B * Sq` for fixed-length BSHD input and the total Q-token count for Varlen THD
+  input.
+- Every endpoint is a K position local to the sample that owns the Q row.
+
+For one Q row, endpoints `F0, F1, ..., F(nfunc-1)` define a union of half-open intervals:
 
 ```text
-[0, F0) U [F1, F2) U [F3, F4) U ...
+visible(q) = [0, F0) U [F1, F2) U [F3, F4) U ...
 ```
 
 For example:
@@ -37,137 +47,261 @@ endpoints = [32, 64, 96]
 visible K = [0, 32) U [64, 96)
 ```
 
-The endpoints of every row must satisfy:
+The endpoints of each row must be ordered and bounded by the sample's K length:
 
 ```text
 0 <= F0 <= F1 <= ... <= F(nfunc-1) <= sample_k_len
 ```
 
-Equal adjacent endpoints naturally represent an empty interval. The public API accepts neither a
-Python callable mask modifier nor a block mask or packed bit tensor constructed by the caller.
+Equal adjacent endpoints represent an empty interval. The public interface does not require the
+caller to construct a block mask or a packed bit tensor.
 
-## Coordinates and Ownership
+## 3. Coordinate System
 
-### Fixed Length
+The design separates logical coordinates from physical storage addresses.
 
-Every sample in fixed-length BSHD has the same `Sq` and `Sk`. The last dimension of `mask_func`
-still flattens Q rows in batch-major order, but every endpoint remains a sample-local K coordinate.
+### 3.1 Fixed Length
 
-### True Variable Length
+Fixed-length BSHD input uses one common `Sq` and `Sk` for every sample. Q rows are flattened in
+batch-major order in `mask_func`, while endpoint values remain sample-local K positions.
 
-True-variable-length THD inputs use `cu_seqlens_q/k` to define sample boundaries. The builder
-first validates that each prefix tensor:
+### 3.2 Varlen
 
-- is a rank-1, contiguous CUDA `int32` tensor;
-- starts at 0 and ends at `total_q/total_k`;
-- is monotonically nondecreasing; and
-- gives each sample a length no greater than the corresponding `max_seqlen`.
+Varlen THD input uses `cu_seqlens_q` and `cu_seqlens_k` to identify sample boundaries. The public
+endpoint for a Q token is still local to that token's sample. It is never an offset into the
+flattened K tensor.
 
-The builder then clones `cu_seqlens_q/k`, and the resulting `MaskPlan` owns the clones. Mutating
-the originally supplied prefix tensors in place therefore cannot alter the sample partition of an
-existing plan.
+The builder validates that both prefix tensors:
 
-### Internal Planner Coordinates
+- are rank-1, contiguous CUDA `int32` tensors on the Q device;
+- begin at zero and end at `total_q` and `total_k`;
+- are monotonically nondecreasing; and
+- do not produce a sample longer than `max_seqlen_q` or `max_seqlen_k`.
 
-Before GPU planning, the builder adds the current sample's global K offset to every public
-endpoint. This converts sample-local coordinates into the planner's internal coordinate system.
-The internal `mask_func` also has 256 zero-padded Q rows for safe planner reads; this temporary
-tensor is not retained in the public `MaskPlan`.
+The public builder clones the prefix tensors. The resulting `MaskPlan` owns those clones, so a
+later in-place mutation of the caller's tensors cannot change the sample partition of an existing
+plan.
 
-Block indices in the final CSR remain sample-local. A consumer forms actual Q/K/V addresses by
-combining a sample offset with a local block index, so a plan row cannot cross a sample boundary.
+### 3.3 Planner and Consumer Coordinates
 
-## Plan Construction
+The builder converts public endpoints to an internal planner representation by adding each
+sample's physical K offset. It also appends 256 zero Q rows so planner kernels can issue safe
+vectorized reads at the upper boundary. This padded representation is temporary.
+
+The compact topology stored in the final plan uses sample-local block indices. A consumer forms a
+physical address from:
+
+```text
+sample physical offset + sample-local block offset + in-block coordinate
+```
+
+Consequently, a plan row cannot address Q/K/V data in another sample.
+
+## 4. Planner Overview
+
+The planner resolves the exact consumer before materializing a payload because block geometry and
+packed-bit ownership depend on the target kernel.
 
 ```text
 sample-local interval endpoints
-            |
-            v
-input validation, prefix cloning, internal coordinate conversion, and padding
-            |
-            v
-Q2K classify
-  each Q plan row x K block -> empty / partial / full
-            |
-            v
-partial/full count -> exclusive CSR offsets
-            |
-            v
-Q2K compact materialize
-  partial/full indices + partial packed payload
-            |
-            +-----------------------------+
-            | build_backward=True         |
-            v                             |
-K2Q count + compact materialize           |
-  K-major indices + backward payload      |
-            |                             |
-            +-----------------------------+
-            v
+              |
+              v
+input validation and internal endpoint conversion
+              |
+              v
+resolve consumer topology and compact Varlen row prefixes
+              |
+              v
+Q2K classify -> visible_bits, full_bits, partial/full counts
+              |
+              +-------------------------------+
+              | build_backward=True           |
+              v                               |
+K2Q count from backward Q2K bitsets           |
+              |                               |
+              v                               |
+scan counts and allocate exact compact outputs|
+              |                               |
+              v                               |
+materialize Q2K/K2Q CSR and packed payloads   |
+              |                               |
+              v                               |
+materialize SM100 forward schedule metadata   |
+              |                               |
+              +-------------------------------+
+              v
 MaskPlan
 ```
 
-### Block Classification
+### 4.1 Input Validation and Consumer Resolution
 
-The target consumer determines the plan tile size. For every valid Q plan row and sample-local K
-block, the classifier assigns one of three states:
+The host first validates tensor rank, dtype, device, layout, Q/K/V geometry, head counts, endpoint
+shape, and Fixed/Varlen arguments. It then resolves a consumer configuration for the current
+architecture and direction.
 
-- `empty`: all valid attention elements are invisible;
-- `full`: the Q and K tiles lie entirely within the current sample's valid range, and every
-  attention element in the tile is visible; or
-- `partial`: the tile contains visible elements, but the mask is not fully visible or the tile is
-  a Q/K tail that requires boundary protection.
+The resolved configuration provides the planner with:
 
-Classification produces temporary `visible_bits`, `full_bits`, and per-row partial/full counts.
-These bitsets are planner intermediates rather than public attention-consumer inputs.
+- logical Q and K block sizes;
+- `q_stage` and CTA-group topology;
+- PackGQA mapping;
+- MMA/register ownership;
+- number of physical payload subtiles;
+- number of payload groups; and
+- padded `uint32` words per payload group.
 
-### Independent CSR Streams
+This separation is important: the sparse block relation is architecture-neutral, but the packed
+predicate payload is not.
 
-Both Q2K and K2Q use two independent CSR streams:
+### 4.2 Compact Row Prefixes
+
+Fixed-length plans have a rectangular upper bound for Q and K plan rows. Varlen plans instead
+compute the number of valid Q and K block rows for each sample, followed by prefix sums such as:
 
 ```text
-partial CSR
-  mask_block_cnt
-  mask_block_offset
-  mask_block_idx
-
-full CSR
-  full_block_cnt
-  full_block_offset
-  full_block_idx
+cu_total_q_plan_rows[B + 1]
+cu_total_k_plan_rows[B + 1]
 ```
 
-For each stream:
+These prefixes compact away nonexistent rows. They also map a compact outer row back to its
+sample, so the classifier and consumer do not have to scan `cu_seqlens` to rediscover ownership.
+Forward and backward may use different prefixes because their tile geometries can differ.
 
-- `*_cnt[mask_head, plan_row]` is the number of blocks in the row;
-- `*_offset` is the exclusive offset into the flattened CSR data; and
-- `*_idx` stores sample-local block indices.
+### 4.3 Q2K Classification
 
-The design does not assume that block indices are contiguous, does not generate full-block runs,
-and does not dynamically combine partial and full blocks into one index stream. Empty blocks do
-not enter either CSR.
+The Q2K classifier examines every valid pair of one Q plan row and one sample-local K block. It
+assigns exactly one of three states:
 
-## Q2K and K2Q
+- `empty`: no valid score element is visible;
+- `full`: the complete Q/K tile is in bounds and every score element is visible; or
+- `partial`: at least one element is visible, but the tile is not fully visible or requires Q/K
+  tail protection.
 
-### Q2K
+The classifier writes four temporary outputs:
 
-Q2K is Q-major: each outer row lists the K blocks visited by one Q tile. Forward uses a Q2K plan;
-a backward consumer requiring an independent Q-major traversal may own a separate Q2K view.
+```text
+visible_bits[Hmask, upper_q_rows, words_for_k_blocks]
+full_bits[Hmask, upper_q_rows, words_for_k_blocks]
+partial_counts_tmp[Hmask, upper_q_rows]
+full_counts_tmp[Hmask, upper_q_rows]
+```
 
-### K2Q
+`visible_bits` records all non-empty Q/K block pairs. `full_bits` is a subset that records the
+fully visible pairs. Within the valid K-block domain:
 
-Within the same backward topology, K2Q is the transpose of the Q2K sparse block pairs. Each
-K-major row lists the related Q blocks. The dK/dV consumer uses the K2Q plan to visit only the Q
-blocks actually related to each KV task, without rescanning every Q row.
+```text
+partial = visible_bits & ~full_bits
+empty   = ~visible_bits
+```
 
-K2Q may also carry `dq_write_order` and `dq_write_order_full`. They describe only the ordering of
-parallel dQ writes and do not change the mathematical mask semantics.
+The bitsets provide a compact intermediate representation that can be read in either Q-major or
+K-major order. They are planner workspace and are not retained by `MaskPlan`.
 
-## Packed Predicate Payload
+The classifier also writes a defensive error word for invalid interval metadata. Public input
+validation remains the API contract; the device-side flag prevents malformed internal metadata
+from being materialized into a plan.
 
-Only partial blocks carry `mask_block_masks`; full blocks neither allocate nor load a mask payload.
+### 4.4 Backward K2Q Counting
 
-The logical shape is:
+When `build_backward=True`, the planner classifies the mask again with the backward consumer's
+tile geometry. The resulting Q-major bitsets describe the same mathematical mask at the backward
+block granularity.
+
+The K2Q count kernel reads those bitsets by K row and counts partial and full Q contributors for
+each K block. This is the counting phase of a sparse transpose; it does not rescan all endpoint
+intervals and does not yet write the final K2Q indices.
+
+### 4.5 Count, Scan, and Exact Allocation
+
+Classification uses upper-bound workspace because the exact number of active blocks is unknown
+before the GPU kernels run. The planner reduces the count arrays to a small header containing:
+
+```text
+forward Q rows, forward partial nnz, forward full nnz,
+backward Q rows, backward K rows, backward partial nnz, backward full nnz,
+error flags
+```
+
+The host reads this eight-value header once. The readback establishes exact allocation sizes and
+turns device-side metadata errors into public exceptions.
+
+The valid count arrays are then compacted, and independent exclusive scans produce CSR offsets:
+
+```text
+partial_offset[0] = 0
+partial_offset[i + 1] = partial_offset[i] + partial_count[i]
+
+full_offset[0] = 0
+full_offset[i + 1] = full_offset[i] + full_count[i]
+```
+
+Partial and full outputs are allocated independently. Empty blocks require no compact storage.
+
+### 4.6 Q2K Materialization
+
+The Q2K materializer revisits set bits in the classification workspace and writes two independent
+CSR structures:
+
+```text
+partial CSR                         full CSR
+mask_block_cnt                      full_block_cnt
+mask_block_offset                   full_block_offset
+mask_block_idx                      full_block_idx
+mask_block_masks
+```
+
+`mask_block_idx` and `full_block_idx` contain sample-local K block indices. A partial entry also
+receives one consumer-specific packed predicate payload. A full entry does not have a payload.
+
+The design does not assume that either index list is contiguous. It does not create full-block
+runs and does not merge partial and full blocks into one index array.
+
+### 4.7 K2Q Materialization
+
+The K2Q materializer performs the write phase of the sparse transpose. For every K-major row, it
+writes the sample-local Q block indices that were counted in Section 4.4, again with independent
+partial and full CSR arrays.
+
+The K2Q payload is generated for the backward consumer's accumulator layout. Generic backward
+may also materialize `dq_write_order` and `dq_write_order_full`; these arrays define a legal order
+for parallel dQ accumulation and do not change mask visibility.
+
+If a dedicated dQ kernel requires its own Q-major layout, the plan may additionally contain a
+separate Q2K view materialized for that consumer.
+
+### 4.8 SM100 Forward Schedule Materialization
+
+SM100/SM103 forward uses plan-owned CLC work metadata. The planner produces one task for every
+valid Q plan row and scheduled head:
+
+```text
+num_forward_tasks = valid Q plan rows * scheduled heads
+```
+
+`fwd_work_desc` is always present on this path. `sequence_desc` is present for Varlen and for
+consumer families that require an explicit sequence descriptor:
+
+| Descriptor | Contents | Purpose |
+|---|---|---|
+| `sequence_desc[B, 8]` | `q_offset`, `k_offset`, `q_len`, `k_len`, Q-plan-row begin/count, valid K-block count, reserved field | Maps logical rows to one sample and defines address/tail bounds. |
+| `fwd_work_desc[num_forward_tasks, 4]` | `m_block`, scheduled head, `batch_idx`, `q_valid_rows` | Gives each CLC task its complete Q-tile identity. |
+
+The planner computes task cost as:
+
+```text
+task_cost = partial_block_count + full_block_count
+```
+
+Partial and full blocks deliberately have equal scheduling cost. Tasks are stably ordered by cost
+and L2 locality sections before being stored in `fwd_work_desc`. The kernel therefore consumes a
+prepared work queue; it does not enumerate all batch Q tiles or reconstruct task ownership from
+`cu_seqlens`.
+
+`q_len`, `k_len`, and `q_valid_rows` remain necessary after scheduling. They protect physical
+loads and stores at sequence tails; they are not used to rediscover which tasks exist.
+
+## 5. Packed Predicate Payload
+
+Only partial blocks carry `mask_block_masks`. Its logical shape is:
 
 ```text
 mask_block_masks[
@@ -178,104 +312,128 @@ mask_block_masks[
 ]
 ```
 
-The payload is not a generic row-major bitmap. The planner uses the target consumer's MMA
-accumulator ownership to map every score element to its thread or payload group, then writes its
-bit in the linear order in which the consumer will read the final register fragment:
+This tensor is not a row-major bitmap of the score tile. The materializer follows the target
+consumer's MMA accumulator ownership and places each score predicate in the order used by the
+final register fragment:
 
 ```text
 bit = 1  -> keep the score
 bit = 0  -> replace the score with -inf
 ```
 
-The attention kernel therefore does not need to reevaluate intervals, compare coordinates, or
-execute a generic mask modifier. The consumer only loads its packed `uint32` words and applies a
-constexpr bit-select to the accumulator.
+The attention kernel therefore does not reevaluate interval endpoints or execute a generic mask
+modifier. It loads the `uint32` words for its payload group and applies compile-time-unrolled bit
+selection to the score accumulator.
 
-Here, R2P names the data-flow semantics of selecting a register fragment with a packed predicate;
-the source does not require a distinct intrinsic literally named `R2P`. On SM100, a
-TMEM-to-register load followed by the unrolled bit-select implements this path. SM90 applies the
-same semantics to a WGMMA register fragment.
+### 5.1 R2P Semantics
 
-The final `uint32` can contain padding bits beyond the fragment's actual element count. The
-consumer generates accesses only for constexpr elements satisfying
-`col < size(accumulator_fragment)`, preventing an out-of-bounds accumulator access.
+R2P names the data flow from a register fragment and a packed predicate to predicated register
+values. It does not require a hardware intrinsic literally named `R2P`.
 
-## Consumer Protocol
+- SM100/SM103 loads the score fragment from TMEM and applies constexpr bit selection.
+- SM90 applies the same predicate semantics to a WGMMA register fragment.
 
-### Forward
+The final payload word can contain padding bits. The consumer emits accesses only for compile-time
+elements that exist in its accumulator fragment, so padding cannot cause an out-of-bounds register
+access.
 
-Forward reads the partial and full CSR streams of a Q2K row separately:
+## 6. Kernel Consumption
+
+### 6.1 Forward
+
+Forward consumes the partial and full CSR arrays separately:
 
 ```text
-for block in partial CSR:
+for block in partial_range:
     load K/V
     compute score
     load packed predicate
-    masked softmax step
+    softmax_step(apply_mask=True)
 
-for block in full CSR:
+for block in full_range:
     load K/V
     compute score
-    unmasked softmax step
+    softmax_step(apply_mask=False)
 ```
 
-A row with zero blocks writes `O=0` and `LSE=-inf`. Sequence tails are encoded by the plan and
-payload together with consumer-side boundary protection; the consumer must not access the next
-sample.
+An empty block is absent from both ranges. A full block never loads a packed predicate. A plan row
+with no active blocks writes `O=0` and `LSE=-inf`.
 
-### Backward
+### 6.2 SM100/SM103 Two-Stage Mask Pipeline
 
-A backward kernel consumes a Q2K or K2Q view according to its mathematical traversal:
+The generic SM100/SM103 qstage1 + 2CTA forward kernel stages partial payloads through a two-stage
+SMEM packed-mask pipeline. The stages are aligned with the two score stages. Each stage owns one
+2-KB payload slot and its barrier state, for 4 KB of mask SMEM per CTA:
 
-- a partial block loads its packed predicate;
-- a full block reads only `full_block_idx`;
-- a concrete kernel pipeline may choose its traversal order, but the two CSR streams retain their
-  independent semantics; and
-- no singleton-heavy raw-index bypass exists.
+```text
+128 payload groups * 4 uint32 words * 4 bytes = 2 KB per stage
+```
 
-## Architecture and Consumer Boundary
+For a partial block, the load warp bulk-copies the CTA-native `[128, 4]` payload plane from GMEM
+to the selected SMEM stage. The softmax warps wait for that stage, copy their four words to
+registers, release the stage, and apply the packed predicate.
 
-The arbitrary-mask interval semantics and CSR organization are identical on SM90, SM100, and
-SM103, but a materialized payload is tied to its concrete consumer:
+Pipeline state advances exactly once for each partial block assigned to a stage. Full and empty
+blocks neither load a payload nor advance the mask pipeline. The same protocol applies to Fixed,
+Varlen, PackGQA, and non-PackGQA generic shapes.
 
-- an SM90 payload follows WGMMA accumulator partitioning;
-- an SM100/SM103 payload follows register ownership after a tcgen05/TMEM load; and
-- forward, generic backward, D256 dQ, and D256 dKdV may use different tiles, subtiles, CTA groups,
-  and payload word counts.
+The generic qstage1 + 1CTA and qstage2 + 1CTA variants, and the dedicated D256 forward kernel,
+retain direct GMEM-to-register payload loads. Delivery method does not change the payload ABI or
+the partial/full topology.
 
-`MaskPlan` carries an `ArbitraryPlanSignature` that records the architecture family, direction,
-tile topology, MMA layout, payload layout, PackGQA configuration, and dQ order format. Dispatch
-must compare this signature field by field with the consumer about to launch.
+### 6.3 Backward
 
-The same public `mask_func` may therefore be planned separately for different architectures or
-kernel topologies. One `MaskPlan` may contain distinct materialized views for forward and
-backward, but no view may be interpreted as another direction or by an incompatible consumer.
-The complete `MaskPlan` also cannot be reused across architectures or incompatible tile
-geometries.
+Each backward consumer uses the traversal that matches its output:
 
-## Plan Lifecycle
+- Q-major consumers use a Q2K view;
+- K-major dK/dV consumers use a K2Q view;
+- partial entries load their packed predicate; and
+- full entries use `full_block_idx`, do not load a packed predicate, and read write-order metadata
+  only when the consumer requires it.
 
-`MaskPlan` is an opaque, consumer-specific, read-only object:
+The concrete kernel may choose its loop order, but it must preserve the independent partial/full
+semantics. There is no raw-index bypass for singleton-heavy masks.
 
-- Q/K/V tensor identity is not a binding condition, so a plan can process new values with the
-  same geometry;
-- a fixed-length plan binds batch size, Sq, Sk, head counts, head dimensions, dtype, and device;
-- a variable-length plan additionally owns clones of `cu_seqlens_q/k`;
-- runtime binding records geometry plus prefix-tensor identity and version, and rejects stale
-  prefixes;
-- a training call requires a plan that contains backward payloads; and
-- `debug_snapshot()` returns only tensor clones and never exposes mutable internal plan storage.
+## 7. Architecture and Plan Compatibility
 
-## Design Invariants
+Endpoint semantics and the partial/full CSR organization are common to SM90, SM100, and SM103. A
+materialized topology and payload, however, belong to one concrete consumer because block
+geometry and accumulator ownership differ across WGMMA, tcgen05/TMEM, direction, and CTA
+topology.
 
-1. Public endpoints always use sample-local K coordinates.
-2. CSR block indices always use sample-local block coordinates.
-3. Partial and full blocks always use independent CSR streams.
+Every materialized view carries an `ArbitraryPlanSignature`. It records the architecture family,
+direction, kernel family, tile geometry, `q_stage`, CTA-group size, PackGQA configuration, MMA
+layout, payload layout, scheduler layout, and dQ-order format.
+
+Dispatch compares the signature field by field before launch. A mismatch raises an explicit error;
+the runtime never interprets one consumer's payload as another consumer's payload.
+
+The same public mask can therefore be planned separately for different architectures or kernel
+topologies. One `MaskPlan` can own forward, backward, and dedicated dQ views, but each view remains
+consumer-specific.
+
+## 8. Plan Ownership and Reuse
+
+`MaskPlan` is an opaque, read-only owner of compact topology, packed payloads, runtime geometry,
+and optional schedule metadata.
+
+- Q/K/V tensor identity is not part of the binding; new values can reuse a plan when geometry is
+  unchanged.
+- A fixed-length plan binds batch size, `Sq`, `Sk`, head counts, head dimensions, dtype, device,
+  architecture, and consumer topology.
+- A Varlen plan additionally owns cloned Q/K prefix tensors and their versioned runtime binding.
+- A training call requires a plan built with backward views.
+- `debug_snapshot()` returns tensor clones and does not expose mutable internal storage.
+
+## 9. Design Invariants
+
+1. Public endpoints and final CSR indices are sample-local.
+2. Every valid Q/K block pair belongs to exactly one of `empty`, `partial`, and `full`.
+3. Partial and full blocks use independent CSR arrays and do not require contiguous indices.
 4. Only partial blocks carry packed predicate payloads.
-5. Payload bit order must exactly match the target consumer's accumulator ownership.
-6. Full blocks perform neither packed-mask loads nor bit-selects.
-7. Consumers do not rely on block contiguity and neither generate nor consume full-block runs.
-8. True-variable-length inputs never reuse fixed-length addressing paths.
-9. A plan-signature mismatch must raise an explicit error rather than silently reinterpret a
-   different layout.
-10. Tail padding bits in a packed payload must never cause an out-of-bounds accumulator access.
+5. Payload bit order exactly matches the target consumer's accumulator ownership.
+6. Full blocks do not load a payload, apply a bit-select, or advance the mask pipeline.
+7. Q2K and K2Q views describe the same mathematical block relation at their consumer geometry.
+8. Varlen never uses fixed-length addressing.
+9. A plan-signature mismatch is an error, not a fallback condition.
+10. Direct and SMEM-staged payload delivery preserve the same payload ABI and mask semantics.
