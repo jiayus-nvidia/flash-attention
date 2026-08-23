@@ -398,8 +398,12 @@ def _flex_attn_fwd(
     pack_gqa: Optional[bool] = None,
     block_sparse_tensors: BlockSparseTensorsTorch = None,
     return_lse: bool = False,
+    sm90_use_smem_mask_pipeline: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run packed arbitrary-mask forward."""
+
+    if type(sm90_use_smem_mask_pipeline) is not bool:
+        raise TypeError("sm90_use_smem_mask_pipeline must be a bool")
 
     q, k, v = [maybe_contiguous(tensor) for tensor in (q, k, v)]
     if q.dtype not in (torch.float16, torch.bfloat16):
@@ -432,6 +436,7 @@ def _flex_attn_fwd(
         max_seqlen_k,
     )
     arch = _get_device_arch()
+    use_smem_mask_pipeline = sm90_use_smem_mask_pipeline and arch == 90
     _validate_head_dims(head_dim, head_dim_v, 16 // q.element_size())
     resolved_max_q = max_seqlen_q if is_varlen else seqlen_q
     resolved_max_k = max_seqlen_k if is_varlen else seqlen_k
@@ -468,12 +473,11 @@ def _flex_attn_fwd(
         pack_gqa=pack_gqa,
         kernel_family=plan_signature.kernel_family,
     )
-    if arch != 90:
-        validate_arbitrary_plan_signature(
-            plan_signature,
-            config.plan_signature,
-            context="arbitrary forward plan after dispatch",
-        )
+    validate_arbitrary_plan_signature(
+        plan_signature,
+        config.plan_signature,
+        context="arbitrary forward plan after dispatch",
+    )
     pack_gqa = config.pack_gqa
     tile_m, tile_n = config.tile_m, config.tile_n
     plan_tile_m, plan_tile_n = config.block_size
@@ -529,14 +533,14 @@ def _flex_attn_fwd(
         return out, lse
 
     use_hd256 = head_dim == 256 and head_dim_v == 256 and arch in (100, 103)
-    scheduler_metadata = None
     scheduler_tile_counter = None
-    num_sms = 132 if is_fake_mode() else torch.cuda.get_device_properties(q.device).multi_processor_count
-    if arch == 90 and is_varlen:
-        scheduler_metadata = torch.empty(
-            (3, batch_size), dtype=torch.int32, device=q.device
-        )
-        scheduler_tile_counter = torch.empty(
+    num_sms = (
+        132
+        if is_fake_mode()
+        else torch.cuda.get_device_properties(q.device).multi_processor_count
+    )
+    if arch == 90:
+        scheduler_tile_counter = torch.zeros(
             (1,), dtype=torch.int32, device=q.device
         )
 
@@ -557,6 +561,7 @@ def _flex_attn_fwd(
         q_stage,
         cta_group_size,
         qstage1_overlap_pv_with_k_wait,
+        use_smem_mask_pipeline,
     )
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     if compile_key not in _flex_attn_fwd.compile_cache:
@@ -596,16 +601,9 @@ def _flex_attn_fwd(
                 Q_in_regs=False,
                 intra_wg_overlap=config.intra_wg_overlap,
                 mma_pv_is_rs=config.mma_pv_is_rs,
+                use_smem_mask_pipeline=use_smem_mask_pipeline,
+                num_mask_payload_groups=config.num_mask_payload_groups,
                 q_subtile_factor=1,
-            )
-            scheduler_metadata_tensor = (
-                to_cute_tensor(
-                    scheduler_metadata,
-                    assumed_align=16,
-                    leading_dim=1,
-                )
-                if scheduler_metadata is not None
-                else None
             )
             scheduler_counter_tensor = (
                 to_cute_tensor(
@@ -627,7 +625,6 @@ def _flex_attn_fwd(
                 cu_q_tensor,
                 cu_k_tensor,
                 sparse_tensor,
-                scheduler_metadata_tensor,
                 scheduler_counter_tensor,
                 Int32(0),
                 current_stream,
@@ -721,7 +718,6 @@ def _flex_attn_fwd(
                 cu_seqlens_q,
                 cu_seqlens_k,
                 sparse_args,
-                scheduler_metadata,
                 scheduler_tile_counter,
                 num_sms,
             ]

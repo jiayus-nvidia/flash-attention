@@ -1,49 +1,44 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # SM90 (Hopper) forward pass for FlexAttention.
 
+from functools import partial
 from types import SimpleNamespace
 from typing import Callable, Optional
-from functools import partial
-
-import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
-from cutlass.cute.nvgpu import cpasync, warpgroup
-from cutlass.utils import LayoutEnum
-import cutlass.utils.hopper_helpers as sm90_utils_basic
+from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass import pipeline
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.base_dsl.arch import Arch
+from cutlass.cute.nvgpu import cpasync, warpgroup
+import cutlass.utils.hopper_helpers as sm90_utils_basic
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cutlass.utils import LayoutEnum
+
+import cuda.bindings.driver as cuda
 
 from quack import copy_utils
 from quack import layout_utils
 from quack import sm90_utils
-
-from flex_attn.runtime.dsl_utils import assume_tensor_aligned
-from flex_attn.kernels.common import device_utils as utils
-from flex_attn.kernels.common.softmax import Softmax
-from flex_attn.kernels.common.seqlen_info import SeqlenInfoQK
-from flex_attn.plan.kernels import BlockSparseTensors
-from flex_attn.plan.kernels.packed_mask import (
-    produce_block_sparse_loads,
-    consume_block_sparse_loads,
-)
-from flex_attn.kernels.common import pipeline as pipeline_custom
-from flex_attn.kernels.common.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
-from flex_attn.kernels.sm90.named_barrier import NamedBarrierFwd
 from quack.cute_dsl_utils import ParamsBase
+
+from flex_attn.kernels.common import device_utils as utils
+from flex_attn.kernels.common import pipeline as pipeline_custom
+from flex_attn.kernels.common.pack_gqa import PackGQA, make_packgqa_tiled_tma_atom, pack_gqa_layout
+from flex_attn.kernels.common.seqlen_info import SeqlenInfoQK
+from flex_attn.kernels.common.softmax import Softmax
 from flex_attn.kernels.common.tile_scheduler import (
-    SchedulingMode,
-    TileSchedulerArguments,
-    SingleTileScheduler,
-    SingleTileVarlenScheduler,
-    VarlenDynamicPersistentTileSchedulerSm90,
+    PlanDynamicPersistentTileSchedulerSm90,
 )
 from flex_attn.kernels.sm90 import FlexAttentionForwardBase
 from flex_attn.kernels.sm90.forward_config import make_sm90_fwd_tiled_mma
-from flex_attn.kernels.sm90.prepare_scheduler import FlexAttentionVarlenPrepareSchedulerSm90
+from flex_attn.kernels.sm90.named_barrier import NamedBarrierFwd
+from flex_attn.plan.kernels import BlockSparseTensors
+from flex_attn.plan.kernels.packed_mask import (
+    consume_block_sparse_loads,
+    produce_block_sparse_loads,
+)
+from flex_attn.runtime.dsl_utils import assume_tensor_aligned
 
 
 class FlexAttentionForwardSm90(FlexAttentionForwardBase):
@@ -52,11 +47,18 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         *args,
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
+        use_smem_mask_pipeline: bool = True,
+        num_mask_payload_groups: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        if type(use_smem_mask_pipeline) is not bool:
+            raise TypeError("use_smem_mask_pipeline must be a bool")
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
+        self.use_smem_mask_pipeline = use_smem_mask_pipeline
+        self.num_mask_payload_groups = num_mask_payload_groups
+        self.mask_stages = 2
         self.buffer_align_bytes = 1024
         self.use_tma_KV = True
         assert self.use_tma_KV
@@ -116,16 +118,26 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
         mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
         mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+        mask_mbar_size = self.mask_stages * 2 if self.use_smem_mask_pipeline else 0
+        mbar_ptr_Mask_struct = cute.struct.MemRange[cutlass.Int64, mask_mbar_size]
         mbar_ptr_O_empty_struct = cute.struct.Align[cute.struct.MemRange[cutlass.Int64, 1], 16]
         scheduler_work_struct = cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 4], 16]
+        sMask_size = (
+            self.num_mask_payload_groups * self.mask_payload_words * self.mask_stages
+            if self.use_smem_mask_pipeline
+            else 0
+        )
+        sMask_struct = cute.struct.Align[cute.struct.MemRange[Uint32, sMask_size], 16]
 
         @cute.struct
         class SharedStorageQKV:
             mbar_ptr_Q: mbar_ptr_Q_struct
             mbar_ptr_K: mbar_ptr_K_struct
             mbar_ptr_V: mbar_ptr_V_struct
+            mbar_ptr_Mask: mbar_ptr_Mask_struct
             mbar_ptr_O_empty: mbar_ptr_O_empty_struct
             scheduler_work: scheduler_work_struct
+            sMask: sMask_struct
             sV: sVO_struct
             sQ: sQ_struct
             sK: sK_struct
@@ -136,8 +148,10 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             mbar_ptr_Q: mbar_ptr_Q_struct
             mbar_ptr_K: mbar_ptr_K_struct
             mbar_ptr_V: mbar_ptr_V_struct
+            mbar_ptr_Mask: mbar_ptr_Mask_struct
             mbar_ptr_O_empty: mbar_ptr_O_empty_struct
             scheduler_work: scheduler_work_struct
+            sMask: sMask_struct
             sQ: sQVO_struct
             sK: sK_struct
             sP: sP_struct
@@ -156,7 +170,6 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
         blocksparse_tensors: BlockSparseTensors = None,
-        scheduler_metadata: Optional[cute.Tensor] = None,
         scheduler_tile_counter: Optional[cute.Tensor] = None,
         scheduler_num_sms: Int32 = 132,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -177,9 +190,8 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
 
         assert blocksparse_tensors is not None
         self.varlen_q = mCuSeqlensQ is not None
-        self.use_varlen_persistent = scheduler_metadata is not None
-        assert self.use_varlen_persistent == (scheduler_tile_counter is not None)
-        assert not self.use_varlen_persistent or self.varlen_q
+        assert blocksparse_tensors.fwd_work_desc is not None
+        assert scheduler_tile_counter is not None
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
@@ -210,11 +222,10 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
         self.use_tma_O = self.use_tma_Q
-        # The SM90 dynamic scheduler has one 32-thread producer warp, matching the
-        # native TMA Q/K/V path. Other paths keep their existing scheduler.
-        self.use_varlen_persistent = (
-            self.use_varlen_persistent and self.use_tma_Q and self.use_tma_KV
-        )
+        if const_expr(not self.use_tma_Q or not self.use_tma_KV):
+            raise NotImplementedError(
+                "SM90 plan-owned persistent scheduling requires TMA Q/K/V"
+            )
         # Producer needs more registers when doing cp.async Q or KV loads
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
             self.num_mma_regs, self.num_producer_regs = 224, 40
@@ -237,6 +248,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             )
 
         self.mask_payload_words = (self.tile_m * self.tile_n // self.num_mma_threads + 31) // 32
+        assert blocksparse_tensors.mask_block_masks is not None
         SharedStorage = self._get_shared_storage_cls()
 
         mQ_og, mO_og = mQ, mO
@@ -246,34 +258,6 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
-
-        if const_expr(self.use_varlen_persistent):
-            assert scheduler_metadata is not None and scheduler_tile_counter is not None
-            prepare_scheduler = FlexAttentionVarlenPrepareSchedulerSm90(
-                tile_m=self.tile_m,
-                tile_n=self.tile_n,
-                head_dim=self.tile_hdim,
-                head_dim_v=self.tile_hdimv,
-                element_size=self.dtype.width // 8,
-                qhead_per_kvhead=self.qhead_per_kvhead,
-                pack_gqa=self.pack_gqa,
-                sort_by_remaining=True,
-            )
-            prepare_scheduler(
-                mCuSeqlensQ,
-                mCuSeqlensK,
-                None,
-                None,
-                blocksparse_tensors.cu_total_m_blocks,
-                scheduler_metadata,
-                scheduler_tile_counter,
-                Int32(mQ_og.shape[0]),
-                Int32(mK.shape[0]),
-                Int32(mQ_og.shape[0]),
-                Int32(mK.shape[0]),
-                Int32(mQ.shape[2]),
-                stream,
-            )
 
         # TMA
         gmem_tiled_copy_Q = cpasync.CopyBulkTensorTileG2SOp()
@@ -330,42 +314,13 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
                 self.sO_layout,
                 (self.tile_m, self.tile_hdimv),  # No mcast
             )
-        if const_expr(self.use_varlen_persistent):
-            TileScheduler = VarlenDynamicPersistentTileSchedulerSm90
-        elif const_expr(mCuSeqlensQ is not None):
-            TileScheduler = SingleTileVarlenScheduler
-        else:
-            TileScheduler = SingleTileScheduler
-        tile_sched_args = TileSchedulerArguments(
-            cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
-            cute.size(mQ.shape[2]),
-            cute.size(mQ.shape[3])
-            if const_expr(mCuSeqlensQ is None)
-            else cute.size(mCuSeqlensQ.shape[0] - 1),
-            cute.size(mK.shape[0]),
-            mQ.shape[1],
-            mV.shape[1],
-            total_q=cute.size(mQ.shape[0])
-            if const_expr(mCuSeqlensQ is not None)
-            else cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
-            tile_shape_mn=(self.tile_m, self.tile_n),
-            mCuSeqlensQ=mCuSeqlensQ,
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-            element_size=self.dtype.width // 8,
-            is_persistent=self.use_varlen_persistent,
-            lpt=True,
+        TileScheduler = PlanDynamicPersistentTileSchedulerSm90
+        tile_sched_params = TileScheduler.to_underlying_arguments(
+            blocksparse_tensors.fwd_work_desc,
+            scheduler_tile_counter,
+            num_sm=Int32(scheduler_num_sms),
+            num_mma_threads=self.num_mma_threads,
         )
-        if const_expr(self.use_varlen_persistent):
-            tile_sched_params = TileScheduler.to_underlying_arguments(
-                tile_sched_args,
-                scheduler_metadata,
-                scheduler_tile_counter,
-                num_sm=Int32(scheduler_num_sms),
-                num_mma_threads=self.num_mma_threads,
-                scheduling_mode=SchedulingMode.DYNAMIC,
-            )
-        else:
-            tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale)
         self.kernel(
@@ -451,12 +406,10 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
-        sO_empty_mbar_ptr = None
-        if const_expr(self.use_varlen_persistent):
-            sO_empty_mbar_ptr = storage.mbar_ptr_O_empty.data_ptr()
-            if warp_idx == 0:
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_init(sO_empty_mbar_ptr, 1)
+        sO_empty_mbar_ptr = storage.mbar_ptr_O_empty.data_ptr()
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(sO_empty_mbar_ptr, 1)
 
         # Mbarrier / pipeline init
         mbar_ptr_Q = storage.mbar_ptr_Q.data_ptr()
@@ -522,6 +475,19 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
                 syncwarp_before_release=False,
             )
 
+        pipeline_mask = None
+        if const_expr(self.use_smem_mask_pipeline):
+            assert blocksparse_tensors.mask_block_masks is not None
+            mask_tx_count = self.num_mask_payload_groups * self.mask_payload_words * 4
+            pipeline_mask = pipeline_custom.PipelineTmaAsync.create(
+                barrier_storage=storage.mbar_ptr_Mask.data_ptr(),
+                num_stages=self.mask_stages,
+                producer_group=tma_warp,
+                consumer_group=mma_warps,
+                tx_count=mask_tx_count,
+                defer_sync=True,
+            )
+
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
@@ -543,6 +509,19 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         sP = None
         if const_expr(sP_layout is not None):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
+        sMask = None
+        if const_expr(self.use_smem_mask_pipeline):
+            assert blocksparse_tensors.mask_block_masks is not None
+            sMask = storage.sMask.get_tensor(
+                cute.make_layout(
+                    (self.num_mask_payload_groups, self.mask_payload_words, self.mask_stages),
+                    stride=(
+                        self.mask_payload_words,
+                        1,
+                        self.num_mask_payload_groups * self.mask_payload_words,
+                    ),
+                )
+            )
         # Match the Hopper C++ layout: epilogue O overlaps V, while Q stays independent.
         sSchedulerWork = storage.scheduler_work.get_tensor(cute.make_layout((4,)))
 
@@ -556,16 +535,12 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             mCuBlockIdxOffsets=blocksparse_tensors.cu_block_idx_offsets,
             # Don't need to pass in tile_mn because we won't access offset_padded
         )
-        if const_expr(self.use_varlen_persistent):
-            ProducerTileSchedulerCls = partial(
-                TileScheduler.create, tile_sched_params, sSchedulerWork, True
-            )
-            ConsumerTileSchedulerCls = partial(
-                TileScheduler.create, tile_sched_params, sSchedulerWork, False
-            )
-        else:
-            ProducerTileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
-            ConsumerTileSchedulerCls = ProducerTileSchedulerCls
+        ProducerTileSchedulerCls = partial(
+            TileScheduler.create, tile_sched_params, sSchedulerWork, True
+        )
+        ConsumerTileSchedulerCls = partial(
+            TileScheduler.create, tile_sched_params, sSchedulerWork, False
+        )
 
         # Cluster wait before starting
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
@@ -585,6 +560,8 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
                 pipeline_k,
                 pipeline_v,
                 pipeline_q,
+                pipeline_mask,
+                sMask,
                 gmem_tiled_copy_Q,
                 blocksparse_tensors,
                 SeqlenInfoCls,
@@ -612,6 +589,8 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
                 pipeline_k,
                 pipeline_v,
                 pipeline_q,
+                pipeline_mask,
+                sMask,
                 gmem_tiled_copy_O,
                 tma_atom_O,
                 tidx,
@@ -638,6 +617,8 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
         pipeline_q: pipeline.PipelineAsync,
+        pipeline_mask: Optional[pipeline.PipelineAsync],
+        sMask: Optional[cute.Tensor],
         gmem_tiled_copy_Q: cute.TiledCopy,
         blocksparse_tensors: Optional[BlockSparseTensors],
         SeqlenInfoCls: Callable,
@@ -658,6 +639,11 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             kv_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_stages
             )
+            mask_producer_state = None
+            if const_expr(self.use_smem_mask_pipeline):
+                mask_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.mask_stages
+                )
             o_empty_phase = Int32(1)
             tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
@@ -711,23 +697,47 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
                     q_producer_phase ^= 1
                 tile_scheduler.prefetch_next_work()
                 if is_kv_load_warp:
-                    kv_producer_state = produce_block_sparse_loads(
-                        blocksparse_tensors,
-                        batch_idx,
-                        head_idx,
-                        m_block,
-                        seqlen,
-                        kv_producer_state,
-                        tma_load_K_fn,
-                        tma_load_V_fn,
-                        pipeline_k,
-                        pipeline_v,
-                        self.intra_wg_overlap,
-                        self.tile_m,
-                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                        o_empty_mbar_ptr=sO_empty_mbar_ptr,
-                        o_empty_phase=o_empty_phase,
-                    )
+                    if const_expr(self.use_smem_mask_pipeline):
+                        kv_producer_state, mask_producer_state = produce_block_sparse_loads(
+                            blocksparse_tensors,
+                            batch_idx,
+                            head_idx,
+                            m_block,
+                            seqlen,
+                            kv_producer_state,
+                            tma_load_K_fn,
+                            tma_load_V_fn,
+                            pipeline_k,
+                            pipeline_v,
+                            self.intra_wg_overlap,
+                            self.tile_m,
+                            self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                            o_empty_mbar_ptr=sO_empty_mbar_ptr,
+                            o_empty_phase=o_empty_phase,
+                            pipeline_mask=pipeline_mask,
+                            mask_producer_state=mask_producer_state,
+                            sMask=sMask,
+                            payload_groups=self.num_mask_payload_groups,
+                            payload_words=self.mask_payload_words,
+                        )
+                    else:
+                        kv_producer_state = produce_block_sparse_loads(
+                            blocksparse_tensors,
+                            batch_idx,
+                            head_idx,
+                            m_block,
+                            seqlen,
+                            kv_producer_state,
+                            tma_load_K_fn,
+                            tma_load_V_fn,
+                            pipeline_k,
+                            pipeline_v,
+                            self.intra_wg_overlap,
+                            self.tile_m,
+                            self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                            o_empty_mbar_ptr=sO_empty_mbar_ptr,
+                            o_empty_phase=o_empty_phase,
+                        )
                     if const_expr(sO_empty_mbar_ptr is not None):
                         o_empty_phase ^= 1
 
@@ -739,6 +749,8 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             # need it for Q (no cluster) and K.
             if is_kv_load_warp:
                 pipeline_v.producer_tail(kv_producer_state)
+                if const_expr(self.use_smem_mask_pipeline):
+                    pipeline_mask.producer_tail(mask_producer_state)
 
     @cute.jit
     def mma(
@@ -755,6 +767,8 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
         pipeline_q: pipeline.PipelineAsync,
+        pipeline_mask: Optional[pipeline.PipelineAsync],
+        sMask: Optional[cute.Tensor],
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: Optional[cute.CopyAtom],
         tidx: Int32,
@@ -799,6 +813,11 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         kv_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_stages
         )
+        mask_consumer_state = None
+        if const_expr(self.use_smem_mask_pipeline):
+            mask_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.mask_stages
+            )
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         softmax = Softmax.create(
@@ -854,25 +873,51 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
 
             mma_one_n_block = partial(mma_one_n_block_all, seqlen=seqlen, softmax=softmax)
             pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
-            kv_consumer_state, _, processed_any = consume_block_sparse_loads(
-                blocksparse_tensors,
-                batch_idx,
-                head_idx,
-                m_block,
-                seqlen,
-                kv_consumer_state,
-                mma_pv_fn,
-                mma_one_n_block,
-                process_first_half_block,
-                process_last_half_block,
-                self.intra_wg_overlap,
-                self.warp_scheduler_barrier_sync,
-                self.warp_scheduler_barrier_arrive,
-                self.tile_m,
-                tidx,
-                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                payload_words=self.mask_payload_words,
-            )
+            if const_expr(self.use_smem_mask_pipeline):
+                kv_consumer_state, _, processed_any, mask_consumer_state = (
+                    consume_block_sparse_loads(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        seqlen,
+                        kv_consumer_state,
+                        mma_pv_fn,
+                        mma_one_n_block,
+                        process_first_half_block,
+                        process_last_half_block,
+                        self.intra_wg_overlap,
+                        self.warp_scheduler_barrier_sync,
+                        self.warp_scheduler_barrier_arrive,
+                        self.tile_m,
+                        tidx,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        payload_words=self.mask_payload_words,
+                        pipeline_mask=pipeline_mask,
+                        mask_consumer_state=mask_consumer_state,
+                        sMask=sMask,
+                    )
+                )
+            else:
+                kv_consumer_state, _, processed_any = consume_block_sparse_loads(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    seqlen,
+                    kv_consumer_state,
+                    mma_pv_fn,
+                    mma_one_n_block,
+                    process_first_half_block,
+                    process_last_half_block,
+                    self.intra_wg_overlap,
+                    self.warp_scheduler_barrier_sync,
+                    self.warp_scheduler_barrier_arrive,
+                    self.tile_m,
+                    tidx,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    payload_words=self.mask_payload_words,
+                )
 
             pipeline_q.consumer_release_w_index(0)
 

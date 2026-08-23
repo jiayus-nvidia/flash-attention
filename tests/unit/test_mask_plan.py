@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 import torch
 
+from flex_attn.kernels.sm90.forward_config import resolve_sm90_fwd_consumer_config
 from flex_attn.kernels.sm100.bwd.backward_config import (
     resolve_sm100_bwd_consumer_config,
 )
@@ -108,7 +109,7 @@ def test_payload_signature_captures_mma_layout_and_swap_ab():
     assert config.block_size == (256, 128)
     assert signature.mma_atom_layout_id == "tcgen05_f32_ss_qk_cta1_m128n128_major_kk"
     assert signature.swap_ab is False
-    assert signature.scheduler_layout_id == "sm100_clc_fwd_work_desc_i32x4_v1"
+    assert signature.scheduler_layout_id == "plan_fwd_work_desc_i32x4_v1"
     assert signature.mma_atom_layout_id in signature.compile_key
     assert signature.swap_ab in signature.compile_key
     assert signature.scheduler_layout_id in signature.compile_key
@@ -161,6 +162,41 @@ def test_payload_signature_captures_mma_layout_and_swap_ab():
     assert qstage1_1cta_signature != signature
     assert qstage1_1cta_signature != qstage1_2cta_signature
 
+
+def test_sm90_forward_uses_architecture_neutral_schedule_layout():
+    for is_varlen in (False, True):
+        config = resolve_sm90_fwd_consumer_config(
+            arch=90,
+            dtype=torch.bfloat16,
+            head_dim=128,
+            head_dim_v=128,
+            num_q_heads=16,
+            num_kv_heads=4,
+            is_varlen=is_varlen,
+            hmask=1,
+            pack_gqa=None,
+        )
+        signature = config.plan_signature
+        assert signature.arch_family == "sm90"
+        assert signature.direction == "forward"
+        assert signature.scheduler_layout_id == "plan_fwd_work_desc_i32x4_v1"
+
+    config_d256 = resolve_sm90_fwd_consumer_config(
+        arch=90,
+        dtype=torch.bfloat16,
+        head_dim=256,
+        head_dim_v=256,
+        num_q_heads=16,
+        num_kv_heads=16,
+        is_varlen=False,
+        hmask=1,
+        pack_gqa=False,
+    )
+    assert config_d256.block_size == (128, 64)
+    assert config_d256.payload_valid_words == 1
+
+
+def test_sm100_standard_dim_config_coverage():
     for dtype in (torch.float16, torch.bfloat16):
         for head_dim, head_dim_v in SM100_STANDARD_HEAD_DIMS:
             for resolver, expected_q_stage, expected_cta_group_size in (
@@ -214,7 +250,7 @@ def test_hd256_forward_qstage1_cta_variants():
     assert config.physical_subtiles == 1
     assert config.block_size == (128, 128)
     assert signature.mma_atom_layout_id == "tcgen05_f32_ss_qk_cta1_m128n128_major_kk"
-    assert signature.scheduler_layout_id == "sm100_clc_fwd_work_desc_i32x4_v1"
+    assert signature.scheduler_layout_id == "plan_fwd_work_desc_i32x4_v1"
 
     config_2cta = resolve_sm100_hd256_fwd_consumer_config(
         arch=103,
@@ -235,4 +271,4 @@ def test_hd256_forward_qstage1_cta_variants():
     assert config_2cta.block_size == (256, 128)
     assert signature_2cta.kernel_family == "sm100_hd256_qstage1_2cta_fwd"
     assert signature_2cta.mma_atom_layout_id == "tcgen05_f32_ss_qk_cta2_m256n128_major_kk"
-    assert signature_2cta.scheduler_layout_id == "sm100_clc_fwd_work_desc_i32x4_v1"
+    assert signature_2cta.scheduler_layout_id == "plan_fwd_work_desc_i32x4_v1"

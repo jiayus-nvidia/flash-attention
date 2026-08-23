@@ -12,6 +12,8 @@ import torch
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import warpgroup
 
+from flex_attn.plan.mask_plan import ArbitraryPlanSignature
+
 
 @dataclass(frozen=True)
 class FwdConfig:
@@ -74,6 +76,33 @@ class _ResolvedSm90FwdConsumerConfig:
             self.payload_padded_words,
         )
 
+    @property
+    def plan_signature(self) -> ArbitraryPlanSignature:
+        return ArbitraryPlanSignature(
+            arch_family="sm90",
+            direction="forward",
+            kernel_family="sm90_generic_fwd",
+            tile_m=self.tile_m,
+            tile_n=self.tile_n,
+            q_stage=1,
+            cta_group_size=1,
+            pack_gqa=self.pack_gqa,
+            qhead_per_kvhead=self.qhead_per_kvhead,
+            mma_atom_layout_id=(
+                f"sm90_wgmma_f32_ss_qk_m{self.tile_m}n{self.tile_n}"
+                f"_t{self.num_mma_threads}_major_kk"
+            ),
+            swap_ab=self.swap_ab,
+            payload_layout_id=(
+                f"sm90_wgmma_qk_t{self.num_mma_threads}"
+                f"_v{self.payload_values_per_thread}"
+                f"_w{self.payload_padded_words}_v1"
+            ),
+            dq_order_format="none",
+            cluster_axis="m",
+            scheduler_layout_id="plan_fwd_work_desc_i32x4_v1",
+        )
+
 
 def _tile_size_fwd_sm90(
     head_dim: int,
@@ -95,7 +124,7 @@ def _tile_size_fwd_sm90(
     if head_dim <= 192:
         tile_n = 128 if head_dim_v <= 128 else 112
         return FwdConfig(128, tile_n, True, True)
-    return FwdConfig(128, 80, True, True)
+    return FwdConfig(128, 64, True, True)
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -111,16 +140,46 @@ def _native_sm90_fwd_smem_bytes(
 
     tile_hdim = math.ceil(head_dim / 16) * 16
     tile_hdim_v = math.ceil(head_dim_v / 16) * 16
-    offset = (2 + 2 * config.num_stages + 2 * config.num_stages) * 8
-    fields = (
+    num_mma_threads = 128 * (config.m_block_size // 64)
+    payload_values_per_thread = (
+        config.m_block_size * config.n_block_size // num_mma_threads
+    )
+    payload_words = math.ceil(payload_values_per_thread / 32)
+    mask_pipeline_bytes = num_mma_threads * payload_words * 2 * 4
+
+    # Preserve the conservative native-QKV estimate while accounting for the
+    # actual SharedStorageQKV lifetime layout used by the mask pipeline.
+    native_offset = (2 + 2 * config.num_stages + 2 * config.num_stages) * 8
+    native_fields = (
         config.n_block_size * tile_hdim_v * config.num_stages * 2,
         config.m_block_size * max(tile_hdim, tile_hdim_v) * 2,
         config.n_block_size * tile_hdim * config.num_stages * 2,
         0 if config.mma_pv_is_rs else config.m_block_size * config.n_block_size * 2,
     )
-    for size in fields:
-        offset = _align_up(offset, 1024) + size
-    return _align_up(offset, 1024)
+    for size in native_fields:
+        native_offset = _align_up(native_offset, 1024) + size
+
+    pipeline_offset = (
+        2 + 2 * config.num_stages + 2 * config.num_stages + 2 * 2
+    ) * 8
+    pipeline_offset = _align_up(pipeline_offset, 16) + mask_pipeline_bytes
+    pipeline_fields = (
+        max(
+            config.n_block_size * tile_hdim_v * config.num_stages,
+            config.m_block_size * tile_hdim_v,
+        )
+        * 2,
+        config.m_block_size * tile_hdim * 2,
+        config.n_block_size * tile_hdim * config.num_stages * 2,
+        0 if config.mma_pv_is_rs else config.m_block_size * config.n_block_size * 2,
+    )
+    for size in pipeline_fields:
+        pipeline_offset = _align_up(pipeline_offset, 1024) + size
+
+    return max(
+        _align_up(native_offset, 1024),
+        _align_up(pipeline_offset, 1024),
+    )
 
 
 def sm90_native_fwd_can_implement(head_dim: int, head_dim_v: int) -> bool:

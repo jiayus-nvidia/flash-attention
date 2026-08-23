@@ -460,6 +460,10 @@ def produce_arbitrary_forward_nonoverlap(
     pipeline_v,
     o_empty_mbar_ptr: Optional[cute.Pointer] = None,
     o_empty_phase: Optional[Int32] = None,
+    pipeline_mask=None,
+    mask_producer_state=None,
+    sMask: Optional[cute.Tensor] = None,
+    payload_groups: cutlass.Constexpr[int] = 0,
 ):
     """Produce anchored partial/full CSR loops without K/V overlap."""
     if const_expr(o_empty_mbar_ptr is not None):
@@ -470,7 +474,21 @@ def produce_arbitrary_forward_nonoverlap(
         partial_list_idx = partial_block_cnt - Int32(1) - iteration
         n_block = partial_block_idx[partial_list_idx]
         payload_idx = partial_payload_base + partial_list_idx
-        prefetch_arbitrary_forward_mask(mask_payloads, payload_idx, True, payload_words)
+        if const_expr(pipeline_mask is not None):
+            assert mask_producer_state is not None
+            assert sMask is not None
+            mask_producer_state = load_mask_payload_to_smem(
+                mask_payloads,
+                payload_idx,
+                Int32(0),
+                sMask[None, None, mask_producer_state.index],
+                pipeline_mask,
+                mask_producer_state,
+                payload_groups,
+                payload_words,
+            )
+        else:
+            prefetch_arbitrary_forward_mask(mask_payloads, payload_idx, True, payload_words)
         prefetch_arbitrary_forward_block_index(
             partial_block_idx,
             partial_list_idx - Int32(1),
@@ -495,7 +513,7 @@ def produce_arbitrary_forward_nonoverlap(
         pipeline_v.producer_acquire(kv_producer_state)
         load_V(src_idx=n_block, producer_state=kv_producer_state)
         kv_producer_state.advance()
-    return kv_producer_state
+    return kv_producer_state, mask_producer_state
 
 
 @cute.jit
@@ -514,6 +532,10 @@ def produce_arbitrary_forward_overlap(
     pipeline_v,
     o_empty_mbar_ptr: Optional[cute.Pointer] = None,
     o_empty_phase: Optional[Int32] = None,
+    pipeline_mask=None,
+    mask_producer_state=None,
+    sMask: Optional[cute.Tensor] = None,
+    payload_groups: cutlass.Constexpr[int] = 0,
 ):
     """Produce partial/full CSR loops with overlapped K/V loads."""
     total_block_cnt = partial_block_cnt + full_block_cnt
@@ -524,13 +546,27 @@ def produce_arbitrary_forward_overlap(
             partial_list_idx = partial_block_cnt - Int32(1)
             n_block_prev = partial_block_idx[partial_list_idx]
             payload_idx = partial_payload_base + partial_list_idx
-            prefetch_arbitrary_forward_mask(mask_payloads, payload_idx, True, payload_words)
-            prefetch_arbitrary_forward_mask(
-                mask_payloads,
-                payload_idx - Int32(1),
-                partial_block_cnt > Int32(1),
-                payload_words,
-            )
+            if const_expr(pipeline_mask is not None):
+                assert mask_producer_state is not None
+                assert sMask is not None
+                mask_producer_state = load_mask_payload_to_smem(
+                    mask_payloads,
+                    payload_idx,
+                    Int32(0),
+                    sMask[None, None, mask_producer_state.index],
+                    pipeline_mask,
+                    mask_producer_state,
+                    payload_groups,
+                    payload_words,
+                )
+            else:
+                prefetch_arbitrary_forward_mask(mask_payloads, payload_idx, True, payload_words)
+                prefetch_arbitrary_forward_mask(
+                    mask_payloads,
+                    payload_idx - Int32(1),
+                    partial_block_cnt > Int32(1),
+                    payload_words,
+                )
             prefetch_arbitrary_forward_block_index(
                 partial_block_idx,
                 partial_list_idx - Int32(1),
@@ -564,12 +600,26 @@ def produce_arbitrary_forward_overlap(
                 partial_list_idx = partial_block_cnt - Int32(1) - iteration
                 n_block = partial_block_idx[partial_list_idx]
                 payload_idx = partial_payload_base + partial_list_idx
-                prefetch_arbitrary_forward_mask(
-                    mask_payloads,
-                    payload_idx - Int32(1),
-                    iteration + Int32(1) < partial_block_cnt,
-                    payload_words,
-                )
+                if const_expr(pipeline_mask is not None):
+                    assert mask_producer_state is not None
+                    assert sMask is not None
+                    mask_producer_state = load_mask_payload_to_smem(
+                        mask_payloads,
+                        payload_idx,
+                        Int32(0),
+                        sMask[None, None, mask_producer_state.index],
+                        pipeline_mask,
+                        mask_producer_state,
+                        payload_groups,
+                        payload_words,
+                    )
+                else:
+                    prefetch_arbitrary_forward_mask(
+                        mask_payloads,
+                        payload_idx - Int32(1),
+                        iteration + Int32(1) < partial_block_cnt,
+                        payload_words,
+                    )
                 prefetch_arbitrary_forward_block_index(
                     partial_block_idx,
                     partial_list_idx - Int32(1),
@@ -606,7 +656,7 @@ def produce_arbitrary_forward_overlap(
         pipeline_v.producer_acquire(kv_producer_state)
         load_V(src_idx=n_block_prev, producer_state=kv_producer_state)
         kv_producer_state.advance()
-    return kv_producer_state
+    return kv_producer_state, mask_producer_state
 
 
 @cute.jit
@@ -624,6 +674,9 @@ def consume_arbitrary_forward_nonoverlap(
     payload_words: cutlass.Constexpr[int],
     warp_scheduler_barrier_sync: Callable,
     warp_scheduler_barrier_arrive: Callable,
+    pipeline_mask=None,
+    mask_consumer_state=None,
+    sMask: Optional[cute.Tensor] = None,
 ):
     """Consume partial/full CSR loops without K/V overlap."""
     total_block_cnt = partial_block_cnt + full_block_cnt
@@ -637,6 +690,16 @@ def consume_arbitrary_forward_nonoverlap(
             n_block = Int32(0)
             if const_expr(partial_block_idx is not None):
                 n_block = partial_block_idx[partial_list_idx]
+            r_bitmask = None
+            if const_expr(pipeline_mask is not None):
+                assert mask_consumer_state is not None
+                assert sMask is not None
+                r_bitmask, mask_consumer_state = consume_mask_payload_from_smem(
+                    sMask[None, None, mask_consumer_state.index],
+                    payload_group_idx,
+                    pipeline_mask,
+                    mask_consumer_state,
+                )
             kv_consumer_state = mma_one_n_block(
                 kv_consumer_state,
                 n_block=n_block,
@@ -647,6 +710,7 @@ def consume_arbitrary_forward_nonoverlap(
                     payload_idx=payload_idx,
                     payload_group_idx=payload_group_idx,
                     payload_words=payload_words,
+                    r_bitmask=r_bitmask,
                 ),
                 is_first_n_block=True,
             )
@@ -656,6 +720,16 @@ def consume_arbitrary_forward_nonoverlap(
                 n_block = Int32(0)
                 if const_expr(partial_block_idx is not None):
                     n_block = partial_block_idx[partial_list_idx]
+                r_bitmask = None
+                if const_expr(pipeline_mask is not None):
+                    assert mask_consumer_state is not None
+                    assert sMask is not None
+                    r_bitmask, mask_consumer_state = consume_mask_payload_from_smem(
+                        sMask[None, None, mask_consumer_state.index],
+                        payload_group_idx,
+                        pipeline_mask,
+                        mask_consumer_state,
+                    )
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=n_block,
@@ -666,6 +740,7 @@ def consume_arbitrary_forward_nonoverlap(
                         payload_idx=payload_idx,
                         payload_group_idx=payload_group_idx,
                         payload_words=payload_words,
+                        r_bitmask=r_bitmask,
                     ),
                     is_first_n_block=False,
                 )
@@ -696,7 +771,7 @@ def consume_arbitrary_forward_nonoverlap(
                 is_first_n_block=False,
             )
         warp_scheduler_barrier_arrive()
-    return kv_consumer_state, processed_any
+    return kv_consumer_state, processed_any, mask_consumer_state
 
 
 @cute.jit
@@ -715,6 +790,9 @@ def consume_arbitrary_forward_overlap(
     process_last_half_block: Callable,
     payload_group_idx: Int32,
     payload_words: cutlass.Constexpr[int],
+    pipeline_mask=None,
+    mask_consumer_state=None,
+    sMask: Optional[cute.Tensor] = None,
 ):
     """Consume partial/full CSR loops with K/V overlap."""
     processed_any = partial_block_cnt + full_block_cnt > Int32(0)
@@ -727,37 +805,35 @@ def consume_arbitrary_forward_overlap(
             n_block = Int32(0)
             if const_expr(partial_block_idx is not None):
                 n_block = partial_block_idx[partial_list_idx]
-            kv_consumer_state = process_first_half_block(
-                n_block=n_block,
-                seqlen=seqlen_info,
-                kv_consumer_state=kv_consumer_state,
-                mask_fn=partial(
-                    apply_arbitrary_forward_mask,
-                    mask_payloads=mask_payloads,
-                    payload_idx=payload_idx,
-                    payload_group_idx=payload_group_idx,
-                    payload_words=payload_words,
-                ),
-                mask_prefetch_fn=partial(
-                    load_mask_payload,
-                    mask_payloads,
-                    payload_idx,
+            if const_expr(pipeline_mask is not None):
+                assert mask_consumer_state is not None
+                assert sMask is not None
+                r_bitmask, mask_consumer_state = consume_mask_payload_from_smem(
+                    sMask[None, None, mask_consumer_state.index],
                     payload_group_idx,
-                    payload_words=payload_words,
-                ),
-                is_first_block=True,
-            )
-            for iteration in cutlass.range(1, partial_block_cnt, unroll=1):
-                partial_list_idx = partial_block_cnt - Int32(1) - iteration
-                payload_idx = partial_payload_base + partial_list_idx
-                n_block = Int32(0)
-                if const_expr(partial_block_idx is not None):
-                    n_block = partial_block_idx[partial_list_idx]
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
+                    pipeline_mask,
+                    mask_consumer_state,
+                )
+                kv_consumer_state = process_first_half_block(
                     n_block=n_block,
                     seqlen=seqlen_info,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                    kv_consumer_state=kv_consumer_state,
+                    mask_fn=partial(
+                        apply_arbitrary_forward_mask,
+                        mask_payloads=mask_payloads,
+                        payload_idx=payload_idx,
+                        payload_group_idx=payload_group_idx,
+                        payload_words=payload_words,
+                        r_bitmask=r_bitmask,
+                    ),
+                    mask_prefetch_fn=None,
+                    is_first_block=True,
+                )
+            else:
+                kv_consumer_state = process_first_half_block(
+                    n_block=n_block,
+                    seqlen=seqlen_info,
+                    kv_consumer_state=kv_consumer_state,
                     mask_fn=partial(
                         apply_arbitrary_forward_mask,
                         mask_payloads=mask_payloads,
@@ -772,7 +848,59 @@ def consume_arbitrary_forward_overlap(
                         payload_group_idx,
                         payload_words=payload_words,
                     ),
+                    is_first_block=True,
                 )
+            for iteration in cutlass.range(1, partial_block_cnt, unroll=1):
+                partial_list_idx = partial_block_cnt - Int32(1) - iteration
+                payload_idx = partial_payload_base + partial_list_idx
+                n_block = Int32(0)
+                if const_expr(partial_block_idx is not None):
+                    n_block = partial_block_idx[partial_list_idx]
+                if const_expr(pipeline_mask is not None):
+                    assert mask_consumer_state is not None
+                    assert sMask is not None
+                    r_bitmask, mask_consumer_state = consume_mask_payload_from_smem(
+                        sMask[None, None, mask_consumer_state.index],
+                        payload_group_idx,
+                        pipeline_mask,
+                        mask_consumer_state,
+                    )
+                    kv_consumer_state = mma_one_n_block(
+                        kv_consumer_state,
+                        n_block=n_block,
+                        seqlen=seqlen_info,
+                        mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                        mask_fn=partial(
+                            apply_arbitrary_forward_mask,
+                            mask_payloads=mask_payloads,
+                            payload_idx=payload_idx,
+                            payload_group_idx=payload_group_idx,
+                            payload_words=payload_words,
+                            r_bitmask=r_bitmask,
+                        ),
+                        mask_prefetch_fn=None,
+                    )
+                else:
+                    kv_consumer_state = mma_one_n_block(
+                        kv_consumer_state,
+                        n_block=n_block,
+                        seqlen=seqlen_info,
+                        mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                        mask_fn=partial(
+                            apply_arbitrary_forward_mask,
+                            mask_payloads=mask_payloads,
+                            payload_idx=payload_idx,
+                            payload_group_idx=payload_group_idx,
+                            payload_words=payload_words,
+                        ),
+                        mask_prefetch_fn=partial(
+                            load_mask_payload,
+                            mask_payloads,
+                            payload_idx,
+                            payload_group_idx,
+                            payload_words=payload_words,
+                        ),
+                    )
                 O_should_accumulate = True
             full_start = Int32(0)
         else:
@@ -810,7 +938,7 @@ def consume_arbitrary_forward_overlap(
             zero_init=not O_should_accumulate,
         )
         O_should_accumulate = True
-    return kv_consumer_state, O_should_accumulate, processed_any
+    return kv_consumer_state, O_should_accumulate, processed_any, mask_consumer_state
 
 
 @cute.jit
@@ -830,6 +958,11 @@ def produce_block_sparse_loads(
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     o_empty_mbar_ptr: Optional[cute.Pointer] = None,
     o_empty_phase: Optional[Int32] = None,
+    pipeline_mask=None,
+    mask_producer_state=None,
+    sMask: Optional[cute.Tensor] = None,
+    payload_groups: cutlass.Constexpr[int] = 0,
+    payload_words: cutlass.Constexpr[int] = 4,
 ):
     """Produce K/V loads for one arbitrary-mask plan row on SM90."""
     mask_payloads = blocksparse_tensors.mask_block_masks
@@ -850,14 +983,14 @@ def produce_block_sparse_loads(
         qhead_per_kvhead,
     )
     if const_expr(not intra_wg_overlap):
-        return produce_arbitrary_forward_nonoverlap(
+        kv_producer_state, mask_producer_state = produce_arbitrary_forward_nonoverlap(
             curr_mask_block_cnt,
             curr_mask_block_idx,
             curr_full_block_cnt,
             curr_full_block_idx,
             mask_payload_base,
             mask_payloads,
-            mask_payloads.shape[3],
+            payload_words,
             kv_producer_state,
             load_K,
             load_V,
@@ -865,23 +998,35 @@ def produce_block_sparse_loads(
             pipeline_v,
             o_empty_mbar_ptr,
             o_empty_phase,
+            pipeline_mask,
+            mask_producer_state,
+            sMask,
+            payload_groups,
         )
-    return produce_arbitrary_forward_overlap(
-        curr_mask_block_cnt,
-        curr_mask_block_idx,
-        curr_full_block_cnt,
-        curr_full_block_idx,
-        mask_payload_base,
-        mask_payloads,
-        mask_payloads.shape[3],
-        kv_producer_state,
-        load_K,
-        load_V,
-        pipeline_k,
-        pipeline_v,
-        o_empty_mbar_ptr,
-        o_empty_phase,
-    )
+    else:
+        kv_producer_state, mask_producer_state = produce_arbitrary_forward_overlap(
+            curr_mask_block_cnt,
+            curr_mask_block_idx,
+            curr_full_block_cnt,
+            curr_full_block_idx,
+            mask_payload_base,
+            mask_payloads,
+            payload_words,
+            kv_producer_state,
+            load_K,
+            load_V,
+            pipeline_k,
+            pipeline_v,
+            o_empty_mbar_ptr,
+            o_empty_phase,
+            pipeline_mask,
+            mask_producer_state,
+            sMask,
+            payload_groups,
+        )
+    if const_expr(pipeline_mask is not None):
+        return kv_producer_state, mask_producer_state
+    return kv_producer_state
 
 
 @cute.jit
@@ -903,6 +1048,9 @@ def consume_block_sparse_loads(
     consumer_tidx: Int32,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     payload_words: cutlass.Constexpr[int] = 4,
+    pipeline_mask=None,
+    mask_consumer_state=None,
+    sMask: Optional[cute.Tensor] = None,
 ):
     """Consume one arbitrary-mask plan row on the SM90 MMA warp group."""
     mask_payloads = blocksparse_tensors.mask_block_masks
@@ -925,38 +1073,53 @@ def consume_block_sparse_loads(
         qhead_per_kvhead,
     )
     if const_expr(not intra_wg_overlap):
-        kv_consumer_state, processed_any = consume_arbitrary_forward_nonoverlap(
+        kv_consumer_state, processed_any, mask_consumer_state = (
+            consume_arbitrary_forward_nonoverlap(
+                curr_mask_block_cnt,
+                None,
+                curr_full_block_cnt,
+                None,
+                mask_payload_base,
+                mask_payloads,
+                kv_consumer_state,
+                mma_pv_fn,
+                mma_one_n_block,
+                payload_group_idx,
+                payload_words,
+                warp_scheduler_barrier_sync,
+                warp_scheduler_barrier_arrive,
+                pipeline_mask,
+                mask_consumer_state,
+                sMask,
+            )
+        )
+        if const_expr(pipeline_mask is not None):
+            return kv_consumer_state, processed_any, processed_any, mask_consumer_state
+        return kv_consumer_state, processed_any, processed_any
+    kv_consumer_state, O_should_accumulate, processed_any, mask_consumer_state = (
+        consume_arbitrary_forward_overlap(
             curr_mask_block_cnt,
             None,
             curr_full_block_cnt,
             None,
             mask_payload_base,
             mask_payloads,
+            seqlen_info,
             kv_consumer_state,
             mma_pv_fn,
             mma_one_n_block,
+            process_first_half_block,
+            process_last_half_block,
             payload_group_idx,
             payload_words,
-            warp_scheduler_barrier_sync,
-            warp_scheduler_barrier_arrive,
+            pipeline_mask,
+            mask_consumer_state,
+            sMask,
         )
-        return kv_consumer_state, processed_any, processed_any
-    return consume_arbitrary_forward_overlap(
-        curr_mask_block_cnt,
-        None,
-        curr_full_block_cnt,
-        None,
-        mask_payload_base,
-        mask_payloads,
-        seqlen_info,
-        kv_consumer_state,
-        mma_pv_fn,
-        mma_one_n_block,
-        process_first_half_block,
-        process_last_half_block,
-        payload_group_idx,
-        payload_words,
     )
+    if const_expr(pipeline_mask is not None):
+        return kv_consumer_state, O_should_accumulate, processed_any, mask_consumer_state
+    return kv_consumer_state, O_should_accumulate, processed_any
 
 
 @cute.jit

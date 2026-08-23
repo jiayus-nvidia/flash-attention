@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import torch
 
 from flex_attn.kernels.sm90.backward_config import _ResolvedSm90BwdConsumerConfig
-from flex_attn.kernels.sm90.forward_config import _ResolvedSm90FwdConsumerConfig
 from flex_attn.kernels.sm100.bwd.backward_config import _ResolvedSm100BwdConsumerConfig
 from flex_attn.kernels.sm100.bwd.backward_config_hd256 import (
     _ResolvedSm100Hd256DkdvConsumerConfig,
@@ -21,35 +20,11 @@ from flex_attn.plan.mask_plan import ArbitraryPlanSignature
 
 
 def _consumer_plan_signature(config) -> ArbitraryPlanSignature:
-    """Return versioned metadata without changing the committed SM90 configs."""
+    """Return versioned metadata for one resolved consumer config."""
 
     signature = getattr(config, "plan_signature", None)
     if signature is not None:
         return signature
-    if isinstance(config, _ResolvedSm90FwdConsumerConfig):
-        return ArbitraryPlanSignature(
-            arch_family="sm90",
-            direction="forward",
-            kernel_family="sm90_generic_fwd",
-            tile_m=config.tile_m,
-            tile_n=config.tile_n,
-            q_stage=1,
-            cta_group_size=1,
-            pack_gqa=config.pack_gqa,
-            qhead_per_kvhead=config.qhead_per_kvhead,
-            mma_atom_layout_id=(
-                f"sm90_wgmma_f32_ss_qk_m{config.tile_m}n{config.tile_n}"
-                f"_t{config.num_mma_threads}_major_kk"
-            ),
-            swap_ab=config.swap_ab,
-            payload_layout_id=(
-                f"sm90_wgmma_qk_t{config.num_mma_threads}"
-                f"_v{config.payload_values_per_thread}"
-                f"_w{config.payload_padded_words}_v1"
-            ),
-            dq_order_format="none",
-            cluster_axis="m",
-        )
     if isinstance(config, _ResolvedSm90BwdConsumerConfig):
         return ArbitraryPlanSignature(
             arch_family="sm90",

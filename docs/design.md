@@ -126,7 +126,7 @@ scan counts and allocate exact compact outputs|
 materialize Q2K/K2Q CSR and packed payloads   |
               |                               |
               v                               |
-materialize SM100 forward schedule metadata   |
+materialize architecture-neutral FWD schedule|
               |                               |
               +-------------------------------+
               v
@@ -268,22 +268,22 @@ for parallel dQ accumulation and do not change mask visibility.
 If a dedicated dQ kernel requires its own Q-major layout, the plan may additionally contain a
 separate Q2K view materialized for that consumer.
 
-### 4.8 SM100 Forward Schedule Materialization
+### 4.8 Architecture-Neutral Forward Schedule Materialization
 
-SM100/SM103 forward uses plan-owned CLC work metadata. The planner produces one task for every
-valid Q plan row and scheduled head:
+SM90, SM100, and SM103 forward share one plan-owned task schedule. The planner produces one task
+for every valid Q plan row and scheduled head:
 
 ```text
 num_forward_tasks = valid Q plan rows * scheduled heads
 ```
 
-`fwd_work_desc` is always present on this path. `sequence_desc` is present for Varlen and for
-consumer families that require an explicit sequence descriptor:
+`fwd_work_desc` is present for every supported forward plan. `sequence_desc` is present for
+Varlen and for consumer families that require an explicit sequence descriptor:
 
 | Descriptor | Contents | Purpose |
 |---|---|---|
 | `sequence_desc[B, 8]` | `q_offset`, `k_offset`, `q_len`, `k_len`, Q-plan-row begin/count, valid K-block count, reserved field | Maps logical rows to one sample and defines address/tail bounds. |
-| `fwd_work_desc[num_forward_tasks, 4]` | `m_block`, scheduled head, `batch_idx`, `q_valid_rows` | Gives each CLC task its complete Q-tile identity. |
+| `fwd_work_desc[num_forward_tasks, 4]` | `m_block`, scheduled head, `batch_idx`, `q_valid_rows` | Gives each scheduled task its complete Q-tile identity. |
 
 The planner computes task cost as:
 
@@ -295,6 +295,16 @@ Partial and full blocks deliberately have equal scheduling cost. Tasks are stabl
 and L2 locality sections before being stored in `fwd_work_desc`. The kernel therefore consumes a
 prepared work queue; it does not enumerate all batch Q tiles or reconstruct task ownership from
 `cu_seqlens`.
+
+The descriptor layout and ordering are architecture-neutral; only the queue backend differs:
+
+- SM90 uses `PlanDynamicPersistentTileSchedulerSm90`, backed by a call-local software atomic
+  counter. Fixed and Varlen forward use the same queue mechanism, and every task is obtained from
+  the dynamic queue.
+- SM100/SM103 use `PlanClcPersistentTileSchedulerSm100`, backed by the hardware CLC queue.
+
+The SM90 counter is runtime workspace rather than plan storage. This lets one immutable plan be
+used concurrently on different CUDA streams without sharing mutable scheduler state.
 
 `q_len`, `k_len`, and `q_valid_rows` remain necessary after scheduling. They protect physical
 loads and stores at sequence tails; they are not used to rediscover which tasks exist.
@@ -359,27 +369,31 @@ for block in full_range:
 An empty block is absent from both ranges. A full block never loads a packed predicate. A plan row
 with no active blocks writes `O=0` and `LSE=-inf`.
 
-### 6.2 SM100/SM103 Two-Stage Mask Pipeline
+### 6.2 Two-Stage SMEM Mask Pipeline
 
-The generic SM100/SM103 qstage1 + 2CTA forward kernel stages partial payloads through a two-stage
-SMEM packed-mask pipeline. The stages are aligned with the two score stages. Each stage owns one
-2-KB payload slot and its barrier state, for 4 KB of mask SMEM per CTA:
+SM90 forward and the generic SM100/SM103 qstage1 + 2CTA forward kernel stage partial payloads
+through a two-stage SMEM packed-mask pipeline. Each stage owns one CTA-native payload slot and its
+barrier state. For an M128xN128 non-PackGQA consumer, the pipeline uses 4 KB of mask SMEM per CTA:
 
 ```text
-128 payload groups * 4 uint32 words * 4 bytes = 2 KB per stage
+SM90:             256 payload groups * 2 uint32 words * 4 bytes = 2 KB per stage
+SM100/SM103 2CTA: 128 payload groups * 4 uint32 words * 4 bytes = 2 KB per stage
 ```
 
-For a partial block, the load warp bulk-copies the CTA-native `[128, 4]` payload plane from GMEM
-to the selected SMEM stage. The softmax warps wait for that stage, copy their four words to
-registers, release the stage, and apply the packed predicate.
+For a partial block, the load warp bulk-copies the CTA-native payload plane from GMEM to the
+selected SMEM stage. The MMA/softmax consumers wait for that stage, copy their payload words to
+registers, release the stage, and apply the packed predicate. PackGQA can reduce the number of
+payload groups while preserving the same protocol.
 
 Pipeline state advances exactly once for each partial block assigned to a stage. Full and empty
 blocks neither load a payload nor advance the mask pipeline. The same protocol applies to Fixed,
 Varlen, PackGQA, and non-PackGQA generic shapes.
 
-The generic qstage1 + 1CTA and qstage2 + 1CTA variants, and the dedicated D256 forward kernel,
-retain direct GMEM-to-register payload loads. Delivery method does not change the payload ABI or
-the partial/full topology.
+SM90 D256 uses an M128xN64 tile. The smaller N dimension leaves enough shared memory for the
+two-stage mask pipeline; its non-PackGQA payload contains one `uint32` word per consumer thread and
+uses 2 KB across both stages. The generic SM100/SM103 qstage1 + 1CTA and qstage2 + 1CTA variants,
+and the dedicated SM100/SM103 D256 forward kernel, retain direct GMEM-to-register payload loads.
+Delivery method does not change the payload ABI or the partial/full topology.
 
 ### 6.3 Backward
 

@@ -1,4 +1,4 @@
-"""Plan-side work descriptor materialization for SM100 forward CLC scheduling."""
+"""Architecture-neutral forward work descriptor materialization."""
 
 from typing import Optional
 
@@ -11,7 +11,7 @@ import cuda.bindings.driver as cuda
 _L2_SECTION_BYTES = 50 * 1024 * 1024
 
 
-class Sm100ForwardSchedulePlan:
+class ForwardSchedulePlan:
     """Materialize exact forward work and locality keys once per mask plan."""
 
     def __init__(
@@ -178,4 +178,4 @@ class Sm100ForwardSchedulePlan:
             mSectionId[task_idx] = section_id
 
 
-__all__ = ["Sm100ForwardSchedulePlan"]
+__all__ = ["ForwardSchedulePlan"]

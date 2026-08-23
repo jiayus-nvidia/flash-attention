@@ -123,7 +123,7 @@ scan counts，按精确大小分配 compact outputs  |
 materialize Q2K/K2Q CSR 与 packed payloads    |
               |                               |
               v                               |
-materialize SM100 forward schedule metadata  |
+materialize 架构通用 FWD schedule            |
               |                               |
               +-------------------------------+
               v
@@ -260,22 +260,22 @@ K2Q payload 按 backward consumer 的 accumulator layout 生成。generic backwa
 如果 dedicated dQ kernel 需要独立的 Q-major layout，plan 还可以额外保存一份为该
 consumer materialize 的 Q2K view。
 
-### 4.8 SM100 Forward Schedule Materialization
+### 4.8 架构通用的 Forward Schedule Materialization
 
-SM100/SM103 forward 使用 plan 持有的 CLC work metadata。planner 为每个有效 Q plan row
-和 scheduled head 生成一个 task：
+SM90、SM100 和 SM103 forward 共用一份由 plan 持有的 task schedule。planner 为每个
+有效 Q plan row 和 scheduled head 生成一个 task：
 
 ```text
 num_forward_tasks = valid Q plan rows * scheduled heads
 ```
 
-该路径始终持有 `fwd_work_desc`。Varlen 以及需要显式 sequence descriptor 的 consumer
-family 还会持有 `sequence_desc`：
+所有受支持的 forward plan 都持有 `fwd_work_desc`。Varlen 以及需要显式 sequence
+descriptor 的 consumer family 还会持有 `sequence_desc`：
 
 | Descriptor | 内容 | 作用 |
 |---|---|---|
 | `sequence_desc[B, 8]` | `q_offset`、`k_offset`、`q_len`、`k_len`、Q-plan-row begin/count、有效 K-block count、reserved field | 将逻辑 row 映射到 sample，并提供地址和 tail 边界。 |
-| `fwd_work_desc[num_forward_tasks, 4]` | `m_block`、scheduled head、`batch_idx`、`q_valid_rows` | 给出每个 CLC task 的完整 Q-tile identity。 |
+| `fwd_work_desc[num_forward_tasks, 4]` | `m_block`、scheduled head、`batch_idx`、`q_valid_rows` | 给出每个 scheduled task 的完整 Q-tile identity。 |
 
 planner 使用以下 cost：
 
@@ -286,6 +286,16 @@ task_cost = partial_block_count + full_block_count
 partial 与 full block 的 cost 相同。task 在写入 `fwd_work_desc` 前，按 cost 和 L2 locality
 section 执行 stable ordering。kernel 最终消费 prepared work queue，不再枚举整个 batch
 的 Q tiles，也不通过 `cu_seqlens` 重建 task ownership。
+
+descriptor layout 和 ordering 与 architecture 无关，只有 queue backend 不同：
+
+- SM90 使用 `PlanDynamicPersistentTileSchedulerSm90`，backend 是调用级 software atomic
+  counter。Fixed 和 Varlen forward 使用同一套 queue 机制，所有 task 都从 dynamic
+  queue 中取得。
+- SM100/SM103 使用 `PlanClcPersistentTileSchedulerSm100`，backend 是硬件 CLC queue。
+
+SM90 counter 属于 runtime workspace，不属于 plan storage。这样同一个 immutable plan
+可以在不同 CUDA stream 上并发使用，而不会共享可变 scheduler state。
 
 完成调度后，`q_len`、`k_len` 和 `q_valid_rows` 仍然有必要：它们用于保护 sequence tail
 处的物理 load/store，而不是重新判断有哪些 task。
@@ -348,26 +358,32 @@ for block in full_range:
 empty block 不进入任何 range。full block 不加载 packed predicate。没有 active block 的
 plan row 写出 `O=0`、`LSE=-inf`。
 
-### 6.2 SM100/SM103 Two-Stage Mask Pipeline
+### 6.2 Two-Stage SMEM Mask Pipeline
 
-generic SM100/SM103 qstage1 + 2CTA forward kernel 使用 two-stage SMEM packed-mask
-pipeline 暂存 partial payload。两个 stage 与 score pipeline 的两个 stage 对齐；每个 stage
-持有一个 2-KB payload slot 和对应 barrier state，因此每个 CTA 共使用 4 KB mask SMEM：
+SM90 forward 和 generic SM100/SM103 qstage1 + 2CTA forward kernel 使用 two-stage
+SMEM packed-mask pipeline 暂存 partial payload。每个 stage 持有一个 CTA-native payload
+slot 和对应 barrier state。对于 M128xN128 non-PackGQA consumer，每个 CTA 共使用 4 KB
+mask SMEM：
 
 ```text
-128 payload groups * 4 uint32 words * 4 bytes = 2 KB per stage
+SM90:             256 payload groups * 2 uint32 words * 4 bytes = 2 KB per stage
+SM100/SM103 2CTA: 128 payload groups * 4 uint32 words * 4 bytes = 2 KB per stage
 ```
 
-处理 partial block 时，load warp 将 CTA-native `[128, 4]` payload plane 从 GMEM
-bulk-copy 到选定的 SMEM stage。softmax warps 等待该 stage，将各自的 4 个 words 复制到
-register，释放 stage，然后应用 packed predicate。
+处理 partial block 时，load warp 将 CTA-native payload plane 从 GMEM bulk-copy 到选定的
+SMEM stage。MMA/softmax consumers 等待该 stage，将各自的 payload words 复制到
+register，释放 stage，然后应用 packed predicate。PackGQA 可以减少 payload group 数量，
+但不改变 pipeline 协议。
 
 每个 partial block 在所属 stage 上恰好推进一次 pipeline state。full 和 empty blocks
 既不加载 payload，也不推进 mask pipeline。Fixed、Varlen、PackGQA 和 non-PackGQA 的
 generic shapes 共用该协议。
 
-generic qstage1 + 1CTA、qstage2 + 1CTA 和 dedicated D256 forward 仍直接将 payload 从
-GMEM 加载到 register。delivery method 不改变 payload ABI 或 partial/full topology。
+SM90 D256 使用 M128xN64 tile。较小的 N 维度为 two-stage mask pipeline 留出足够的
+shared memory；non-PackGQA payload 中每个 consumer thread 对应一个 `uint32` word，两个
+stage 共使用 2 KB。generic SM100/SM103 qstage1 + 1CTA、qstage2 + 1CTA 和 dedicated
+SM100/SM103 D256 forward 仍直接将 payload 从 GMEM 加载到 register。delivery method
+不改变 payload ABI 或 partial/full topology。
 
 ### 6.3 Backward
 

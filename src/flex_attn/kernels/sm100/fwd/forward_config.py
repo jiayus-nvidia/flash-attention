@@ -169,7 +169,7 @@ class _ResolvedSm100FwdConsumerConfig:
             payload_layout_id=self.payload_layout_id,
             dq_order_format="none",
             cluster_axis=topology.cluster_axis,
-            scheduler_layout_id="sm100_clc_fwd_work_desc_i32x4_v1",
+            scheduler_layout_id="plan_fwd_work_desc_i32x4_v1",
         )
 
 

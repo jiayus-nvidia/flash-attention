@@ -233,18 +233,18 @@ def normalize_arbitrary_block_sparse_config(
         is_varlen=is_varlen,
         context="arbitrary forward plan",
     )
-    is_sm100_forward = (
+    is_plan_scheduled_forward = (
         tensors.plan_signature is not None
-        and tensors.plan_signature.arch_family == "sm100"
         and tensors.plan_signature.direction == "forward"
+        and tensors.plan_signature.arch_family in ("sm90", "sm100")
     )
-    if is_sm100_forward:
+    if is_plan_scheduled_forward:
         _validate_required_tensors(
             {
                 "fwd_work_desc": (tensors.fwd_work_desc, torch.int32, 2),
             },
             device=device,
-            context="SM100 arbitrary forward schedule",
+            context="arbitrary forward schedule",
         )
         assert tensors.fwd_work_desc is not None
         if tensors.fwd_work_desc.shape[1] != 4:
@@ -271,7 +271,7 @@ def normalize_arbitrary_block_sparse_config(
                     "sequence_desc": (tensors.sequence_desc, torch.int32, 2),
                 },
                 device=device,
-                context="SM100 arbitrary varlen forward schedule",
+                context="arbitrary varlen forward schedule",
             )
             assert tensors.sequence_desc is not None
             if tuple(tensors.sequence_desc.shape) != (batch_size, 8):
@@ -279,9 +279,9 @@ def normalize_arbitrary_block_sparse_config(
             if not is_fake_mode() and tensors.sequence_desc.data_ptr() % 16 != 0:
                 raise ValueError("sequence_desc must be 16-byte aligned")
         elif tensors.sequence_desc is not None:
-            raise ValueError("fixed SM100 forward must not provide sequence_desc")
+            raise ValueError("fixed generic forward must not provide sequence_desc")
     elif tensors.sequence_desc is not None or tensors.fwd_work_desc is not None:
-        raise ValueError("forward schedule descriptors are only valid for SM100/SM103")
+        raise ValueError("forward schedule descriptors require a supported FWD plan")
     for name in (
         "cu_block_idx_offsets",
         "dq_write_order",

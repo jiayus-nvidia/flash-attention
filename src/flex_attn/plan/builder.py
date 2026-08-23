@@ -37,7 +37,7 @@ from flex_attn.plan.kernels.materialize_sm100 import (
     _ArbitraryPlanMaterializeSm100,
 )
 from flex_attn.plan.kernels.q2k_classify import _ArbitraryPlanClassifySm90
-from flex_attn.plan.kernels.schedule_sm100 import Sm100ForwardSchedulePlan
+from flex_attn.plan.kernels.schedule import ForwardSchedulePlan
 from flex_attn.plan.topology import (
     _ResolvedSm90BwdTopologyConfig,
     _ResolvedSm100BwdTopologyConfig,
@@ -300,7 +300,11 @@ def _compile_materialize(
 
 
 def _compile_forward_schedule(
-    config: _ResolvedSm100FwdConsumerConfig | _ResolvedSm100Hd256FwdConsumerConfig,
+    config: (
+        _ResolvedSm90FwdConsumerConfig
+        | _ResolvedSm100FwdConsumerConfig
+        | _ResolvedSm100Hd256FwdConsumerConfig
+    ),
     partial_counts: torch.Tensor,
     full_counts: torch.Tensor,
     cu_seqlens_q: torch.Tensor | None,
@@ -312,7 +316,7 @@ def _compile_forward_schedule(
     section_id: torch.Tensor,
 ):
     key = (
-        "arbitrary_plan_fwd_schedule_v2",
+        "arbitrary_plan_fwd_schedule_v3",
         config.arch,
         config.block_size,
         config.tile_n,
@@ -325,7 +329,7 @@ def _compile_forward_schedule(
         sequence_desc is not None,
     )
     if key not in _FWD_SCHEDULE_COMPILE_CACHE:
-        planner = Sm100ForwardSchedulePlan(
+        planner = ForwardSchedulePlan(
             plan_tile_m=config.block_size[0],
             tile_n=config.tile_n,
             qhead_per_kvhead=config.qhead_per_kvhead,
@@ -424,8 +428,12 @@ def _stable_task_order(
     return torch.cat((positive, zero))
 
 
-def _build_sm100_forward_schedule(
-    config: _ResolvedSm100FwdConsumerConfig | _ResolvedSm100Hd256FwdConsumerConfig,
+def _build_forward_schedule(
+    config: (
+        _ResolvedSm90FwdConsumerConfig
+        | _ResolvedSm100FwdConsumerConfig
+        | _ResolvedSm100Hd256FwdConsumerConfig
+    ),
     partial_counts: torch.Tensor,
     full_counts: torch.Tensor,
     *,
@@ -441,13 +449,14 @@ def _build_sm100_forward_schedule(
     cu_seqlens_k: torch.Tensor | None,
     cu_total_m_blocks: torch.Tensor | None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
-    """Build the immutable SM100 CLC work queue owned by a mask plan."""
+    """Build the immutable architecture-neutral FWD work queue owned by a plan."""
 
     num_scheduled_heads = config.num_kv_heads if config.pack_gqa else config.num_q_heads
     num_forward_tasks = total_m_blocks * num_scheduled_heads
-    num_clc_ctas = num_forward_tasks * config.cta_group_size
-    if num_clc_ctas > torch.iinfo(torch.int32).max:
-        raise ValueError("SM100 forward CLC task grid exceeds the int32 coordinate range")
+    cta_group_size = getattr(config, "cta_group_size", 1)
+    num_backend_work_items = num_forward_tasks * cta_group_size
+    if num_backend_work_items > torch.iinfo(torch.int32).max:
+        raise ValueError("forward schedule exceeds the int32 work-item range")
 
     device = partial_counts.device
     needs_sequence_desc = config.is_varlen or isinstance(
@@ -1560,9 +1569,13 @@ def _build_packed_mask_plan(
     fwd_work_desc = None
     if isinstance(
         fwd_config,
-        (_ResolvedSm100FwdConsumerConfig, _ResolvedSm100Hd256FwdConsumerConfig),
+        (
+            _ResolvedSm90FwdConsumerConfig,
+            _ResolvedSm100FwdConsumerConfig,
+            _ResolvedSm100Hd256FwdConsumerConfig,
+        ),
     ):
-        sequence_desc, fwd_work_desc = _build_sm100_forward_schedule(
+        sequence_desc, fwd_work_desc = _build_forward_schedule(
             fwd_config,
             partial_counts,
             full_counts,
