@@ -242,6 +242,76 @@ def test_flex_attn_varlen(case):
         max_seqlen_q=max(case.q_lengths),
         max_seqlen_k=max(case.k_lengths),
     )
+    if case.case_id == 526:
+        invalid_prefixes = []
+        invalid_start = cu_q.clone()
+        invalid_start[0] = 1
+        invalid_prefixes.append(invalid_start)
+        invalid_end = cu_q.clone()
+        invalid_end[-1] -= 1
+        invalid_prefixes.append(invalid_end)
+        invalid_order = cu_q.clone()
+        invalid_order[1] = invalid_order[2] + 1
+        invalid_prefixes.append(invalid_order)
+        invalid_length = cu_q.clone()
+        invalid_length[1] = max(case.q_lengths) + 1
+        invalid_prefixes.append(invalid_length)
+        for invalid_cu_q in invalid_prefixes:
+            with pytest.raises(ValueError, match="cu_seqlens_q/k"):
+                create_mask_plan(
+                    mask_func,
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=invalid_cu_q,
+                    cu_seqlens_k=cu_k,
+                    max_seqlen_q=max(case.q_lengths),
+                    max_seqlen_k=max(case.k_lengths),
+                )
+        invalid_masks = []
+        invalid_negative = mask_func.clone()
+        invalid_negative[0, 0, 0] = -1
+        invalid_masks.append(invalid_negative)
+        invalid_upper = mask_func.clone()
+        invalid_upper[0, 0, 0] = case.k_lengths[0] + 1
+        invalid_masks.append(invalid_upper)
+        invalid_endpoint_order = mask_func.clone()
+        invalid_endpoint_order[0, 0, 0] = 1
+        invalid_endpoint_order[0, 1, 0] = 0
+        invalid_masks.append(invalid_endpoint_order)
+        for invalid_mask in invalid_masks:
+            with pytest.raises(ValueError, match="mask_func endpoints"):
+                create_mask_plan(
+                    invalid_mask,
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_q,
+                    cu_seqlens_k=cu_k,
+                    max_seqlen_q=max(case.q_lengths),
+                    max_seqlen_k=max(case.k_lengths),
+                )
+
+        zero_k = k[:0]
+        zero_v = v[:0]
+        zero_k_mask = torch.ones(
+            (1, 1, 1),
+            dtype=torch.int32,
+            device=q.device,
+        )
+        zero_k_cu_q = torch.tensor((0, 1), dtype=torch.int32, device=q.device)
+        zero_k_cu_k = torch.tensor((0, 0), dtype=torch.int32, device=q.device)
+        with pytest.raises(ValueError, match="mask_func endpoints"):
+            create_mask_plan(
+                zero_k_mask,
+                q[:1],
+                zero_k,
+                zero_v,
+                cu_seqlens_q=zero_k_cu_q,
+                cu_seqlens_k=zero_k_cu_k,
+                max_seqlen_q=1,
+                max_seqlen_k=0,
+            )
     _assert_default_sm100_forward_topology(plan, case)
     run_fwd_topology_variants = (
         torch.cuda.get_device_capability()[0] == 10

@@ -69,21 +69,24 @@ batch-major 顺序展平，但 endpoint 的值始终是 sample-local K 位置。
 Varlen THD 使用 `cu_seqlens_q` 和 `cu_seqlens_k` 定义 sample 边界。一个 Q token 对应的
 公开 endpoint 仍然是该 sample 内的 K 坐标，不是 flattened K tensor 的全局 offset。
 
-builder 验证两组 prefix tensor：
+host 侧验证两组 prefix tensor：
 
 - 为 rank-1、contiguous CUDA `int32` tensor，并与 Q 位于同一 device；
-- 从 0 开始，分别以 `total_q` 和 `total_k` 结束；
-- 单调非递减；
-- 每个 sample 的长度不超过 `max_seqlen_q` 或 `max_seqlen_k`。
+- shape 相同。
+
+prefix 的数值内容由 planner 在 GPU 上验证：必须从 0 开始，以 `total_q`/`total_k`
+结束，单调非递减，并满足 `max_seqlen_q`/`max_seqlen_k`。验证结果通过 4.5 节的精确分配
+header 返回，因此非法输入仍会同步抛出公开异常，但不再单独把整段 prefix D2H 两次。
 
 公开 builder 会 clone prefix tensor，并由 `MaskPlan` 持有。调用方之后原地修改最初传入的
 tensor，不会改变现有 plan 的 sample 划分。
 
 ### 3.3 Planner 与 Consumer 坐标
 
-builder 为每个公开 endpoint 加上所属 sample 的物理 K offset，得到 planner 内部表示。
-内部表示还会在 Q 维追加 256 个零 padding rows，使 planner kernel 可以在上边界安全地执行
-vectorized load。该 padded tensor 只在建 plan 期间使用。
+planner kernel 直接读取公开的 sample-local endpoints。row 对应的 sequence descriptor
+提供 `q_offset`、`k_offset`、`q_len` 和 `k_len`；endpoint 只与该 row 的 local `k_len`
+比较并完成 clamp/validation。planner 不再给 endpoint 添加物理 K offset，也不再构造
+padded endpoint tensor。
 
 最终 plan 中的 compact topology 重新保存 sample-local block index。consumer 按以下方式
 计算实际地址：
@@ -103,7 +106,7 @@ bit ownership 都与目标 kernel 有关。
 sample-local interval endpoints
               |
               v
-输入校验与内部 endpoint 转换
+输入结构校验
               |
               v
 解析 consumer topology，构建 compact Varlen row prefixes
@@ -133,7 +136,9 @@ MaskPlan
 ### 4.1 输入校验与 Consumer 解析
 
 host 首先校验 tensor rank、dtype、device、layout、Q/K/V geometry、head 数量、endpoint
-shape，以及 Fixed/Varlen 参数。随后根据 architecture 和计算方向解析 consumer config。
+shape，以及 Fixed/Varlen 参数。endpoint 和 Varlen prefix 的数值内容由 classifier 与
+allocation-header 路径校验，避免额外的 elementwise validation kernel 和 D2H wait。随后
+根据 architecture 和计算方向解析 consumer config。
 
 consumer config 向 planner 提供：
 
@@ -162,6 +167,11 @@ cu_total_k_plan_rows[B + 1]
 classifier 和 consumer 因而不需要扫描 `cu_seqlens` 来重新判断 row ownership。
 
 forward 和 backward 的 tile geometry 可以不同，因此两者可以使用不同的 row prefixes。
+
+一个架构通用的 `VarlenGeometry` kernel 根据 `cu_seqlens_q/k` 构建 FWD 以及可选 BWD 所需
+的全部 block prefixes。该 kernel 同时检查 prefix 的起点、终点、顺序和最大长度，并写出
+device error flag。SM90、SM100 和 SM103 使用同一套算法，区别仅在 consumer tile size 与
+编译目标。
 
 ### 4.3 Q2K Classification
 
@@ -192,8 +202,10 @@ empty   = ~visible_bits
 bitsets 是一种紧凑的中间表示，既可以按 Q-major 读取，也可以按 K-major 读取。它们只是
 planner workspace，不进入最终 `MaskPlan`。
 
-classifier 还会通过一个 error word 执行防御性检查。公开输入校验仍由 API 层负责；该
-device-side flag 用于防止异常的内部 metadata 被 materialize 到 plan 中。
+classifier 会检查每个 endpoint 是否位于所属 sample 的 local-K 范围，并检查完整 endpoint
+序列是否单调。interval 或 Varlen prefix 错误统一写入精确分配阶段使用的 device error
+word。host 只读取一次该错误值，并在 materialization 前抛出异常，非法 metadata 不会生成
+plan。
 
 ### 4.4 Backward K2Q Counting
 
@@ -218,7 +230,17 @@ error flags
 host 读取一次该 8-value header。该 readback 用于确定精确分配大小，并将 device 侧的
 metadata error 转换为公开异常。
 
-随后 planner 截取有效 count rows，并分别对 partial/full counts 执行 exclusive scan：
+SM90、SM100 和 SM103 的 fixed 与 Varlen plan 都使用架构通用的 scan/header kernel。
+FWD/BWD classify 仍然独立，两种模式也都保留一次 allocation-header D2H。
+
+fixed-length 下，`FixedScanHeader` 扫描 FWD 以及可选 K2Q/dedicated-dQ count arrays。临时
+counts 已经具有最终保留的 shape，因此 plan 直接复用它们，同时由该 kernel 写出 exact
+exclusive CSR offsets 和 allocation header。
+
+Varlen 下，`VarlenScanHeader` 扫描 upper-bound count arrays，保留 inclusive scans，并写出
+相同的 allocation header。header 确定精确 row 数和 NNZ 后，一个
+`VarlenCompactMetadata` kernel 统一复制每个 head 的有效 count prefix，并将 inclusive
+scans 转换为最终 exact offsets：
 
 ```text
 partial_offset[0] = 0
@@ -228,7 +250,9 @@ full_offset[0] = 0
 full_offset[i + 1] = full_offset[i] + full_count[i]
 ```
 
-partial 与 full outputs 独立分配。empty block 不占用 compact storage。
+该 compact materializer 在一次 launch 中处理 FWD、可选 K2Q 以及可选 dedicated-dQ
+metadata。它不会为最终 CSR 添加 padding，也不会改成 capacity-based allocation。
+partial 与 full outputs 继续独立分配，empty block 不占用 compact storage。
 
 ### 4.6 Q2K Materialization
 
@@ -283,9 +307,14 @@ planner 使用以下 cost：
 task_cost = partial_block_count + full_block_count
 ```
 
-partial 与 full block 的 cost 相同。task 在写入 `fwd_work_desc` 前，按 cost 和 L2 locality
-section 执行 stable ordering。kernel 最终消费 prepared work queue，不再枚举整个 batch
-的 Q tiles，也不通过 `cu_seqlens` 重建 task ownership。
+partial 与 full block 的 cost 相同。positive-cost tasks 按 L2 section、task cost 降序以及
+既有的 head/Q-block tie order 执行 stable ordering；zero-cost tasks 随后按
+batch/head/Q-block 排列。planner 使用 bounded counting 实现该顺序：第一个 kernel 统计
+`(section, task_cost)` histogram，一个 CTA 计算稳定的 section rank 与 bucket offsets，随后
+每个 section 由一个 warp 按 tie order scatter 32-task chunks。该实现保持完全相同的
+lexicographic order，同时不再使用通用 GPU sort 链或 data-dependent host read。kernel 最终
+消费 prepared work queue，不再枚举整个 batch 的 Q tiles，也不通过 `cu_seqlens` 重建 task
+ownership。
 
 descriptor layout 和 ordering 与 architecture 无关，只有 queue backend 不同：
 

@@ -136,7 +136,7 @@ class _ArbitraryPlanMaterializeSm90(_ArbitraryPlanQ2KCompact):
             _,
             q_begin,
             q_len,
-            k_begin,
+            _,
             k_len,
             valid_m_block,
         ) = self._sample_info(
@@ -180,9 +180,7 @@ class _ArbitraryPlanMaterializeSm90(_ArbitraryPlanQ2KCompact):
                         mask_head,
                         interval_idx,
                         q_global,
-                        k_begin,
                         k_len,
-                        total_k,
                     )
                     for word in cutlass.range_constexpr(canonical_words):
                         word_begin = local_n_block * Int32(self.tile_n) + Int32(word * 32)
@@ -378,7 +376,7 @@ class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCompact):
             _,
             q_begin,
             q_len,
-            k_begin,
+            _,
             k_len,
             valid_n_block,
         ) = self._sample_info_k(
@@ -419,9 +417,7 @@ class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCompact):
                         mask_head,
                         interval_idx,
                         q_global,
-                        k_begin,
                         k_len,
-                        total_k,
                     )
                     for word in cutlass.range_constexpr(canonical_words):
                         word_begin = local_n_block * Int32(self.tile_n) + Int32(word * 32)

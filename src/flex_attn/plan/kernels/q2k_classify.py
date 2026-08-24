@@ -137,7 +137,7 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
             compact_outer_row,
             q_begin,
             q_len,
-            k_begin,
+            _,
             k_len,
             valid_m_block,
         ) = self._sample_info(
@@ -169,31 +169,27 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
             q_valid = q_valid & valid_m_block
 
             if q_valid:
-                previous_begin = Int32(-1)
+                previous_end = Int32(0)
                 num_intervals = (nfunc + Int32(1)) // Int32(2)
                 for interval_idx in cutlass.range(num_intervals, unroll=1):
-                    global_begin, global_end, local_begin, local_end = self._safe_interval(
+                    endpoint_begin, endpoint_end, local_begin, local_end = self._safe_interval(
                         mArbitraryFunc,
                         mask_head,
                         interval_idx,
                         q_global,
-                        k_begin,
                         k_len,
-                        total_k,
                     )
                     invalid = (
-                        (global_begin < Int32(0))
-                        | (global_end < Int32(0))
-                        | (global_begin > total_k)
-                        | (global_end > total_k)
-                        | (global_end < global_begin)
+                        (endpoint_begin < Int32(0))
+                        | (endpoint_end < Int32(0))
+                        | (endpoint_begin > k_len)
+                        | (endpoint_end > k_len)
+                        | (endpoint_end < endpoint_begin)
+                        | (endpoint_begin < previous_end)
                     )
-                    if global_end > global_begin and global_begin < previous_begin:
-                        invalid = Boolean(True)
                     if invalid:
                         self._mark_error(mError, Uint32(_ERROR_INVALID_INTERVAL))
-                    if global_end > global_begin:
-                        previous_begin = global_begin
+                    previous_end = endpoint_end
                     if local_end > local_begin:
                         block_begin = local_begin // Int32(self.tile_n)
                         block_end = cute.ceil_div(local_end, self.tile_n)
@@ -253,9 +249,7 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
                                 row_q_global,
                                 block_id,
                                 nfunc,
-                                k_begin,
                                 k_len,
-                                total_k,
                             )
                             lane_visible |= row_visible
                             lane_full &= row_full

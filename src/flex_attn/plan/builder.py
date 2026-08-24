@@ -18,7 +18,6 @@ from flex_attn.plan.mask_plan import (
     MaskPlan,
 )
 from flex_attn.plan.validation import (
-    make_internal_mask_func,
     validate_create_mask_plan_inputs,
 )
 from flex_attn.plan.kernels import BlockSparseTensorsTorch
@@ -37,7 +36,13 @@ from flex_attn.plan.kernels.materialize_sm100 import (
     _ArbitraryPlanMaterializeSm100,
 )
 from flex_attn.plan.kernels.q2k_classify import _ArbitraryPlanClassifySm90
-from flex_attn.plan.kernels.schedule import ForwardSchedulePlan
+from flex_attn.plan.kernels.scan_header import (
+    FixedScanHeader,
+    VarlenCompactMetadata,
+    VarlenGeometry,
+    VarlenScanHeader,
+)
+from flex_attn.plan.kernels.schedule import ForwardScheduleOrder, ForwardSchedulePlan
 from flex_attn.plan.topology import (
     _ResolvedSm90BwdTopologyConfig,
     _ResolvedSm100BwdTopologyConfig,
@@ -92,6 +97,13 @@ _MATERIALIZE_COMPILE_CACHE = get_jit_cache("arbitrary_plan_materialize")
 _K2Q_COUNT_COMPILE_CACHE = get_jit_cache("arbitrary_plan_k2q_count")
 _K2Q_MATERIALIZE_COMPILE_CACHE = get_jit_cache("arbitrary_plan_k2q_materialize")
 _FWD_SCHEDULE_COMPILE_CACHE = get_jit_cache("arbitrary_plan_fwd_schedule")
+_FWD_SCHEDULE_ORDER_COMPILE_CACHE = get_jit_cache("arbitrary_plan_fwd_schedule_order")
+_FIXED_SCAN_HEADER_COMPILE_CACHE = get_jit_cache("arbitrary_plan_fixed_scan_header")
+_VARLEN_SCAN_HEADER_COMPILE_CACHE = get_jit_cache("arbitrary_plan_varlen_scan_header")
+_VARLEN_COMPACT_METADATA_COMPILE_CACHE = get_jit_cache(
+    "arbitrary_plan_varlen_compact_metadata"
+)
+_VARLEN_GEOMETRY_COMPILE_CACHE = get_jit_cache("arbitrary_plan_varlen_geometry")
 
 
 def _get_plan_builder_arch(device: torch.device) -> int:
@@ -121,8 +133,50 @@ def _exclusive_offsets(counts: torch.Tensor) -> torch.Tensor:
     return offsets
 
 
-def _to_cute_optional(tensor: torch.Tensor | None):
-    return to_cute_tensor(tensor, assumed_align=4, leading_dim=0) if tensor is not None else None
+def _exclusive_offsets_from_scan(
+    counts: torch.Tensor,
+    inclusive_scan: torch.Tensor | None,
+) -> torch.Tensor:
+    """Reuse a full-row inclusive scan when exact compact rows are known."""
+
+    if inclusive_scan is None:
+        return _exclusive_offsets(counts)
+    offsets = torch.empty((counts.numel() + 1,), dtype=torch.int32, device=counts.device)
+    offsets[0] = 0
+    if counts.numel() > 0:
+        hmask, compact_rows = counts.shape
+        upper_rows = inclusive_scan.numel() // hmask
+        offsets[1:].view(hmask, compact_rows).copy_(
+            inclusive_scan.view(hmask, upper_rows)[:, :compact_rows]
+        )
+    return offsets
+
+
+def _compact_counts(
+    counts: torch.Tensor,
+    total_rows: int,
+    *,
+    is_varlen: bool,
+) -> torch.Tensor:
+    """Retain exact fixed counts and compact only data-dependent Varlen rows."""
+
+    if not is_varlen:
+        assert total_rows == counts.shape[1]
+        return counts
+    return counts[:, :total_rows].clone()
+
+
+def _to_cute_optional(
+    tensor: torch.Tensor | None,
+    *,
+    leading_dim: int = 0,
+    assumed_align: int = 4,
+):
+    return (
+        to_cute_tensor(tensor, assumed_align=assumed_align, leading_dim=leading_dim)
+        if tensor is not None
+        else None
+    )
 
 
 def _classify_compile_key(
@@ -139,7 +193,7 @@ def _classify_compile_key(
     """Keep family-compatible signatures separate from exact-arch CUBINs."""
 
     return (
-        "arbitrary_plan_classify_v6",
+        "arbitrary_plan_classify_v7",
         config.arch,
         config.topology_planner_compile_key,
     )
@@ -157,15 +211,15 @@ def _materialize_compile_key(
 
     return (
         (
-            "arbitrary_plan_materialize_hd256_dq_v2"
+            "arbitrary_plan_materialize_hd256_dq_v3"
             if isinstance(config, _ResolvedSm100Hd256DqConsumerConfig)
             else (
-                "arbitrary_plan_materialize_hd256_fwd_v2"
+                "arbitrary_plan_materialize_hd256_fwd_v3"
                 if isinstance(config, _ResolvedSm100Hd256FwdConsumerConfig)
                 else (
-                    "arbitrary_plan_sm90_materialize_v5"
+                    "arbitrary_plan_sm90_materialize_v6"
                     if isinstance(config, _ResolvedSm90FwdConsumerConfig)
-                    else "arbitrary_plan_materialize_v3"
+                    else "arbitrary_plan_materialize_v4"
                 )
             )
         ),
@@ -299,6 +353,268 @@ def _compile_materialize(
     return _MATERIALIZE_COMPILE_CACHE[key]
 
 
+def _compile_fixed_scan_header(
+    arch: int,
+    partial_counts: torch.Tensor,
+    full_counts: torch.Tensor,
+    partial_offsets: torch.Tensor,
+    full_offsets: torch.Tensor,
+    bwd_partial_counts: torch.Tensor | None,
+    bwd_full_counts: torch.Tensor | None,
+    bwd_partial_offsets: torch.Tensor | None,
+    bwd_full_offsets: torch.Tensor | None,
+    dq_partial_counts: torch.Tensor | None,
+    dq_full_counts: torch.Tensor | None,
+    dq_partial_offsets: torch.Tensor | None,
+    dq_full_offsets: torch.Tensor | None,
+    error: torch.Tensor,
+    header: torch.Tensor,
+):
+    """Compile the architecture-neutral fixed scan and allocation header."""
+
+    build_backward = bwd_partial_counts is not None
+    build_dq = dq_partial_counts is not None
+    key = ("arbitrary_plan_fixed_scan_header_v2", arch, build_backward, build_dq)
+    if key not in _FIXED_SCAN_HEADER_COMPILE_CACHE:
+        kernel = FixedScanHeader(build_backward=build_backward, build_dq=build_dq)
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        started_at = time.perf_counter()
+        compiled = cute.compile(
+            kernel,
+            to_cute_tensor(partial_counts, assumed_align=4, leading_dim=1),
+            to_cute_tensor(full_counts, assumed_align=4, leading_dim=1),
+            to_cute_tensor(partial_offsets, assumed_align=4, leading_dim=0),
+            to_cute_tensor(full_offsets, assumed_align=4, leading_dim=0),
+            (
+                to_cute_tensor(bwd_partial_counts, assumed_align=4, leading_dim=1)
+                if bwd_partial_counts is not None
+                else None
+            ),
+            (
+                to_cute_tensor(bwd_full_counts, assumed_align=4, leading_dim=1)
+                if bwd_full_counts is not None
+                else None
+            ),
+            _to_cute_optional(bwd_partial_offsets),
+            _to_cute_optional(bwd_full_offsets),
+            _to_cute_optional(dq_partial_counts, leading_dim=1),
+            _to_cute_optional(dq_full_counts, leading_dim=1),
+            _to_cute_optional(dq_partial_offsets),
+            _to_cute_optional(dq_full_offsets),
+            to_cute_tensor(error, assumed_align=4, leading_dim=0),
+            to_cute_tensor(header, assumed_align=8, leading_dim=0),
+            Int32(1),
+            Int32(1),
+            Int32(1),
+            stream,
+            options="--enable-tvm-ffi",
+        )
+        print(
+            "Compiled mask-plan fixed scan/header in "
+            f"{time.perf_counter() - started_at:.1f}s"
+        )
+        _FIXED_SCAN_HEADER_COMPILE_CACHE[key] = compiled
+    return _FIXED_SCAN_HEADER_COMPILE_CACHE[key]
+
+
+def _compile_varlen_scan_header(
+    arch: int,
+    partial_counts: torch.Tensor,
+    full_counts: torch.Tensor,
+    partial_scan: torch.Tensor,
+    full_scan: torch.Tensor,
+    bwd_partial_counts: torch.Tensor | None,
+    bwd_full_counts: torch.Tensor | None,
+    bwd_partial_scan: torch.Tensor | None,
+    bwd_full_scan: torch.Tensor | None,
+    dq_partial_counts: torch.Tensor | None,
+    dq_full_counts: torch.Tensor | None,
+    dq_partial_scan: torch.Tensor | None,
+    dq_full_scan: torch.Tensor | None,
+    cu_total_m_blocks: torch.Tensor,
+    cu_total_bwd_m_blocks: torch.Tensor | None,
+    cu_total_bwd_n_blocks: torch.Tensor | None,
+    metadata_invalid: torch.Tensor,
+    error: torch.Tensor,
+    header: torch.Tensor,
+):
+    """Compile the architecture-neutral Varlen scan and allocation header."""
+
+    build_backward = bwd_partial_counts is not None
+    build_dq = dq_partial_counts is not None
+    key = ("arbitrary_plan_varlen_scan_header_v1", arch, build_backward, build_dq)
+    if key not in _VARLEN_SCAN_HEADER_COMPILE_CACHE:
+        kernel = VarlenScanHeader(build_backward=build_backward, build_dq=build_dq)
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        started_at = time.perf_counter()
+        compiled = cute.compile(
+            kernel,
+            to_cute_tensor(partial_counts, assumed_align=4, leading_dim=1),
+            to_cute_tensor(full_counts, assumed_align=4, leading_dim=1),
+            to_cute_tensor(partial_scan, assumed_align=8, leading_dim=0),
+            to_cute_tensor(full_scan, assumed_align=8, leading_dim=0),
+            _to_cute_optional(bwd_partial_counts, leading_dim=1),
+            _to_cute_optional(bwd_full_counts, leading_dim=1),
+            _to_cute_optional(bwd_partial_scan),
+            _to_cute_optional(bwd_full_scan),
+            _to_cute_optional(dq_partial_counts, leading_dim=1),
+            _to_cute_optional(dq_full_counts, leading_dim=1),
+            _to_cute_optional(dq_partial_scan),
+            _to_cute_optional(dq_full_scan),
+            to_cute_tensor(cu_total_m_blocks, assumed_align=4, leading_dim=0),
+            _to_cute_optional(cu_total_bwd_m_blocks),
+            _to_cute_optional(cu_total_bwd_n_blocks),
+            to_cute_tensor(metadata_invalid, assumed_align=1, leading_dim=0),
+            to_cute_tensor(error, assumed_align=4, leading_dim=0),
+            to_cute_tensor(header, assumed_align=8, leading_dim=0),
+            stream,
+            options="--enable-tvm-ffi",
+        )
+        print(
+            "Compiled mask-plan Varlen scan/header in "
+            f"{time.perf_counter() - started_at:.1f}s"
+        )
+        _VARLEN_SCAN_HEADER_COMPILE_CACHE[key] = compiled
+    return _VARLEN_SCAN_HEADER_COMPILE_CACHE[key]
+
+
+def _compile_varlen_geometry(
+    arch: int,
+    *,
+    fwd_tile_m: int,
+    fwd_tile_n: int,
+    qhead_per_kvhead: int,
+    bwd_tile_m: int,
+    bwd_tile_n: int,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    cu_total_m_blocks: torch.Tensor,
+    cu_total_fwd_n_blocks: torch.Tensor,
+    cu_total_bwd_m_blocks: torch.Tensor | None,
+    cu_total_bwd_n_blocks: torch.Tensor | None,
+    metadata_invalid: torch.Tensor,
+):
+    """Compile architecture-neutral Varlen block-prefix materialization."""
+
+    build_backward = cu_total_bwd_m_blocks is not None
+    key = (
+        "arbitrary_plan_varlen_geometry_v1",
+        arch,
+        fwd_tile_m,
+        fwd_tile_n,
+        qhead_per_kvhead,
+        build_backward,
+        bwd_tile_m,
+        bwd_tile_n,
+    )
+    if key not in _VARLEN_GEOMETRY_COMPILE_CACHE:
+        kernel = VarlenGeometry(
+            fwd_tile_m=fwd_tile_m,
+            fwd_tile_n=fwd_tile_n,
+            qhead_per_kvhead=qhead_per_kvhead,
+            build_backward=build_backward,
+            bwd_tile_m=bwd_tile_m,
+            bwd_tile_n=bwd_tile_n,
+        )
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        started_at = time.perf_counter()
+        compiled = cute.compile(
+            kernel,
+            to_cute_tensor(cu_seqlens_q, assumed_align=4, leading_dim=0),
+            to_cute_tensor(cu_seqlens_k, assumed_align=4, leading_dim=0),
+            to_cute_tensor(cu_total_m_blocks, assumed_align=4, leading_dim=0),
+            to_cute_tensor(cu_total_fwd_n_blocks, assumed_align=4, leading_dim=0),
+            _to_cute_optional(cu_total_bwd_m_blocks),
+            _to_cute_optional(cu_total_bwd_n_blocks),
+            to_cute_tensor(metadata_invalid, assumed_align=1, leading_dim=0),
+            Int32(1),
+            Int32(1),
+            Int32(1),
+            Int32(1),
+            stream,
+            options="--enable-tvm-ffi",
+        )
+        print(
+            "Compiled mask-plan Varlen geometry in "
+            f"{time.perf_counter() - started_at:.1f}s"
+        )
+        _VARLEN_GEOMETRY_COMPILE_CACHE[key] = compiled
+    return _VARLEN_GEOMETRY_COMPILE_CACHE[key]
+
+
+def _compile_varlen_compact_metadata(
+    arch: int,
+    partial_counts_tmp: torch.Tensor,
+    full_counts_tmp: torch.Tensor,
+    partial_scan: torch.Tensor,
+    full_scan: torch.Tensor,
+    partial_counts: torch.Tensor,
+    full_counts: torch.Tensor,
+    partial_offsets: torch.Tensor,
+    full_offsets: torch.Tensor,
+    bwd_partial_counts_tmp: torch.Tensor | None,
+    bwd_full_counts_tmp: torch.Tensor | None,
+    bwd_partial_scan: torch.Tensor | None,
+    bwd_full_scan: torch.Tensor | None,
+    bwd_partial_counts: torch.Tensor | None,
+    bwd_full_counts: torch.Tensor | None,
+    bwd_partial_offsets: torch.Tensor | None,
+    bwd_full_offsets: torch.Tensor | None,
+    dq_partial_counts_tmp: torch.Tensor | None,
+    dq_full_counts_tmp: torch.Tensor | None,
+    dq_partial_scan: torch.Tensor | None,
+    dq_full_scan: torch.Tensor | None,
+    dq_partial_counts: torch.Tensor | None,
+    dq_full_counts: torch.Tensor | None,
+    dq_partial_offsets: torch.Tensor | None,
+    dq_full_offsets: torch.Tensor | None,
+):
+    """Compile exact Varlen count/offset materialization."""
+
+    build_backward = bwd_partial_counts_tmp is not None
+    build_dq = dq_partial_counts_tmp is not None
+    key = ("arbitrary_plan_varlen_compact_metadata_v1", arch, build_backward, build_dq)
+    if key not in _VARLEN_COMPACT_METADATA_COMPILE_CACHE:
+        kernel = VarlenCompactMetadata(build_backward=build_backward, build_dq=build_dq)
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        started_at = time.perf_counter()
+        compiled = cute.compile(
+            kernel,
+            to_cute_tensor(partial_counts_tmp, assumed_align=4, leading_dim=1),
+            to_cute_tensor(full_counts_tmp, assumed_align=4, leading_dim=1),
+            to_cute_tensor(partial_scan, assumed_align=8, leading_dim=0),
+            to_cute_tensor(full_scan, assumed_align=8, leading_dim=0),
+            to_cute_tensor(partial_counts, assumed_align=4, leading_dim=1),
+            to_cute_tensor(full_counts, assumed_align=4, leading_dim=1),
+            to_cute_tensor(partial_offsets, assumed_align=4, leading_dim=0),
+            to_cute_tensor(full_offsets, assumed_align=4, leading_dim=0),
+            _to_cute_optional(bwd_partial_counts_tmp, leading_dim=1),
+            _to_cute_optional(bwd_full_counts_tmp, leading_dim=1),
+            _to_cute_optional(bwd_partial_scan),
+            _to_cute_optional(bwd_full_scan),
+            _to_cute_optional(bwd_partial_counts, leading_dim=1),
+            _to_cute_optional(bwd_full_counts, leading_dim=1),
+            _to_cute_optional(bwd_partial_offsets),
+            _to_cute_optional(bwd_full_offsets),
+            _to_cute_optional(dq_partial_counts_tmp, leading_dim=1),
+            _to_cute_optional(dq_full_counts_tmp, leading_dim=1),
+            _to_cute_optional(dq_partial_scan),
+            _to_cute_optional(dq_full_scan),
+            _to_cute_optional(dq_partial_counts, leading_dim=1),
+            _to_cute_optional(dq_full_counts, leading_dim=1),
+            _to_cute_optional(dq_partial_offsets),
+            _to_cute_optional(dq_full_offsets),
+            stream,
+            options="--enable-tvm-ffi",
+        )
+        print(
+            "Compiled mask-plan Varlen compact metadata in "
+            f"{time.perf_counter() - started_at:.1f}s"
+        )
+        _VARLEN_COMPACT_METADATA_COMPILE_CACHE[key] = compiled
+    return _VARLEN_COMPACT_METADATA_COMPILE_CACHE[key]
+
+
 def _compile_forward_schedule(
     config: (
         _ResolvedSm90FwdConsumerConfig
@@ -370,62 +686,65 @@ def _compile_forward_schedule(
     return _FWD_SCHEDULE_COMPILE_CACHE[key]
 
 
-def _stable_task_order(
+def _compile_forward_schedule_order(
+    config: (
+        _ResolvedSm90FwdConsumerConfig
+        | _ResolvedSm100FwdConsumerConfig
+        | _ResolvedSm100Hd256FwdConsumerConfig
+    ),
     work_desc: torch.Tensor,
     task_cost: torch.Tensor,
     section_id: torch.Tensor,
-    *,
-    batch_size: int,
-    num_kv_heads: int,
-    qhead_per_kvhead: int,
-    pack_gqa: bool,
-) -> torch.Tensor:
-    """Return deterministic L2-sectioned LPT order entirely on CUDA."""
-
-    num_tasks = work_desc.shape[0]
-    order = torch.arange(num_tasks, dtype=torch.int64, device=work_desc.device)
-    section_cost = torch.zeros(
-        (batch_size * num_kv_heads,),
-        dtype=torch.int64,
-        device=work_desc.device,
+    histogram: torch.Tensor,
+    section_cost: torch.Tensor,
+    section_order: torch.Tensor,
+    positive_base: torch.Tensor,
+    zero_base: torch.Tensor,
+    sorted_work_desc: torch.Tensor,
+    cu_total_m_blocks: torch.Tensor | None,
+):
+    key = (
+        "arbitrary_plan_fwd_schedule_order_v2",
+        config.arch,
+        config.qhead_per_kvhead,
+        config.pack_gqa,
+        config.is_varlen,
     )
-    section_cost.scatter_add_(0, section_id.to(torch.int64), task_cost.to(torch.int64))
-    section_order = torch.argsort(section_cost, descending=True, stable=True)
-    section_rank = torch.empty_like(section_order)
-    section_rank[section_order] = torch.arange(
-        section_order.numel(),
-        dtype=torch.int64,
-        device=work_desc.device,
-    )
-
-    def stable_sort(indices: torch.Tensor, key: torch.Tensor, *, descending: bool = False):
-        permutation = torch.argsort(
-            key[indices],
-            descending=descending,
-            stable=True,
+    if key not in _FWD_SCHEDULE_ORDER_COMPILE_CACHE:
+        planner = ForwardScheduleOrder(
+            qhead_per_kvhead=config.qhead_per_kvhead,
+            pack_gqa=config.pack_gqa,
+            is_varlen=config.is_varlen,
         )
-        return indices[permutation]
-
-    positive = order[task_cost > 0]
-    zero = order[task_cost == 0]
-    head_idx = work_desc[:, 1].to(torch.int64)
-    m_block = work_desc[:, 0].to(torch.int64)
-    batch_idx = work_desc[:, 2].to(torch.int64)
-    kv_head_idx = (
-        head_idx if pack_gqa else torch.div(head_idx, qhead_per_kvhead, rounding_mode="floor")
-    )
-
-    positive = stable_sort(positive, head_idx)
-    positive = stable_sort(positive, m_block)
-    positive = stable_sort(positive, kv_head_idx)
-    positive = stable_sort(positive, task_cost, descending=True)
-    positive = stable_sort(positive, section_rank[section_id.to(torch.int64)])
-
-    zero = stable_sort(zero, head_idx)
-    zero = stable_sort(zero, m_block)
-    zero = stable_sort(zero, kv_head_idx)
-    zero = stable_sort(zero, batch_idx)
-    return torch.cat((positive, zero))
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        started_at = time.perf_counter()
+        compiled = cute.compile(
+            planner,
+            to_cute_tensor(work_desc, assumed_align=16, leading_dim=1),
+            to_cute_tensor(task_cost, assumed_align=4, leading_dim=0),
+            to_cute_tensor(section_id, assumed_align=4, leading_dim=0),
+            to_cute_tensor(histogram, assumed_align=4, leading_dim=1),
+            to_cute_tensor(section_cost, assumed_align=8, leading_dim=0),
+            to_cute_tensor(section_order, assumed_align=4, leading_dim=0),
+            to_cute_tensor(positive_base, assumed_align=4, leading_dim=0),
+            to_cute_tensor(zero_base, assumed_align=4, leading_dim=0),
+            to_cute_tensor(sorted_work_desc, assumed_align=16, leading_dim=1),
+            _to_cute_optional(cu_total_m_blocks),
+            Int32(1),
+            Int32(1),
+            Int32(1),
+            Int32(1),
+            Int32(1),
+            Int32(1),
+            stream,
+            options="--enable-tvm-ffi",
+        )
+        print(
+            "Compiled mask-plan forward schedule order in "
+            f"{time.perf_counter() - started_at:.1f}s"
+        )
+        _FWD_SCHEDULE_ORDER_COMPILE_CACHE[key] = compiled
+    return _FWD_SCHEDULE_ORDER_COMPILE_CACHE[key]
 
 
 def _build_forward_schedule(
@@ -440,6 +759,7 @@ def _build_forward_schedule(
     batch_size: int,
     total_m_blocks: int,
     max_m_blocks: int,
+    max_task_cost: int,
     seqlen_q_fixed: int,
     seqlen_k_fixed: int,
     head_dim: int,
@@ -557,16 +877,49 @@ def _build_forward_schedule(
         Int32(head_dim_v),
         Int32(element_size),
     )
-    task_order = _stable_task_order(
+    num_sections = batch_size * config.num_kv_heads
+    histogram = torch.zeros(
+        (num_sections, max_task_cost + 1),
+        dtype=torch.int32,
+        device=device,
+    )
+    section_cost = torch.zeros((num_sections,), dtype=torch.int64, device=device)
+    section_order = torch.empty((num_sections,), dtype=torch.int32, device=device)
+    positive_base = torch.empty_like(section_order)
+    zero_base = torch.empty_like(section_order)
+    sorted_work_desc = torch.empty_like(work_desc)
+    order_schedule = _compile_forward_schedule_order(
+        config,
         work_desc,
         task_cost,
         section_id,
-        batch_size=batch_size,
-        num_kv_heads=config.num_kv_heads,
-        qhead_per_kvhead=config.qhead_per_kvhead,
-        pack_gqa=config.pack_gqa,
+        histogram,
+        section_cost,
+        section_order,
+        positive_base,
+        zero_base,
+        sorted_work_desc,
+        cu_total_m_blocks,
     )
-    return sequence_desc, work_desc.index_select(0, task_order).contiguous()
+    order_schedule(
+        work_desc,
+        task_cost,
+        section_id,
+        histogram,
+        section_cost,
+        section_order,
+        positive_base,
+        zero_base,
+        sorted_work_desc,
+        cu_total_m_blocks,
+        Int32(num_forward_tasks),
+        Int32(batch_size),
+        Int32(num_scheduled_heads),
+        Int32(config.num_kv_heads),
+        Int32(max_m_blocks),
+        Int32(max_task_cost),
+    )
+    return sequence_desc, sorted_work_desc
 
 
 def _compile_k2q_count(
@@ -653,12 +1006,12 @@ def _compile_k2q_materialize(
 ):
     key = (
         (
-            "arbitrary_plan_hd256_k2q_materialize_v2"
+            "arbitrary_plan_hd256_k2q_materialize_v3"
             if isinstance(config, _ResolvedSm100Hd256DkdvConsumerConfig)
             else (
-                "arbitrary_plan_sm90_k2q_materialize_v6"
+                "arbitrary_plan_sm90_k2q_materialize_v7"
                 if isinstance(config, _ResolvedSm90BwdConsumerConfig)
-                else "arbitrary_plan_k2q_materialize_v4"
+                else "arbitrary_plan_k2q_materialize_v5"
             )
         ),
         config.arch,
@@ -759,7 +1112,7 @@ def _validate_builder_inputs(
         raise ValueError("Hq must be divisible by Hkv")
 
     if arbitrary_func.ndim != 3:
-        raise ValueError("arbitrary_func must have shape [Hmask, nfunc, total_q + padding]")
+        raise ValueError("arbitrary_func must have shape [Hmask, nfunc, total_q]")
     if arbitrary_func.dtype != torch.int32:
         raise TypeError("arbitrary_func must have dtype torch.int32")
     if arbitrary_func.device != q.device:
@@ -803,10 +1156,8 @@ def _validate_builder_inputs(
         total_k = batch_size * seqlen_k_fixed
         max_seqlen_q = seqlen_q_fixed
         max_seqlen_k = seqlen_k_fixed
-    if func_q_extent < total_q + 256:
-        raise ValueError(
-            f"arbitrary_func last extent must be at least total_q + 256 ({total_q + 256})"
-        )
+    if func_q_extent != total_q:
+        raise ValueError(f"arbitrary_func last extent must equal total_q ({total_q})")
     return {
         "is_varlen": is_varlen,
         "batch_size": batch_size,
@@ -1043,59 +1394,101 @@ def _build_packed_mask_plan(
     cu_total_fwd_n_blocks = None
     cu_total_bwd_m_blocks = None
     cu_total_bwd_n_blocks = None
-    metadata_invalid = torch.zeros((), dtype=torch.bool, device=device)
+    metadata_invalid = None
     if metadata["is_varlen"]:
-        q_lengths_raw = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-        k_lengths_raw = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-        q_lengths = q_lengths_raw.clamp(min=0, max=metadata["max_seqlen_q"])
-        physical_q_lengths = q_lengths * qratio
-        m_counts = torch.div(
-            physical_q_lengths + fwd_plan_tile_m - 1,
-            fwd_plan_tile_m,
-            rounding_mode="floor",
-        ).to(torch.int32)
+        assert cu_seqlens_q is not None
+        assert cu_seqlens_k is not None
         cu_total_m_blocks = torch.empty(
             (metadata["batch_size"] + 1,), dtype=torch.int32, device=device
         )
-        cu_total_m_blocks[0] = 0
-        cu_total_m_blocks[1:] = torch.cumsum(m_counts, dim=0, dtype=torch.int32)
-        fwd_n_counts = torch.div(
-            k_lengths_raw.clamp(min=0, max=metadata["max_seqlen_k"]) + fwd_config.tile_n - 1,
-            fwd_config.tile_n,
-            rounding_mode="floor",
-        ).to(torch.int32)
         cu_total_fwd_n_blocks = torch.empty_like(cu_total_m_blocks)
-        cu_total_fwd_n_blocks[0] = 0
-        cu_total_fwd_n_blocks[1:] = torch.cumsum(fwd_n_counts, dim=0, dtype=torch.int32)
         if bwd_config is not None:
-            bwd_m_counts = torch.div(
-                q_lengths + bwd_config.sparse_tile_m - 1,
-                bwd_config.sparse_tile_m,
-                rounding_mode="floor",
-            ).to(torch.int32)
-            bwd_n_counts = torch.div(
-                k_lengths_raw.clamp(min=0, max=metadata["max_seqlen_k"]) + bwd_sparse_tile_n - 1,
-                bwd_sparse_tile_n,
-                rounding_mode="floor",
-            ).to(torch.int32)
             cu_total_bwd_m_blocks = torch.empty(
                 (metadata["batch_size"] + 1,), dtype=torch.int32, device=device
             )
             cu_total_bwd_n_blocks = torch.empty_like(cu_total_bwd_m_blocks)
-            cu_total_bwd_m_blocks[0] = 0
-            cu_total_bwd_n_blocks[0] = 0
-            cu_total_bwd_m_blocks[1:] = torch.cumsum(bwd_m_counts, dim=0, dtype=torch.int32)
-            cu_total_bwd_n_blocks[1:] = torch.cumsum(bwd_n_counts, dim=0, dtype=torch.int32)
-        metadata_invalid = (
-            (cu_seqlens_q[0] != 0)
-            | (cu_seqlens_k[0] != 0)
-            | (cu_seqlens_q[-1] != metadata["total_q"])
-            | (cu_seqlens_k[-1] != metadata["total_k"])
-            | torch.any(q_lengths_raw < 0)
-            | torch.any(k_lengths_raw < 0)
-            | torch.any(q_lengths_raw > metadata["max_seqlen_q"])
-            | torch.any(k_lengths_raw > metadata["max_seqlen_k"])
-        )
+        metadata_invalid = torch.empty((1,), dtype=torch.bool, device=device)
+        if is_fake_mode():
+            q_lengths_raw = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            k_lengths_raw = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+            q_lengths = q_lengths_raw.clamp(min=0, max=metadata["max_seqlen_q"])
+            k_lengths = k_lengths_raw.clamp(min=0, max=metadata["max_seqlen_k"])
+            m_counts = torch.div(
+                q_lengths * qratio + fwd_plan_tile_m - 1,
+                fwd_plan_tile_m,
+                rounding_mode="floor",
+            ).to(torch.int32)
+            cu_total_m_blocks[0] = 0
+            cu_total_m_blocks[1:] = torch.cumsum(m_counts, dim=0, dtype=torch.int32)
+            fwd_n_counts = torch.div(
+                k_lengths + fwd_config.tile_n - 1,
+                fwd_config.tile_n,
+                rounding_mode="floor",
+            ).to(torch.int32)
+            cu_total_fwd_n_blocks[0] = 0
+            cu_total_fwd_n_blocks[1:] = torch.cumsum(
+                fwd_n_counts, dim=0, dtype=torch.int32
+            )
+            if bwd_config is not None:
+                assert cu_total_bwd_m_blocks is not None
+                assert cu_total_bwd_n_blocks is not None
+                bwd_m_counts = torch.div(
+                    q_lengths + bwd_config.sparse_tile_m - 1,
+                    bwd_config.sparse_tile_m,
+                    rounding_mode="floor",
+                ).to(torch.int32)
+                bwd_n_counts = torch.div(
+                    k_lengths + bwd_sparse_tile_n - 1,
+                    bwd_sparse_tile_n,
+                    rounding_mode="floor",
+                ).to(torch.int32)
+                cu_total_bwd_m_blocks[0] = 0
+                cu_total_bwd_n_blocks[0] = 0
+                cu_total_bwd_m_blocks[1:] = torch.cumsum(
+                    bwd_m_counts, dim=0, dtype=torch.int32
+                )
+                cu_total_bwd_n_blocks[1:] = torch.cumsum(
+                    bwd_n_counts, dim=0, dtype=torch.int32
+                )
+            metadata_invalid[0] = (
+                (cu_seqlens_q[0] != 0)
+                | (cu_seqlens_k[0] != 0)
+                | (cu_seqlens_q[-1] != metadata["total_q"])
+                | (cu_seqlens_k[-1] != metadata["total_k"])
+                | torch.any(q_lengths_raw < 0)
+                | torch.any(k_lengths_raw < 0)
+                | torch.any(q_lengths_raw > metadata["max_seqlen_q"])
+                | torch.any(k_lengths_raw > metadata["max_seqlen_k"])
+            )
+        else:
+            varlen_geometry = _compile_varlen_geometry(
+                arch,
+                fwd_tile_m=fwd_plan_tile_m,
+                fwd_tile_n=fwd_config.tile_n,
+                qhead_per_kvhead=qratio,
+                bwd_tile_m=bwd_config.sparse_tile_m if bwd_config is not None else 1,
+                bwd_tile_n=bwd_sparse_tile_n if bwd_config is not None else 1,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                cu_total_m_blocks=cu_total_m_blocks,
+                cu_total_fwd_n_blocks=cu_total_fwd_n_blocks,
+                cu_total_bwd_m_blocks=cu_total_bwd_m_blocks,
+                cu_total_bwd_n_blocks=cu_total_bwd_n_blocks,
+                metadata_invalid=metadata_invalid,
+            )
+            varlen_geometry(
+                cu_seqlens_q,
+                cu_seqlens_k,
+                cu_total_m_blocks,
+                cu_total_fwd_n_blocks,
+                cu_total_bwd_m_blocks,
+                cu_total_bwd_n_blocks,
+                metadata_invalid,
+                Int32(metadata["total_q"]),
+                Int32(metadata["total_k"]),
+                Int32(metadata["max_seqlen_q"]),
+                Int32(metadata["max_seqlen_k"]),
+            )
 
     visible_bits = torch.zeros(
         (metadata["hmask"], fwd_upper_total_m_blocks, fwd_num_words),
@@ -1238,6 +1631,20 @@ def _build_packed_mask_plan(
                 Int32(metadata["total_k"]),
                 Int32(bwd_max_n_blocks),
             )
+    partial_scan = None
+    full_scan = None
+    bwd_partial_scan = None
+    bwd_full_scan = None
+    dq_partial_scan = None
+    dq_full_scan = None
+    fixed_partial_offsets = None
+    fixed_full_offsets = None
+    fixed_bwd_partial_offsets = None
+    fixed_bwd_full_offsets = None
+    fixed_dq_partial_offsets = None
+    fixed_dq_full_offsets = None
+    use_fixed_scan_header = not metadata["is_varlen"] and fwd_max_n_blocks > 0
+    use_varlen_scan_header = metadata["is_varlen"] and fwd_max_n_blocks > 0
     if is_fake_mode():
         total_m_blocks = fwd_upper_total_m_blocks
         partial_nnz = metadata["hmask"] * fwd_upper_total_m_blocks * fwd_max_n_blocks
@@ -1246,6 +1653,148 @@ def _build_packed_mask_plan(
         bwd_total_n_blocks = bwd_upper_total_n_blocks
         bwd_partial_nnz = metadata["hmask"] * bwd_upper_total_n_blocks * bwd_max_m_blocks
         bwd_full_nnz = 0
+    elif use_fixed_scan_header:
+        fixed_partial_offsets = torch.empty(
+            (partial_counts_tmp.numel() + 1,), dtype=torch.int32, device=device
+        )
+        fixed_full_offsets = torch.empty_like(fixed_partial_offsets)
+        if bwd_config is not None:
+            assert bwd_partial_counts_tmp is not None
+            assert bwd_full_counts_tmp is not None
+            fixed_bwd_partial_offsets = torch.empty(
+                (bwd_partial_counts_tmp.numel() + 1,),
+                dtype=torch.int32,
+                device=device,
+            )
+            fixed_bwd_full_offsets = torch.empty_like(fixed_bwd_partial_offsets)
+        if dq_config is not None:
+            assert bwd_q_partial_counts_tmp is not None
+            fixed_dq_partial_offsets = torch.empty(
+                (bwd_q_partial_counts_tmp.numel() + 1,),
+                dtype=torch.int32,
+                device=device,
+            )
+            fixed_dq_full_offsets = torch.empty_like(fixed_dq_partial_offsets)
+        header = torch.empty((8,), dtype=torch.int64, device=device)
+        fixed_scan_header = _compile_fixed_scan_header(
+            arch,
+            partial_counts_tmp,
+            full_counts_tmp,
+            fixed_partial_offsets,
+            fixed_full_offsets,
+            bwd_partial_counts_tmp,
+            bwd_full_counts_tmp,
+            fixed_bwd_partial_offsets,
+            fixed_bwd_full_offsets,
+            bwd_q_partial_counts_tmp if dq_config is not None else None,
+            bwd_q_full_counts_tmp if dq_config is not None else None,
+            fixed_dq_partial_offsets,
+            fixed_dq_full_offsets,
+            error,
+            header,
+        )
+        fixed_scan_header(
+            partial_counts_tmp,
+            full_counts_tmp,
+            fixed_partial_offsets,
+            fixed_full_offsets,
+            bwd_partial_counts_tmp,
+            bwd_full_counts_tmp,
+            fixed_bwd_partial_offsets,
+            fixed_bwd_full_offsets,
+            bwd_q_partial_counts_tmp if dq_config is not None else None,
+            bwd_q_full_counts_tmp if dq_config is not None else None,
+            fixed_dq_partial_offsets,
+            fixed_dq_full_offsets,
+            error,
+            header,
+            Int32(fwd_upper_total_m_blocks),
+            Int32(bwd_upper_total_m_blocks),
+            Int32(bwd_upper_total_n_blocks),
+        )
+        (
+            total_m_blocks,
+            partial_nnz,
+            full_nnz,
+            bwd_total_m_blocks,
+            bwd_total_n_blocks,
+            bwd_partial_nnz,
+            bwd_full_nnz,
+            error_value,
+        ) = (int(value) for value in header.cpu().tolist())
+    elif use_varlen_scan_header:
+        partial_scan = torch.empty(
+            (partial_counts_tmp.numel(),), dtype=torch.int64, device=device
+        )
+        full_scan = torch.empty_like(partial_scan)
+        if bwd_config is not None:
+            assert bwd_partial_counts_tmp is not None
+            assert bwd_full_counts_tmp is not None
+            bwd_partial_scan = torch.empty(
+                (bwd_partial_counts_tmp.numel(),), dtype=torch.int64, device=device
+            )
+            bwd_full_scan = torch.empty_like(bwd_partial_scan)
+        if dq_config is not None:
+            assert bwd_q_partial_counts_tmp is not None
+            assert bwd_q_full_counts_tmp is not None
+            dq_partial_scan = torch.empty(
+                (bwd_q_partial_counts_tmp.numel(),), dtype=torch.int64, device=device
+            )
+            dq_full_scan = torch.empty_like(dq_partial_scan)
+        assert cu_total_m_blocks is not None
+        assert metadata_invalid is not None
+        header = torch.empty((8,), dtype=torch.int64, device=device)
+        varlen_scan_header = _compile_varlen_scan_header(
+            arch,
+            partial_counts_tmp,
+            full_counts_tmp,
+            partial_scan,
+            full_scan,
+            bwd_partial_counts_tmp,
+            bwd_full_counts_tmp,
+            bwd_partial_scan,
+            bwd_full_scan,
+            bwd_q_partial_counts_tmp if dq_config is not None else None,
+            bwd_q_full_counts_tmp if dq_config is not None else None,
+            dq_partial_scan,
+            dq_full_scan,
+            cu_total_m_blocks,
+            cu_total_bwd_m_blocks,
+            cu_total_bwd_n_blocks,
+            metadata_invalid,
+            error,
+            header,
+        )
+        varlen_scan_header(
+            partial_counts_tmp,
+            full_counts_tmp,
+            partial_scan,
+            full_scan,
+            bwd_partial_counts_tmp,
+            bwd_full_counts_tmp,
+            bwd_partial_scan,
+            bwd_full_scan,
+            bwd_q_partial_counts_tmp if dq_config is not None else None,
+            bwd_q_full_counts_tmp if dq_config is not None else None,
+            dq_partial_scan,
+            dq_full_scan,
+            cu_total_m_blocks,
+            cu_total_bwd_m_blocks,
+            cu_total_bwd_n_blocks,
+            metadata_invalid,
+            error,
+            header,
+        )
+        (
+            total_m_blocks,
+            partial_nnz,
+            full_nnz,
+            bwd_total_m_blocks,
+            bwd_total_n_blocks,
+            bwd_partial_nnz,
+            bwd_full_nnz,
+            error_value,
+        ) = (int(value) for value in header.cpu().tolist())
     else:
         partial_scan = torch.cumsum(partial_counts_tmp.reshape(-1), dim=0, dtype=torch.int64)
         full_scan = torch.cumsum(full_counts_tmp.reshape(-1), dim=0, dtype=torch.int64)
@@ -1301,9 +1850,17 @@ def _build_packed_mask_plan(
         bwd_full_total = (
             bwd_full_scan[-1] if bwd_full_scan is not None and bwd_full_scan.numel() else zero
         )
-        combined_error = error[0].to(torch.int64) | (
-            metadata_invalid.to(torch.int64) * _ERROR_INVALID_SEQLENS
-        )
+        interval_error = error[0].to(torch.int64)
+        if fwd_upper_total_m_blocks > 0 and fwd_max_n_blocks == 0:
+            interval_error = interval_error | (
+                torch.any(arbitrary_func != 0).to(torch.int64)
+                * _ERROR_INVALID_INTERVAL
+            )
+        combined_error = interval_error
+        if metadata_invalid is not None:
+            combined_error = combined_error | (
+                metadata_invalid[0].to(torch.int64) * _ERROR_INVALID_SEQLENS
+            )
         header = torch.stack(
             (
                 total_m_tensor,
@@ -1326,6 +1883,7 @@ def _build_packed_mask_plan(
             bwd_full_nnz,
             error_value,
         ) = (int(value) for value in header.cpu().tolist())
+    if not is_fake_mode():
         if error_value & _ERROR_INVALID_SEQLENS:
             raise ValueError(
                 "cu_seqlens_q/k must start at zero, be nondecreasing, end at "
@@ -1333,14 +1891,43 @@ def _build_packed_mask_plan(
             )
         if error_value & _ERROR_INVALID_INTERVAL:
             raise ValueError(
-                "arbitrary_func endpoints must be in [0, total_k], each begin must "
-                "not exceed its end, and non-empty interval begins must be ordered"
+                "mask_func endpoints must lie in each row's local-K range and be "
+                "nondecreasing for every Q row"
             )
 
-    partial_counts = partial_counts_tmp[:, :total_m_blocks].clone()
-    full_counts = full_counts_tmp[:, :total_m_blocks].clone()
-    partial_offsets = _exclusive_offsets(partial_counts)
-    full_offsets = _exclusive_offsets(full_counts)
+    use_varlen_compact_metadata = (
+        not is_fake_mode() and metadata["is_varlen"] and use_varlen_scan_header
+    )
+    if use_varlen_compact_metadata:
+        partial_counts = torch.empty(
+            (metadata["hmask"], total_m_blocks), dtype=torch.int32, device=device
+        )
+        full_counts = torch.empty_like(partial_counts)
+        partial_offsets = torch.empty(
+            (partial_counts.numel() + 1,), dtype=torch.int32, device=device
+        )
+        full_offsets = torch.empty_like(partial_offsets)
+    else:
+        partial_counts = _compact_counts(
+            partial_counts_tmp,
+            total_m_blocks,
+            is_varlen=metadata["is_varlen"],
+        )
+        full_counts = _compact_counts(
+            full_counts_tmp,
+            total_m_blocks,
+            is_varlen=metadata["is_varlen"],
+        )
+        partial_offsets = (
+            fixed_partial_offsets
+            if fixed_partial_offsets is not None
+            else _exclusive_offsets_from_scan(partial_counts, partial_scan)
+        )
+        full_offsets = (
+            fixed_full_offsets
+            if fixed_full_offsets is not None
+            else _exclusive_offsets_from_scan(full_counts, full_scan)
+        )
     partial_indices = torch.empty((partial_nnz,), dtype=torch.int32, device=device)
     full_indices = torch.empty((full_nnz,), dtype=torch.int32, device=device)
     partial_masks = torch.empty(
@@ -1371,10 +1958,38 @@ def _build_packed_mask_plan(
         assert dq_config.block_size == bwd_config.block_size
         assert bwd_q_partial_counts_tmp is not None
         assert bwd_q_full_counts_tmp is not None
-        dq_partial_counts = bwd_q_partial_counts_tmp[:, :bwd_total_m_blocks].clone()
-        dq_full_counts = bwd_q_full_counts_tmp[:, :bwd_total_m_blocks].clone()
-        dq_partial_offsets = _exclusive_offsets(dq_partial_counts)
-        dq_full_offsets = _exclusive_offsets(dq_full_counts)
+        if use_varlen_compact_metadata:
+            dq_partial_counts = torch.empty(
+                (metadata["hmask"], bwd_total_m_blocks),
+                dtype=torch.int32,
+                device=device,
+            )
+            dq_full_counts = torch.empty_like(dq_partial_counts)
+            dq_partial_offsets = torch.empty(
+                (dq_partial_counts.numel() + 1,), dtype=torch.int32, device=device
+            )
+            dq_full_offsets = torch.empty_like(dq_partial_offsets)
+        else:
+            dq_partial_counts = _compact_counts(
+                bwd_q_partial_counts_tmp,
+                bwd_total_m_blocks,
+                is_varlen=metadata["is_varlen"],
+            )
+            dq_full_counts = _compact_counts(
+                bwd_q_full_counts_tmp,
+                bwd_total_m_blocks,
+                is_varlen=metadata["is_varlen"],
+            )
+            dq_partial_offsets = (
+                fixed_dq_partial_offsets
+                if fixed_dq_partial_offsets is not None
+                else _exclusive_offsets_from_scan(dq_partial_counts, dq_partial_scan)
+            )
+            dq_full_offsets = (
+                fixed_dq_full_offsets
+                if fixed_dq_full_offsets is not None
+                else _exclusive_offsets_from_scan(dq_full_counts, dq_full_scan)
+            )
         # Q-major and K-major views enumerate the same classified sparse pairs.
         dq_partial_indices = torch.empty((bwd_partial_nnz,), dtype=torch.int32, device=device)
         dq_full_indices = torch.empty((bwd_full_nnz,), dtype=torch.int32, device=device)
@@ -1389,12 +2004,44 @@ def _build_packed_mask_plan(
             device=device,
         )
         dq_partial_work_desc = torch.empty((bwd_partial_nnz, 4), dtype=torch.int32, device=device)
+    bwd_partial_counts = None
+    bwd_full_counts = None
+    bwd_partial_offsets = None
+    bwd_full_offsets = None
     bwd_plan = None
     if bwd_config is not None:
-        bwd_partial_counts = bwd_partial_counts_tmp[:, :bwd_total_n_blocks].clone()
-        bwd_full_counts = bwd_full_counts_tmp[:, :bwd_total_n_blocks].clone()
-        bwd_partial_offsets = _exclusive_offsets(bwd_partial_counts)
-        bwd_full_offsets = _exclusive_offsets(bwd_full_counts)
+        if use_varlen_compact_metadata:
+            bwd_partial_counts = torch.empty(
+                (metadata["hmask"], bwd_total_n_blocks),
+                dtype=torch.int32,
+                device=device,
+            )
+            bwd_full_counts = torch.empty_like(bwd_partial_counts)
+            bwd_partial_offsets = torch.empty(
+                (bwd_partial_counts.numel() + 1,), dtype=torch.int32, device=device
+            )
+            bwd_full_offsets = torch.empty_like(bwd_partial_offsets)
+        else:
+            bwd_partial_counts = _compact_counts(
+                bwd_partial_counts_tmp,
+                bwd_total_n_blocks,
+                is_varlen=metadata["is_varlen"],
+            )
+            bwd_full_counts = _compact_counts(
+                bwd_full_counts_tmp,
+                bwd_total_n_blocks,
+                is_varlen=metadata["is_varlen"],
+            )
+            bwd_partial_offsets = (
+                fixed_bwd_partial_offsets
+                if fixed_bwd_partial_offsets is not None
+                else _exclusive_offsets_from_scan(bwd_partial_counts, bwd_partial_scan)
+            )
+            bwd_full_offsets = (
+                fixed_bwd_full_offsets
+                if fixed_bwd_full_offsets is not None
+                else _exclusive_offsets_from_scan(bwd_full_counts, bwd_full_scan)
+            )
         bwd_partial_indices = torch.empty((bwd_partial_nnz,), dtype=torch.int32, device=device)
         bwd_full_indices = torch.empty((bwd_full_nnz,), dtype=torch.int32, device=device)
         bwd_partial_dq_order = torch.empty_like(bwd_partial_indices)
@@ -1413,6 +2060,62 @@ def _build_packed_mask_plan(
             (bwd_partial_nnz, 4),
             dtype=torch.int32,
             device=device,
+        )
+    if use_varlen_compact_metadata:
+        assert partial_scan is not None
+        assert full_scan is not None
+        compact_metadata = _compile_varlen_compact_metadata(
+            arch,
+            partial_counts_tmp,
+            full_counts_tmp,
+            partial_scan,
+            full_scan,
+            partial_counts,
+            full_counts,
+            partial_offsets,
+            full_offsets,
+            bwd_partial_counts_tmp,
+            bwd_full_counts_tmp,
+            bwd_partial_scan,
+            bwd_full_scan,
+            bwd_partial_counts,
+            bwd_full_counts,
+            bwd_partial_offsets,
+            bwd_full_offsets,
+            bwd_q_partial_counts_tmp if dq_config is not None else None,
+            bwd_q_full_counts_tmp if dq_config is not None else None,
+            dq_partial_scan,
+            dq_full_scan,
+            dq_partial_counts,
+            dq_full_counts,
+            dq_partial_offsets,
+            dq_full_offsets,
+        )
+        compact_metadata(
+            partial_counts_tmp,
+            full_counts_tmp,
+            partial_scan,
+            full_scan,
+            partial_counts,
+            full_counts,
+            partial_offsets,
+            full_offsets,
+            bwd_partial_counts_tmp,
+            bwd_full_counts_tmp,
+            bwd_partial_scan,
+            bwd_full_scan,
+            bwd_partial_counts,
+            bwd_full_counts,
+            bwd_partial_offsets,
+            bwd_full_offsets,
+            bwd_q_partial_counts_tmp if dq_config is not None else None,
+            bwd_q_full_counts_tmp if dq_config is not None else None,
+            dq_partial_scan,
+            dq_full_scan,
+            dq_partial_counts,
+            dq_full_counts,
+            dq_partial_offsets,
+            dq_full_offsets,
         )
     if fwd_upper_total_m_blocks > 0 and partial_nnz + full_nnz > 0:
         materialize = _compile_materialize(
@@ -1582,6 +2285,7 @@ def _build_packed_mask_plan(
             batch_size=metadata["batch_size"],
             total_m_blocks=total_m_blocks,
             max_m_blocks=fwd_max_m_blocks,
+            max_task_cost=fwd_max_n_blocks,
             seqlen_q_fixed=metadata["seqlen_q_fixed"],
             seqlen_k_fixed=metadata["seqlen_k_fixed"],
             head_dim=q.shape[-1],
@@ -1752,9 +2456,8 @@ def create_mask_plan(
         build_backward = torch.is_grad_enabled() and any(
             tensor.requires_grad for tensor in (q, k, v)
         )
-    internal_mask_func = make_internal_mask_func(mask_func, geometry)
     packed_plan = _build_packed_mask_plan(
-        internal_mask_func,
+        mask_func,
         q,
         k,
         v,

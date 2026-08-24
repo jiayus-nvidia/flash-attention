@@ -159,26 +159,24 @@ class _ArbitraryPlanCommonSm90:
         mask_head: Int32,
         interval_idx: Int32,
         q_global: Int32,
-        k_begin: Int32,
         k_len: Int32,
-        total_k: Int32,
     ):
-        global_begin = Int32(0)
+        endpoint_begin = Int32(0)
         if interval_idx > Int32(0):
-            global_begin = _load_endpoint(
+            endpoint_begin = _load_endpoint(
                 mArbitraryFunc, mask_head, interval_idx * Int32(2) - Int32(1), q_global
             )
-        global_end = _load_endpoint(mArbitraryFunc, mask_head, interval_idx * Int32(2), q_global)
-        safe_begin = cutlass.max(Int32(0), cutlass.min(global_begin, total_k))
-        safe_end = cutlass.max(Int32(0), cutlass.min(global_end, total_k))
+        endpoint_end = _load_endpoint(
+            mArbitraryFunc,
+            mask_head,
+            interval_idx * Int32(2),
+            q_global,
+        )
+        safe_begin = cutlass.max(Int32(0), cutlass.min(endpoint_begin, k_len))
+        safe_end = cutlass.max(Int32(0), cutlass.min(endpoint_end, k_len))
         if safe_end < safe_begin:
             safe_end = safe_begin
-        k_end = k_begin + k_len
-        local_begin = cutlass.max(safe_begin, k_begin) - k_begin
-        local_end = cutlass.min(safe_end, k_end) - k_begin
-        if local_end < local_begin:
-            local_end = local_begin
-        return global_begin, global_end, local_begin, local_end
+        return endpoint_begin, endpoint_end, safe_begin, safe_end
 
     @cute.jit
     def _row_block_state(
@@ -188,9 +186,7 @@ class _ArbitraryPlanCommonSm90:
         q_global: Int32,
         block_id: Int32,
         nfunc: Int32,
-        k_begin: Int32,
         k_len: Int32,
-        total_k: Int32,
     ):
         block_begin = block_id * Int32(self.tile_n)
         block_end = block_begin + Int32(self.tile_n)
@@ -203,9 +199,7 @@ class _ArbitraryPlanCommonSm90:
                 mask_head,
                 interval_idx,
                 q_global,
-                k_begin,
                 k_len,
-                total_k,
             )
             lo = cutlass.max(local_begin, block_begin)
             hi = cutlass.min(local_end, block_end)
@@ -214,33 +208,6 @@ class _ArbitraryPlanCommonSm90:
                 if lo <= covered_end and hi > covered_end:
                     covered_end = hi
         return visible, covered_end >= block_end
-
-    @cute.jit
-    def _is_visible(
-        self,
-        mArbitraryFunc: cute.Tensor,
-        mask_head: Int32,
-        q_global: Int32,
-        k_global: Int32,
-        nfunc: Int32,
-    ) -> Boolean:
-        keep = Boolean(False)
-        num_intervals = (nfunc + Int32(1)) // Int32(2)
-        for interval_idx in cutlass.range(num_intervals, unroll=1):
-            global_begin = Int32(0)
-            if interval_idx > Int32(0):
-                global_begin = _load_endpoint(
-                    mArbitraryFunc,
-                    mask_head,
-                    interval_idx * Int32(2) - Int32(1),
-                    q_global,
-                )
-            global_end = _load_endpoint(
-                mArbitraryFunc, mask_head, interval_idx * Int32(2), q_global
-            )
-            if k_global >= global_begin and k_global < global_end:
-                keep = Boolean(True)
-        return keep
 
 
 class _ArbitraryPlanK2QCommonSm90(_ArbitraryPlanCommonSm90):

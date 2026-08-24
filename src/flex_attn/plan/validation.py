@@ -87,24 +87,13 @@ def _validate_prefix(
     tensor: torch.Tensor,
     *,
     name: str,
-    total: int,
-    max_seqlen: int,
-) -> list[int]:
+) -> None:
     if tensor.ndim != 1 or tensor.numel() < 2:
         raise ValueError(f"{name} must be rank-1 with at least two elements")
     if tensor.dtype != torch.int32:
         raise TypeError(f"{name} must have dtype torch.int32")
     if not tensor.is_cuda or not tensor.is_contiguous():
         raise ValueError(f"{name} must be a contiguous CUDA tensor")
-    values = tensor.detach().cpu().tolist()
-    if values[0] != 0 or values[-1] != total:
-        raise ValueError(f"{name} must start at 0 and end at {total}")
-    lengths = [end - begin for begin, end in zip(values, values[1:])]
-    if any(length < 0 for length in lengths):
-        raise ValueError(f"{name} must be nondecreasing")
-    if any(length > max_seqlen for length in lengths):
-        raise ValueError(f"{name} contains a sequence longer than its max_seqlen")
-    return lengths
 
 
 def validate_create_mask_plan_inputs(
@@ -143,24 +132,13 @@ def validate_create_mask_plan_inputs(
         _validate_prefix(
             cu_seqlens_q,
             name="cu_seqlens_q",
-            total=total_q,
-            max_seqlen=max_seqlen_q,
         )
-        k_lengths_host = _validate_prefix(
+        _validate_prefix(
             cu_seqlens_k,
             name="cu_seqlens_k",
-            total=total_k,
-            max_seqlen=max_seqlen_k,
         )
         cu_q_owned = cu_seqlens_q.detach().clone()
         cu_k_owned = cu_seqlens_k.detach().clone()
-        q_lengths = cu_q_owned[1:] - cu_q_owned[:-1]
-        k_lengths = torch.tensor(k_lengths_host, dtype=torch.int32, device=q.device)
-        row_k_lengths = torch.repeat_interleave(
-            k_lengths,
-            q_lengths.to(torch.int64),
-            output_size=total_q,
-        )
         seqlen_q = None
         seqlen_k = None
     else:
@@ -176,9 +154,6 @@ def validate_create_mask_plan_inputs(
         max_seqlen_k = seqlen_k
         cu_q_owned = None
         cu_k_owned = None
-        row_k_lengths = torch.full(
-            (total_q,), seqlen_k, dtype=torch.int32, device=q.device
-        )
 
     if not isinstance(mask_func, torch.Tensor):
         raise TypeError("mask_func must be a torch.Tensor")
@@ -197,17 +172,6 @@ def validate_create_mask_plan_inputs(
         raise ValueError(f"Hmask must be 1 or Hq ({q.shape[-2]}); got {hmask}")
     if nfunc <= 0 or nfunc % 2 == 0:
         raise ValueError("nfunc must be a positive odd number")
-    if total_q:
-        invalid_range = (mask_func < 0) | (mask_func > row_k_lengths[None, None, :])
-        invalid_order = (
-            (mask_func[:, 1:, :] < mask_func[:, :-1, :]).any()
-            if nfunc > 1
-            else torch.zeros((), dtype=torch.bool, device=q.device)
-        )
-        if bool(invalid_range.any().item()):
-            raise ValueError("mask_func endpoints must lie in each row's local-K range")
-        if bool(invalid_order.item()):
-            raise ValueError("mask_func endpoints must be nondecreasing for every Q row")
 
     return PlanGeometry(
         is_varlen=is_varlen,
@@ -230,29 +194,6 @@ def validate_create_mask_plan_inputs(
     )
 
 
-def make_internal_mask_func(mask_func: torch.Tensor, geometry: PlanGeometry) -> torch.Tensor:
-    """Convert sample-local endpoints to the padded planner representation."""
-
-    if geometry.is_varlen:
-        q_lengths = geometry.cu_seqlens_q[1:] - geometry.cu_seqlens_q[:-1]
-        row_k_offsets = torch.repeat_interleave(
-            geometry.cu_seqlens_k[:-1],
-            q_lengths.to(torch.int64),
-            output_size=geometry.total_q,
-        )
-    else:
-        row_k_offsets = torch.arange(
-            geometry.batch_size, dtype=torch.int32, device=mask_func.device
-        ).repeat_interleave(geometry.seqlen_q) * geometry.seqlen_k
-    internal = torch.zeros(
-        (geometry.hmask, geometry.nfunc, geometry.total_q + 256),
-        dtype=torch.int32,
-        device=mask_func.device,
-    )
-    internal[:, :, : geometry.total_q] = mask_func + row_k_offsets[None, None, :]
-    return internal
-
-
 def validate_call_options(
     *, softmax_scale: float | None, deterministic: bool, return_lse: bool
 ) -> None:
@@ -272,7 +213,6 @@ __all__ = [
     "SUPPORTED_HEAD_DIM_RULE",
     "SUPPORTED_HEAD_DIMS",
     "is_supported_head_dims",
-    "make_internal_mask_func",
     "validate_call_options",
     "validate_create_mask_plan_inputs",
 ]

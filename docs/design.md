@@ -71,12 +71,16 @@ Varlen THD input uses `cu_seqlens_q` and `cu_seqlens_k` to identify sample bound
 endpoint for a Q token is still local to that token's sample. It is never an offset into the
 flattened K tensor.
 
-The builder validates that both prefix tensors:
+Host-side validation checks that both prefix tensors:
 
 - are rank-1, contiguous CUDA `int32` tensors on the Q device;
-- begin at zero and end at `total_q` and `total_k`;
-- are monotonically nondecreasing; and
-- do not produce a sample longer than `max_seqlen_q` or `max_seqlen_k`.
+- have the same shape.
+
+The planner validates their values on the GPU: the prefixes must begin at zero, end at
+`total_q`/`total_k`, be monotonically nondecreasing, and respect `max_seqlen_q`/
+`max_seqlen_k`. The result is returned through the exact-allocation header described in Section
+4.5, so invalid input still raises a synchronous public exception without a separate full-prefix
+D2H copy.
 
 The public builder clones the prefix tensors. The resulting `MaskPlan` owns those clones, so a
 later in-place mutation of the caller's tensors cannot change the sample partition of an existing
@@ -84,9 +88,10 @@ plan.
 
 ### 3.3 Planner and Consumer Coordinates
 
-The builder converts public endpoints to an internal planner representation by adding each
-sample's physical K offset. It also appends 256 zero Q rows so planner kernels can issue safe
-vectorized reads at the upper boundary. This padded representation is temporary.
+Planner kernels consume the public sample-local endpoints directly. The row's sequence descriptor
+provides `q_offset`, `k_offset`, `q_len`, and `k_len`; endpoint values are clamped and validated
+against that row's local `k_len`. The planner does not add a physical K offset to the endpoints and
+does not build a padded endpoint tensor.
 
 The compact topology stored in the final plan uses sample-local block indices. A consumer forms a
 physical address from:
@@ -106,7 +111,7 @@ packed-bit ownership depend on the target kernel.
 sample-local interval endpoints
               |
               v
-input validation and internal endpoint conversion
+structural input validation
               |
               v
 resolve consumer topology and compact Varlen row prefixes
@@ -136,8 +141,10 @@ MaskPlan
 ### 4.1 Input Validation and Consumer Resolution
 
 The host first validates tensor rank, dtype, device, layout, Q/K/V geometry, head counts, endpoint
-shape, and Fixed/Varlen arguments. It then resolves a consumer configuration for the current
-architecture and direction.
+shape, and Fixed/Varlen arguments. Endpoint values and Varlen prefix values are validated by the
+classifier and allocation-header path, avoiding separate elementwise validation launches and D2H
+waits. The builder then resolves a consumer configuration for the current architecture and
+direction.
 
 The resolved configuration provides the planner with:
 
@@ -165,6 +172,11 @@ cu_total_k_plan_rows[B + 1]
 These prefixes compact away nonexistent rows. They also map a compact outer row back to its
 sample, so the classifier and consumer do not have to scan `cu_seqlens` to rediscover ownership.
 Forward and backward may use different prefixes because their tile geometries can differ.
+
+One architecture-neutral `VarlenGeometry` kernel builds all required FWD and optional BWD block
+prefixes from `cu_seqlens_q/k`. The same kernel validates prefix start/end values, ordering, and
+maximum lengths and writes a device error flag. SM90, SM100, and SM103 use the same algorithm;
+only consumer tile sizes and the compilation target differ.
 
 ### 4.3 Q2K Classification
 
@@ -196,9 +208,10 @@ empty   = ~visible_bits
 The bitsets provide a compact intermediate representation that can be read in either Q-major or
 K-major order. They are planner workspace and are not retained by `MaskPlan`.
 
-The classifier also writes a defensive error word for invalid interval metadata. Public input
-validation remains the API contract; the device-side flag prevents malformed internal metadata
-from being materialized into a plan.
+The classifier validates every endpoint against the owning sample's local K range and checks the
+complete endpoint sequence for monotonic order. It writes any interval or Varlen-prefix failure to
+the same device error word used by exact allocation. The host reads that error once and raises
+before materialization, so malformed metadata cannot produce a plan.
 
 ### 4.4 Backward K2Q Counting
 
@@ -224,7 +237,17 @@ error flags
 The host reads this eight-value header once. The readback establishes exact allocation sizes and
 turns device-side metadata errors into public exceptions.
 
-The valid count arrays are then compacted, and independent exclusive scans produce CSR offsets:
+Fixed and Varlen plans use architecture-neutral scan/header kernels on SM90, SM100, and SM103.
+FWD and BWD classification remain independent, and both modes retain one allocation-header D2H.
+
+For fixed length, `FixedScanHeader` scans the FWD and optional K2Q/dedicated-dQ count arrays. The
+temporary counts already have their retained shape, so the plan reuses them directly while the
+kernel writes exact exclusive CSR offsets and the allocation header.
+
+For Varlen, `VarlenScanHeader` scans the upper-bound count arrays, stores their inclusive scans,
+and writes the same allocation header. After the header establishes the exact row and NNZ sizes,
+one `VarlenCompactMetadata` kernel copies every valid per-head count prefix and converts the
+inclusive scans into the retained exact offsets:
 
 ```text
 partial_offset[0] = 0
@@ -234,7 +257,9 @@ full_offset[0] = 0
 full_offset[i + 1] = full_offset[i] + full_count[i]
 ```
 
-Partial and full outputs are allocated independently. Empty blocks require no compact storage.
+The compact materializer handles FWD, optional K2Q, and optional dedicated-dQ metadata in one
+launch. It does not pad the retained CSR and does not allocate capacity-based outputs. Partial and
+full outputs remain independent, and empty blocks require no compact storage.
 
 ### 4.6 Q2K Materialization
 
@@ -291,10 +316,14 @@ The planner computes task cost as:
 task_cost = partial_block_count + full_block_count
 ```
 
-Partial and full blocks deliberately have equal scheduling cost. Tasks are stably ordered by cost
-and L2 locality sections before being stored in `fwd_work_desc`. The kernel therefore consumes a
-prepared work queue; it does not enumerate all batch Q tiles or reconstruct task ownership from
-`cu_seqlens`.
+Partial and full blocks deliberately have equal scheduling cost. Positive-cost tasks are stably
+ordered by L2 section, descending task cost, and the existing head/Q-block tie order; zero-cost
+tasks follow in batch/head/Q-block order. The planner implements this order with bounded counting:
+one kernel builds a `(section, task_cost)` histogram, one CTA computes stable section rank and
+bucket offsets, and one warp per section scatters 32-task chunks in tie order. The implementation
+therefore preserves the exact lexicographic order without a chain of general-purpose GPU sorts or
+data-dependent host reads. The kernel consumes the resulting prepared work queue; it does not
+enumerate all batch Q tiles or reconstruct task ownership from `cu_seqlens`.
 
 The descriptor layout and ordering are architecture-neutral; only the queue backend differs:
 
