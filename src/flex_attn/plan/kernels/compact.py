@@ -12,8 +12,6 @@ from cutlass import Boolean, Int32, Uint32, const_expr
 from flex_attn.plan.kernels.common import (
     _ArbitraryPlanCommonSm90,
     _ArbitraryPlanK2QCommonSm90,
-    _DQ_ORDER_COMPONENT_BITS,
-    _PLAN_THREADS,
     _shr_u32,
 )
 
@@ -66,12 +64,12 @@ class _ArbitraryPlanQ2KCompact(_ArbitraryPlanCommonSm90):
         smem = cutlass_utils.SmemAllocator()
         sWarpPartial = smem.allocate_tensor(
             element_type=Int32,
-            layout=cute.make_layout((8,)),
+            layout=cute.make_layout((self.num_warps,)),
             byte_alignment=16,
         )
         sWarpFull = smem.allocate_tensor(
             element_type=Int32,
-            layout=cute.make_layout((8,)),
+            layout=cute.make_layout((self.num_warps,)),
             byte_alignment=16,
         )
         sRunning = smem.allocate_tensor(
@@ -109,7 +107,7 @@ class _ArbitraryPlanQ2KCompact(_ArbitraryPlanCommonSm90):
 
             partial_prefix = Int32(0)
             full_prefix = Int32(0)
-            for prior_warp in cutlass.range_constexpr(8):
+            for prior_warp in cutlass.range_constexpr(self.num_warps):
                 if Int32(prior_warp) < warp_idx:
                     partial_prefix += sWarpPartial[prior_warp]
                     full_prefix += sWarpFull[prior_warp]
@@ -136,13 +134,13 @@ class _ArbitraryPlanQ2KCompact(_ArbitraryPlanCommonSm90):
             if planner_tidx == Int32(0):
                 chunk_partial = Int32(0)
                 chunk_full = Int32(0)
-                for warp in cutlass.range_constexpr(8):
+                for warp in cutlass.range_constexpr(self.num_warps):
                     chunk_partial += sWarpPartial[warp]
                     chunk_full += sWarpFull[warp]
                 sRunning[0] += chunk_partial
                 sRunning[1] += chunk_full
             cute.arch.sync_threads()
-            block_base += Int32(_PLAN_THREADS)
+            block_base += Int32(self.num_threads)
 
 
 class _ArbitraryPlanK2QCompact(_ArbitraryPlanK2QCommonSm90):
@@ -200,12 +198,12 @@ class _ArbitraryPlanK2QCompact(_ArbitraryPlanK2QCommonSm90):
         smem = cutlass_utils.SmemAllocator()
         sWarpPartial = smem.allocate_tensor(
             element_type=Int32,
-            layout=cute.make_layout((8,)),
+            layout=cute.make_layout((self.num_warps,)),
             byte_alignment=16,
         )
         sWarpFull = smem.allocate_tensor(
             element_type=Int32,
-            layout=cute.make_layout((8,)),
+            layout=cute.make_layout((self.num_warps,)),
             byte_alignment=16,
         )
         sRunning = smem.allocate_tensor(
@@ -244,7 +242,7 @@ class _ArbitraryPlanK2QCompact(_ArbitraryPlanK2QCommonSm90):
 
             partial_prefix = Int32(0)
             full_prefix = Int32(0)
-            for prior_warp in cutlass.range_constexpr(8):
+            for prior_warp in cutlass.range_constexpr(self.num_warps):
                 if Int32(prior_warp) < warp_idx:
                     partial_prefix += sWarpPartial[prior_warp]
                     full_prefix += sWarpFull[prior_warp]
@@ -254,7 +252,7 @@ class _ArbitraryPlanK2QCompact(_ArbitraryPlanK2QCommonSm90):
             )
             if partial or full:
                 rank = Int32(0)
-                if const_expr(not self.dq_order_none):
+                if const_expr(self.store_dq_order):
                     rank = self._dq_write_rank(
                         mVisibleBits,
                         mask_head,
@@ -275,36 +273,24 @@ class _ArbitraryPlanK2QCompact(_ArbitraryPlanK2QCommonSm90):
                     mPartialWorkDesc[output_idx, 1] = batch_idx
                     mPartialWorkDesc[output_idx, 2] = local_q_block
                     mPartialWorkDesc[output_idx, 3] = local_n_block
-                    if const_expr(not self.dq_order_none):
-                        if const_expr(self.dq_order_rank_only):
-                            mPartialDQOrder[output_idx] = rank
-                        else:
-                            mPartialDQOrder[output_idx] = Int32(
-                                (Uint32(rank) << Uint32(_DQ_ORDER_COMPONENT_BITS))
-                                | Uint32(local_q_block)
-                            )
+                    if const_expr(self.store_dq_order):
+                        mPartialDQOrder[output_idx] = rank
                 if full:
                     full_rank = (
                         sRunning[1] + full_prefix + Int32(cute.arch.popc(full_ballot & low_lanes))
                     )
                     output_idx = mFullOffsets[plan_row] + full_rank
                     mFullIndices[output_idx] = local_q_block
-                    if const_expr(not self.dq_order_none):
-                        if const_expr(self.dq_order_rank_only):
-                            mFullDQOrder[output_idx] = rank
-                        else:
-                            mFullDQOrder[output_idx] = Int32(
-                                (Uint32(rank) << Uint32(_DQ_ORDER_COMPONENT_BITS))
-                                | Uint32(local_q_block)
-                            )
+                    if const_expr(self.store_dq_order):
+                        mFullDQOrder[output_idx] = rank
             cute.arch.sync_threads()
             if planner_tidx == Int32(0):
                 chunk_partial = Int32(0)
                 chunk_full = Int32(0)
-                for warp in cutlass.range_constexpr(8):
+                for warp in cutlass.range_constexpr(self.num_warps):
                     chunk_partial += sWarpPartial[warp]
                     chunk_full += sWarpFull[warp]
                 sRunning[0] += chunk_partial
                 sRunning[1] += chunk_full
             cute.arch.sync_threads()
-            q_block_base += Int32(_PLAN_THREADS)
+            q_block_base += Int32(self.num_threads)

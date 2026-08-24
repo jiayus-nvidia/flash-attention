@@ -46,7 +46,7 @@ def _consumer_plan_signature(config) -> ArbitraryPlanSignature:
                 f"_s{config.subtile_factor}_swap{int(config.sdp_swap_ab)}"
                 f"_w{config.payload_padded_words}_v1"
             ),
-            dq_order_format="rank16_qblock16",
+            dq_order_format="rank_only",
             cluster_axis="m",
         )
     raise TypeError(f"unsupported arbitrary consumer config: {type(config).__name__}")

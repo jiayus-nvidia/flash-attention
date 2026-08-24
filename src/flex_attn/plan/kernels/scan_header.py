@@ -4,13 +4,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, Int64, const_expr
 
 import cuda.bindings.driver as cuda
-
-from flex_attn.plan.kernels.common import _ERROR_INVALID_SEQLENS
 
 
 class VarlenGeometry:
@@ -123,12 +120,8 @@ class VarlenGeometry:
             physical_q_len = q_len_clamped * qhead_per_kvhead
             fwd_m_blocks = (physical_q_len + fwd_tile_m - Int32(1)) // fwd_tile_m
             fwd_n_blocks = (k_len_clamped + fwd_tile_n - Int32(1)) // fwd_tile_n
-            mCuTotalMBlocks[batch_idx + Int32(1)] = (
-                mCuTotalMBlocks[batch_idx] + fwd_m_blocks
-            )
-            mCuTotalFwdNBlocks[batch_idx + Int32(1)] = (
-                mCuTotalFwdNBlocks[batch_idx] + fwd_n_blocks
-            )
+            mCuTotalMBlocks[batch_idx + Int32(1)] = mCuTotalMBlocks[batch_idx] + fwd_m_blocks
+            mCuTotalFwdNBlocks[batch_idx + Int32(1)] = mCuTotalFwdNBlocks[batch_idx] + fwd_n_blocks
 
             if const_expr(self.build_backward):
                 assert mCuTotalBwdMBlocks is not None
@@ -170,7 +163,7 @@ class FixedScanHeader:
         mDqFullCount: Optional[cute.Tensor],
         mDqPartialOffset: Optional[cute.Tensor],
         mDqFullOffset: Optional[cute.Tensor],
-        mError: cute.Tensor,
+        mIntervalInvalid: cute.Tensor,
         mHeader: cute.Tensor,
         total_m_blocks: Int32,
         bwd_total_m_blocks: Int32,
@@ -190,7 +183,7 @@ class FixedScanHeader:
             mDqFullCount,
             mDqPartialOffset,
             mDqFullOffset,
-            mError,
+            mIntervalInvalid,
             mHeader,
             total_m_blocks,
             bwd_total_m_blocks,
@@ -235,7 +228,7 @@ class FixedScanHeader:
         mDqFullCount: Optional[cute.Tensor],
         mDqPartialOffset: Optional[cute.Tensor],
         mDqFullOffset: Optional[cute.Tensor],
-        mError: cute.Tensor,
+        mIntervalInvalid: cute.Tensor,
         mHeader: cute.Tensor,
         total_m_blocks: Int32,
         bwd_total_m_blocks: Int32,
@@ -275,7 +268,8 @@ class FixedScanHeader:
         mHeader[4] = Int64(bwd_total_n_blocks)
         mHeader[5] = bwd_partial_total
         mHeader[6] = bwd_full_total
-        mHeader[7] = Int64(mError[0])
+        mHeader[7] = Int64(mIntervalInvalid[0])
+        mHeader[8] = Int64(0)
 
 
 class VarlenScanHeader:
@@ -304,7 +298,7 @@ class VarlenScanHeader:
         mCuTotalBwdMBlocks: Optional[cute.Tensor],
         mCuTotalBwdNBlocks: Optional[cute.Tensor],
         mMetadataInvalid: cute.Tensor,
-        mError: cute.Tensor,
+        mIntervalInvalid: cute.Tensor,
         mHeader: cute.Tensor,
         stream: cuda.CUstream = None,
     ) -> None:
@@ -325,7 +319,7 @@ class VarlenScanHeader:
             mCuTotalBwdMBlocks,
             mCuTotalBwdNBlocks,
             mMetadataInvalid,
-            mError,
+            mIntervalInvalid,
             mHeader,
         ).launch(
             grid=(1, 1, 1),
@@ -370,7 +364,7 @@ class VarlenScanHeader:
         mCuTotalBwdMBlocks: Optional[cute.Tensor],
         mCuTotalBwdNBlocks: Optional[cute.Tensor],
         mMetadataInvalid: cute.Tensor,
-        mError: cute.Tensor,
+        mIntervalInvalid: cute.Tensor,
         mHeader: cute.Tensor,
     ) -> None:
         partial_total = self._scan_counts(mPartialCount, mPartialScan)
@@ -395,12 +389,8 @@ class VarlenScanHeader:
                 mBwdFullCount,
                 mBwdFullScan,
             )
-            bwd_total_m_blocks = Int64(
-                mCuTotalBwdMBlocks[cute.size(mCuTotalBwdMBlocks) - Int32(1)]
-            )
-            bwd_total_n_blocks = Int64(
-                mCuTotalBwdNBlocks[cute.size(mCuTotalBwdNBlocks) - Int32(1)]
-            )
+            bwd_total_m_blocks = Int64(mCuTotalBwdMBlocks[cute.size(mCuTotalBwdMBlocks) - Int32(1)])
+            bwd_total_n_blocks = Int64(mCuTotalBwdNBlocks[cute.size(mCuTotalBwdNBlocks) - Int32(1)])
 
         if const_expr(self.build_dq):
             assert mDqPartialCount is not None
@@ -410,13 +400,7 @@ class VarlenScanHeader:
             self._scan_counts(mDqPartialCount, mDqPartialScan)
             self._scan_counts(mDqFullCount, mDqFullScan)
 
-        total_m_blocks = Int64(
-            mCuTotalMBlocks[cute.size(mCuTotalMBlocks) - Int32(1)]
-        )
-        combined_error = Int64(mError[0])
-        if mMetadataInvalid[0]:
-            combined_error = combined_error | Int64(_ERROR_INVALID_SEQLENS)
-
+        total_m_blocks = Int64(mCuTotalMBlocks[cute.size(mCuTotalMBlocks) - Int32(1)])
         mHeader[0] = total_m_blocks
         mHeader[1] = partial_total
         mHeader[2] = full_total
@@ -424,7 +408,8 @@ class VarlenScanHeader:
         mHeader[4] = bwd_total_n_blocks
         mHeader[5] = bwd_partial_total
         mHeader[6] = bwd_full_total
-        mHeader[7] = combined_error
+        mHeader[7] = Int64(mIntervalInvalid[0])
+        mHeader[8] = Int64(mMetadataInvalid[0])
 
 
 class VarlenCompactMetadata:

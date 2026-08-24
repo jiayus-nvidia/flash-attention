@@ -10,7 +10,6 @@ import cuda.bindings.driver as cuda
 
 from flex_attn.plan.kernels.common import (
     _ArbitraryPlanK2QCommonSm90,
-    _PLAN_THREADS,
 )
 
 
@@ -55,7 +54,7 @@ class _ArbitraryPlanK2QCountSm90(_ArbitraryPlanK2QCommonSm90):
             max_n_blocks,
         ).launch(
             grid=(upper_total_n_blocks, hmask, 1),
-            block=(_PLAN_THREADS, 1, 1),
+            block=(self.num_threads, 1, 1),
             stream=stream,
         )
 

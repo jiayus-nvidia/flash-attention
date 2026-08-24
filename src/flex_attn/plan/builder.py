@@ -12,20 +12,36 @@ import cutlass.cute as cute
 from cutlass import Int32
 
 import torch
-from flex_attn.plan.mask_plan import (
-    ArbitraryPlanRuntimeBinding,
-    ArbitraryTopologyTensors,
-    MaskPlan,
+
+from flex_attn.kernels.sm90.backward_config import (
+    _ResolvedSm90BwdConsumerConfig,
+    resolve_sm90_bwd_consumer_config,
 )
-from flex_attn.plan.validation import (
-    validate_create_mask_plan_inputs,
+from flex_attn.kernels.sm90.forward_config import (
+    _ResolvedSm90FwdConsumerConfig,
+    resolve_sm90_fwd_consumer_config,
+)
+from flex_attn.kernels.sm100.bwd.backward_config import (
+    _ResolvedSm100BwdConsumerConfig,
+    resolve_sm100_bwd_consumer_config,
+)
+from flex_attn.kernels.sm100.bwd.backward_config_hd256 import (
+    _ResolvedSm100Hd256DkdvConsumerConfig,
+    _ResolvedSm100Hd256DqConsumerConfig,
+    resolve_sm100_hd256_dkdv_consumer_config,
+    resolve_sm100_hd256_dq_consumer_config,
+)
+from flex_attn.kernels.sm100.fwd.forward_config import (
+    _ResolvedSm100FwdConsumerConfig,
+    resolve_sm100_fwd_consumer_config,
+    resolve_sm100_fwd_qstage1_1cta_consumer_config,
+    resolve_sm100_fwd_qstage1_2cta_consumer_config,
+)
+from flex_attn.kernels.sm100.fwd.forward_config_hd256 import (
+    _ResolvedSm100Hd256FwdConsumerConfig,
+    resolve_sm100_hd256_fwd_consumer_config,
 )
 from flex_attn.plan.kernels import BlockSparseTensorsTorch
-from flex_attn.plan.kernels.common import (
-    _DQ_ORDER_COMPONENT_LIMIT,
-    _ERROR_INVALID_INTERVAL,
-    _ERROR_INVALID_SEQLENS,
-)
 from flex_attn.plan.kernels.k2q_count import _ArbitraryPlanK2QCountSm90
 from flex_attn.plan.kernels.materialize_sm90 import (
     _ArbitraryPlanK2QMaterializeSm90,
@@ -43,6 +59,12 @@ from flex_attn.plan.kernels.scan_header import (
     VarlenScanHeader,
 )
 from flex_attn.plan.kernels.schedule import ForwardScheduleOrder, ForwardSchedulePlan
+from flex_attn.plan.kernels.workspace import PlanWorkspaceInit
+from flex_attn.plan.mask_plan import (
+    ArbitraryPlanRuntimeBinding,
+    ArbitraryTopologyTensors,
+    MaskPlan,
+)
 from flex_attn.plan.topology import (
     _ResolvedSm90BwdTopologyConfig,
     _ResolvedSm100BwdTopologyConfig,
@@ -52,36 +74,9 @@ from flex_attn.plan.topology import (
     _ResolvedSm100Hd256FwdTopologyConfig,
     _consumer_plan_signature,
 )
+from flex_attn.plan.validation import validate_create_mask_plan_inputs
 from flex_attn.runtime.compile_cache import get_jit_cache
 from flex_attn.runtime.dsl_utils import to_cute_tensor
-from flex_attn.kernels.sm90.backward_config import (
-    _ResolvedSm90BwdConsumerConfig,
-    resolve_sm90_bwd_consumer_config,
-)
-from flex_attn.kernels.sm90.forward_config import (
-    _ResolvedSm90FwdConsumerConfig,
-    resolve_sm90_fwd_consumer_config,
-)
-from flex_attn.kernels.sm100.bwd.backward_config import (
-    _ResolvedSm100BwdConsumerConfig,
-    resolve_sm100_bwd_consumer_config,
-)
-from flex_attn.kernels.sm100.fwd.forward_config import (
-    _ResolvedSm100FwdConsumerConfig,
-    resolve_sm100_fwd_consumer_config,
-    resolve_sm100_fwd_qstage1_1cta_consumer_config,
-    resolve_sm100_fwd_qstage1_2cta_consumer_config,
-)
-from flex_attn.kernels.sm100.bwd.backward_config_hd256 import (
-    _ResolvedSm100Hd256DkdvConsumerConfig,
-    _ResolvedSm100Hd256DqConsumerConfig,
-    resolve_sm100_hd256_dkdv_consumer_config,
-    resolve_sm100_hd256_dq_consumer_config,
-)
-from flex_attn.kernels.sm100.fwd.forward_config_hd256 import (
-    _ResolvedSm100Hd256FwdConsumerConfig,
-    resolve_sm100_hd256_fwd_consumer_config,
-)
 from flex_attn.runtime.fake_tensor import is_fake_mode
 
 _QSTAGE1_OVERLAP_MIN_AVERAGE_BLOCKS = 7
@@ -100,10 +95,9 @@ _FWD_SCHEDULE_COMPILE_CACHE = get_jit_cache("arbitrary_plan_fwd_schedule")
 _FWD_SCHEDULE_ORDER_COMPILE_CACHE = get_jit_cache("arbitrary_plan_fwd_schedule_order")
 _FIXED_SCAN_HEADER_COMPILE_CACHE = get_jit_cache("arbitrary_plan_fixed_scan_header")
 _VARLEN_SCAN_HEADER_COMPILE_CACHE = get_jit_cache("arbitrary_plan_varlen_scan_header")
-_VARLEN_COMPACT_METADATA_COMPILE_CACHE = get_jit_cache(
-    "arbitrary_plan_varlen_compact_metadata"
-)
+_VARLEN_COMPACT_METADATA_COMPILE_CACHE = get_jit_cache("arbitrary_plan_varlen_compact_metadata")
 _VARLEN_GEOMETRY_COMPILE_CACHE = get_jit_cache("arbitrary_plan_varlen_geometry")
+_PLAN_WORKSPACE_INIT_COMPILE_CACHE = get_jit_cache("arbitrary_plan_workspace_init")
 
 
 def _get_plan_builder_arch(device: torch.device) -> int:
@@ -244,7 +238,7 @@ def _compile_classify(
     full_bits: torch.Tensor,
     partial_counts: torch.Tensor,
     full_counts: torch.Tensor,
-    error: torch.Tensor,
+    interval_invalid: torch.Tensor,
     cu_seqlens_q: torch.Tensor | None,
     cu_seqlens_k: torch.Tensor | None,
     cu_total_m_blocks: torch.Tensor | None,
@@ -261,7 +255,7 @@ def _compile_classify(
             to_cute_tensor(full_bits, assumed_align=16, leading_dim=2),
             to_cute_tensor(partial_counts, assumed_align=4, leading_dim=1),
             to_cute_tensor(full_counts, assumed_align=4, leading_dim=1),
-            to_cute_tensor(error, assumed_align=4, leading_dim=0),
+            to_cute_tensor(interval_invalid, assumed_align=4, leading_dim=0),
             _to_cute_optional(cu_seqlens_q),
             _to_cute_optional(cu_seqlens_k),
             _to_cute_optional(cu_total_m_blocks),
@@ -279,6 +273,53 @@ def _compile_classify(
         print(f"Compiled mask-plan classify in {time.perf_counter() - started_at:.1f}s")
         _CLASSIFY_COMPILE_CACHE[key] = compiled
     return _CLASSIFY_COMPILE_CACHE[key]
+
+
+def _compile_plan_workspace_init(
+    arch: int,
+    visible_bits: torch.Tensor,
+    full_bits: torch.Tensor,
+    partial_counts: torch.Tensor,
+    full_counts: torch.Tensor,
+    interval_invalid: torch.Tensor,
+    schedule_histogram: torch.Tensor,
+    schedule_section_cost: torch.Tensor,
+    bwd_visible_bits: torch.Tensor | None,
+    bwd_full_bits: torch.Tensor | None,
+    bwd_q_partial_counts: torch.Tensor | None,
+    bwd_q_full_counts: torch.Tensor | None,
+    bwd_partial_counts: torch.Tensor | None,
+    bwd_full_counts: torch.Tensor | None,
+):
+    """Compile the architecture-neutral planner workspace initializer."""
+
+    build_backward = bwd_visible_bits is not None
+    key = ("arbitrary_plan_workspace_init_v1", arch, build_backward)
+    if key not in _PLAN_WORKSPACE_INIT_COMPILE_CACHE:
+        kernel = PlanWorkspaceInit(build_backward=build_backward)
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        started_at = time.perf_counter()
+        compiled = cute.compile(
+            kernel,
+            to_cute_tensor(visible_bits, assumed_align=16, leading_dim=2),
+            to_cute_tensor(full_bits, assumed_align=16, leading_dim=2),
+            to_cute_tensor(partial_counts, assumed_align=4, leading_dim=1),
+            to_cute_tensor(full_counts, assumed_align=4, leading_dim=1),
+            to_cute_tensor(interval_invalid, assumed_align=4, leading_dim=0),
+            to_cute_tensor(schedule_histogram, assumed_align=4, leading_dim=1),
+            to_cute_tensor(schedule_section_cost, assumed_align=8, leading_dim=0),
+            _to_cute_optional(bwd_visible_bits, leading_dim=2, assumed_align=16),
+            _to_cute_optional(bwd_full_bits, leading_dim=2, assumed_align=16),
+            _to_cute_optional(bwd_q_partial_counts, leading_dim=1),
+            _to_cute_optional(bwd_q_full_counts, leading_dim=1),
+            _to_cute_optional(bwd_partial_counts, leading_dim=1),
+            _to_cute_optional(bwd_full_counts, leading_dim=1),
+            stream,
+            options="--enable-tvm-ffi",
+        )
+        print(f"Compiled mask-plan workspace init in {time.perf_counter() - started_at:.1f}s")
+        _PLAN_WORKSPACE_INIT_COMPILE_CACHE[key] = compiled
+    return _PLAN_WORKSPACE_INIT_COMPILE_CACHE[key]
 
 
 def _compile_materialize(
@@ -367,14 +408,14 @@ def _compile_fixed_scan_header(
     dq_full_counts: torch.Tensor | None,
     dq_partial_offsets: torch.Tensor | None,
     dq_full_offsets: torch.Tensor | None,
-    error: torch.Tensor,
+    interval_invalid: torch.Tensor,
     header: torch.Tensor,
 ):
     """Compile the architecture-neutral fixed scan and allocation header."""
 
     build_backward = bwd_partial_counts is not None
     build_dq = dq_partial_counts is not None
-    key = ("arbitrary_plan_fixed_scan_header_v2", arch, build_backward, build_dq)
+    key = ("arbitrary_plan_fixed_scan_header_v3", arch, build_backward, build_dq)
     if key not in _FIXED_SCAN_HEADER_COMPILE_CACHE:
         kernel = FixedScanHeader(build_backward=build_backward, build_dq=build_dq)
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -401,7 +442,7 @@ def _compile_fixed_scan_header(
             _to_cute_optional(dq_full_counts, leading_dim=1),
             _to_cute_optional(dq_partial_offsets),
             _to_cute_optional(dq_full_offsets),
-            to_cute_tensor(error, assumed_align=4, leading_dim=0),
+            to_cute_tensor(interval_invalid, assumed_align=4, leading_dim=0),
             to_cute_tensor(header, assumed_align=8, leading_dim=0),
             Int32(1),
             Int32(1),
@@ -409,10 +450,7 @@ def _compile_fixed_scan_header(
             stream,
             options="--enable-tvm-ffi",
         )
-        print(
-            "Compiled mask-plan fixed scan/header in "
-            f"{time.perf_counter() - started_at:.1f}s"
-        )
+        print(f"Compiled mask-plan fixed scan/header in {time.perf_counter() - started_at:.1f}s")
         _FIXED_SCAN_HEADER_COMPILE_CACHE[key] = compiled
     return _FIXED_SCAN_HEADER_COMPILE_CACHE[key]
 
@@ -435,14 +473,14 @@ def _compile_varlen_scan_header(
     cu_total_bwd_m_blocks: torch.Tensor | None,
     cu_total_bwd_n_blocks: torch.Tensor | None,
     metadata_invalid: torch.Tensor,
-    error: torch.Tensor,
+    interval_invalid: torch.Tensor,
     header: torch.Tensor,
 ):
     """Compile the architecture-neutral Varlen scan and allocation header."""
 
     build_backward = bwd_partial_counts is not None
     build_dq = dq_partial_counts is not None
-    key = ("arbitrary_plan_varlen_scan_header_v1", arch, build_backward, build_dq)
+    key = ("arbitrary_plan_varlen_scan_header_v2", arch, build_backward, build_dq)
     if key not in _VARLEN_SCAN_HEADER_COMPILE_CACHE:
         kernel = VarlenScanHeader(build_backward=build_backward, build_dq=build_dq)
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -465,15 +503,12 @@ def _compile_varlen_scan_header(
             _to_cute_optional(cu_total_bwd_m_blocks),
             _to_cute_optional(cu_total_bwd_n_blocks),
             to_cute_tensor(metadata_invalid, assumed_align=1, leading_dim=0),
-            to_cute_tensor(error, assumed_align=4, leading_dim=0),
+            to_cute_tensor(interval_invalid, assumed_align=4, leading_dim=0),
             to_cute_tensor(header, assumed_align=8, leading_dim=0),
             stream,
             options="--enable-tvm-ffi",
         )
-        print(
-            "Compiled mask-plan Varlen scan/header in "
-            f"{time.perf_counter() - started_at:.1f}s"
-        )
+        print(f"Compiled mask-plan Varlen scan/header in {time.perf_counter() - started_at:.1f}s")
         _VARLEN_SCAN_HEADER_COMPILE_CACHE[key] = compiled
     return _VARLEN_SCAN_HEADER_COMPILE_CACHE[key]
 
@@ -534,10 +569,7 @@ def _compile_varlen_geometry(
             stream,
             options="--enable-tvm-ffi",
         )
-        print(
-            "Compiled mask-plan Varlen geometry in "
-            f"{time.perf_counter() - started_at:.1f}s"
-        )
+        print(f"Compiled mask-plan Varlen geometry in {time.perf_counter() - started_at:.1f}s")
         _VARLEN_GEOMETRY_COMPILE_CACHE[key] = compiled
     return _VARLEN_GEOMETRY_COMPILE_CACHE[key]
 
@@ -608,8 +640,7 @@ def _compile_varlen_compact_metadata(
             options="--enable-tvm-ffi",
         )
         print(
-            "Compiled mask-plan Varlen compact metadata in "
-            f"{time.perf_counter() - started_at:.1f}s"
+            f"Compiled mask-plan Varlen compact metadata in {time.perf_counter() - started_at:.1f}s"
         )
         _VARLEN_COMPACT_METADATA_COMPILE_CACHE[key] = compiled
     return _VARLEN_COMPACT_METADATA_COMPILE_CACHE[key]
@@ -681,7 +712,7 @@ def _compile_forward_schedule(
             stream,
             options="--enable-tvm-ffi",
         )
-        print("Compiled mask-plan forward schedule in " f"{time.perf_counter() - started_at:.1f}s")
+        print(f"Compiled mask-plan forward schedule in {time.perf_counter() - started_at:.1f}s")
         _FWD_SCHEDULE_COMPILE_CACHE[key] = compiled
     return _FWD_SCHEDULE_COMPILE_CACHE[key]
 
@@ -740,8 +771,7 @@ def _compile_forward_schedule_order(
             options="--enable-tvm-ffi",
         )
         print(
-            "Compiled mask-plan forward schedule order in "
-            f"{time.perf_counter() - started_at:.1f}s"
+            f"Compiled mask-plan forward schedule order in {time.perf_counter() - started_at:.1f}s"
         )
         _FWD_SCHEDULE_ORDER_COMPILE_CACHE[key] = compiled
     return _FWD_SCHEDULE_ORDER_COMPILE_CACHE[key]
@@ -768,6 +798,8 @@ def _build_forward_schedule(
     cu_seqlens_q: torch.Tensor | None,
     cu_seqlens_k: torch.Tensor | None,
     cu_total_m_blocks: torch.Tensor | None,
+    schedule_histogram: torch.Tensor,
+    schedule_section_cost: torch.Tensor,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Build the immutable architecture-neutral FWD work queue owned by a plan."""
 
@@ -878,12 +910,6 @@ def _build_forward_schedule(
         Int32(element_size),
     )
     num_sections = batch_size * config.num_kv_heads
-    histogram = torch.zeros(
-        (num_sections, max_task_cost + 1),
-        dtype=torch.int32,
-        device=device,
-    )
-    section_cost = torch.zeros((num_sections,), dtype=torch.int64, device=device)
     section_order = torch.empty((num_sections,), dtype=torch.int32, device=device)
     positive_base = torch.empty_like(section_order)
     zero_base = torch.empty_like(section_order)
@@ -893,8 +919,8 @@ def _build_forward_schedule(
         work_desc,
         task_cost,
         section_id,
-        histogram,
-        section_cost,
+        schedule_histogram,
+        schedule_section_cost,
         section_order,
         positive_base,
         zero_base,
@@ -905,8 +931,8 @@ def _build_forward_schedule(
         work_desc,
         task_cost,
         section_id,
-        histogram,
-        section_cost,
+        schedule_histogram,
+        schedule_section_cost,
         section_order,
         positive_base,
         zero_base,
@@ -1252,9 +1278,7 @@ def _build_packed_mask_plan(
             raise NotImplementedError("arbitrary backward currently supports SM100/SM103 only")
         use_hd256_consumer = q.shape[-1] == 256 and v.shape[-1] == 256
         if use_hd256_consumer and _fwd_variant == "qstage2_1cta":
-            raise NotImplementedError(
-                "dedicated SM100 D256 forward does not support qstage2"
-            )
+            raise NotImplementedError("dedicated SM100 D256 forward does not support qstage2")
         if use_hd256_consumer:
             fwd_config = resolve_sm100_hd256_fwd_consumer_config(
                 arch=arch,
@@ -1282,9 +1306,7 @@ def _build_packed_mask_plan(
                     use_2cta_instrs=True,
                     deterministic=False,
                 )
-        generic_fwd_variant = (
-            _fwd_variant or _SM100_GENERIC_DEFAULT_FWD_VARIANT
-        )
+        generic_fwd_variant = _fwd_variant or _SM100_GENERIC_DEFAULT_FWD_VARIANT
         if not use_hd256_consumer and generic_fwd_variant == "qstage1_1cta":
             fwd_config = resolve_sm100_fwd_qstage1_1cta_consumer_config(
                 arch=arch,
@@ -1375,7 +1397,9 @@ def _build_packed_mask_plan(
             bwd_config,
             (_ResolvedSm100BwdConsumerConfig, _ResolvedSm100Hd256DkdvConsumerConfig),
         )
-        else bwd_config.tile_n if bwd_config is not None else 0
+        else bwd_config.tile_n
+        if bwd_config is not None
+        else 0
     )
     bwd_max_n_blocks = (
         math.ceil(metadata["max_seqlen_k"] / bwd_sparse_tile_n) if bwd_config is not None else 0
@@ -1383,12 +1407,6 @@ def _build_packed_mask_plan(
     bwd_upper_total_m_blocks = metadata["batch_size"] * bwd_max_m_blocks
     bwd_upper_total_n_blocks = metadata["batch_size"] * bwd_max_n_blocks
     bwd_num_words = max(1, math.ceil(bwd_max_n_blocks / 32))
-    if isinstance(bwd_config, _ResolvedSm90BwdConsumerConfig) and (
-        bwd_max_m_blocks > _DQ_ORDER_COMPONENT_LIMIT or bwd_max_n_blocks > _DQ_ORDER_COMPONENT_LIMIT
-    ):
-        raise ValueError(
-            "SM90 arbitrary backward supports at most 65536 local Q/K blocks per sample"
-        )
 
     cu_total_m_blocks = None
     cu_total_fwd_n_blocks = None
@@ -1426,9 +1444,7 @@ def _build_packed_mask_plan(
                 rounding_mode="floor",
             ).to(torch.int32)
             cu_total_fwd_n_blocks[0] = 0
-            cu_total_fwd_n_blocks[1:] = torch.cumsum(
-                fwd_n_counts, dim=0, dtype=torch.int32
-            )
+            cu_total_fwd_n_blocks[1:] = torch.cumsum(fwd_n_counts, dim=0, dtype=torch.int32)
             if bwd_config is not None:
                 assert cu_total_bwd_m_blocks is not None
                 assert cu_total_bwd_n_blocks is not None
@@ -1444,12 +1460,8 @@ def _build_packed_mask_plan(
                 ).to(torch.int32)
                 cu_total_bwd_m_blocks[0] = 0
                 cu_total_bwd_n_blocks[0] = 0
-                cu_total_bwd_m_blocks[1:] = torch.cumsum(
-                    bwd_m_counts, dim=0, dtype=torch.int32
-                )
-                cu_total_bwd_n_blocks[1:] = torch.cumsum(
-                    bwd_n_counts, dim=0, dtype=torch.int32
-                )
+                cu_total_bwd_m_blocks[1:] = torch.cumsum(bwd_m_counts, dim=0, dtype=torch.int32)
+                cu_total_bwd_n_blocks[1:] = torch.cumsum(bwd_n_counts, dim=0, dtype=torch.int32)
             metadata_invalid[0] = (
                 (cu_seqlens_q[0] != 0)
                 | (cu_seqlens_k[0] != 0)
@@ -1490,19 +1502,30 @@ def _build_packed_mask_plan(
                 Int32(metadata["max_seqlen_k"]),
             )
 
-    visible_bits = torch.zeros(
+    visible_bits = torch.empty(
         (metadata["hmask"], fwd_upper_total_m_blocks, fwd_num_words),
         dtype=torch.uint32,
         device=device,
     )
-    full_bits = torch.zeros_like(visible_bits)
-    partial_counts_tmp = torch.zeros(
+    full_bits = torch.empty_like(visible_bits)
+    partial_counts_tmp = torch.empty(
         (metadata["hmask"], fwd_upper_total_m_blocks),
         dtype=torch.int32,
         device=device,
     )
-    full_counts_tmp = torch.zeros_like(partial_counts_tmp)
-    error = torch.zeros((1,), dtype=torch.uint32, device=device)
+    full_counts_tmp = torch.empty_like(partial_counts_tmp)
+    interval_invalid = torch.empty((1,), dtype=torch.uint32, device=device)
+    num_schedule_sections = metadata["batch_size"] * fwd_config.num_kv_heads
+    schedule_histogram = torch.empty(
+        (num_schedule_sections, fwd_max_n_blocks + 1),
+        dtype=torch.int32,
+        device=device,
+    )
+    schedule_section_cost = torch.empty(
+        (num_schedule_sections,),
+        dtype=torch.int64,
+        device=device,
+    )
 
     bwd_visible_bits = None
     bwd_full_bits = None
@@ -1511,24 +1534,57 @@ def _build_packed_mask_plan(
     bwd_partial_counts_tmp = None
     bwd_full_counts_tmp = None
     if bwd_config is not None:
-        bwd_visible_bits = torch.zeros(
+        bwd_visible_bits = torch.empty(
             (metadata["hmask"], bwd_upper_total_m_blocks, bwd_num_words),
             dtype=torch.uint32,
             device=device,
         )
-        bwd_full_bits = torch.zeros_like(bwd_visible_bits)
-        bwd_q_partial_counts_tmp = torch.zeros(
+        bwd_full_bits = torch.empty_like(bwd_visible_bits)
+        bwd_q_partial_counts_tmp = torch.empty(
             (metadata["hmask"], bwd_upper_total_m_blocks),
             dtype=torch.int32,
             device=device,
         )
-        bwd_q_full_counts_tmp = torch.zeros_like(bwd_q_partial_counts_tmp)
-        bwd_partial_counts_tmp = torch.zeros(
+        bwd_q_full_counts_tmp = torch.empty_like(bwd_q_partial_counts_tmp)
+        bwd_partial_counts_tmp = torch.empty(
             (metadata["hmask"], bwd_upper_total_n_blocks),
             dtype=torch.int32,
             device=device,
         )
-        bwd_full_counts_tmp = torch.zeros_like(bwd_partial_counts_tmp)
+        bwd_full_counts_tmp = torch.empty_like(bwd_partial_counts_tmp)
+
+    if not is_fake_mode():
+        workspace_init = _compile_plan_workspace_init(
+            arch,
+            visible_bits,
+            full_bits,
+            partial_counts_tmp,
+            full_counts_tmp,
+            interval_invalid,
+            schedule_histogram,
+            schedule_section_cost,
+            bwd_visible_bits,
+            bwd_full_bits,
+            bwd_q_partial_counts_tmp,
+            bwd_q_full_counts_tmp,
+            bwd_partial_counts_tmp,
+            bwd_full_counts_tmp,
+        )
+        workspace_init(
+            visible_bits,
+            full_bits,
+            partial_counts_tmp,
+            full_counts_tmp,
+            interval_invalid,
+            schedule_histogram,
+            schedule_section_cost,
+            bwd_visible_bits,
+            bwd_full_bits,
+            bwd_q_partial_counts_tmp,
+            bwd_q_full_counts_tmp,
+            bwd_partial_counts_tmp,
+            bwd_full_counts_tmp,
+        )
 
     if fwd_upper_total_m_blocks > 0 and fwd_max_n_blocks > 0:
         classify = _compile_classify(
@@ -1538,7 +1594,7 @@ def _build_packed_mask_plan(
             full_bits,
             partial_counts_tmp,
             full_counts_tmp,
-            error,
+            interval_invalid,
             cu_seqlens_q,
             cu_seqlens_k,
             cu_total_m_blocks,
@@ -1550,7 +1606,7 @@ def _build_packed_mask_plan(
                 full_bits,
                 partial_counts_tmp,
                 full_counts_tmp,
-                error,
+                interval_invalid,
                 cu_seqlens_q,
                 cu_seqlens_k,
                 cu_total_m_blocks,
@@ -1577,7 +1633,7 @@ def _build_packed_mask_plan(
             bwd_full_bits,
             bwd_q_partial_counts_tmp,
             bwd_q_full_counts_tmp,
-            error,
+            interval_invalid,
             cu_seqlens_q,
             cu_seqlens_k,
             cu_total_bwd_m_blocks,
@@ -1589,7 +1645,7 @@ def _build_packed_mask_plan(
                 bwd_full_bits,
                 bwd_q_partial_counts_tmp,
                 bwd_q_full_counts_tmp,
-                error,
+                interval_invalid,
                 cu_seqlens_q,
                 cu_seqlens_k,
                 cu_total_bwd_m_blocks,
@@ -1675,7 +1731,7 @@ def _build_packed_mask_plan(
                 device=device,
             )
             fixed_dq_full_offsets = torch.empty_like(fixed_dq_partial_offsets)
-        header = torch.empty((8,), dtype=torch.int64, device=device)
+        header = torch.empty((9,), dtype=torch.int64, device=device)
         fixed_scan_header = _compile_fixed_scan_header(
             arch,
             partial_counts_tmp,
@@ -1690,7 +1746,7 @@ def _build_packed_mask_plan(
             bwd_q_full_counts_tmp if dq_config is not None else None,
             fixed_dq_partial_offsets,
             fixed_dq_full_offsets,
-            error,
+            interval_invalid,
             header,
         )
         fixed_scan_header(
@@ -1706,7 +1762,7 @@ def _build_packed_mask_plan(
             bwd_q_full_counts_tmp if dq_config is not None else None,
             fixed_dq_partial_offsets,
             fixed_dq_full_offsets,
-            error,
+            interval_invalid,
             header,
             Int32(fwd_upper_total_m_blocks),
             Int32(bwd_upper_total_m_blocks),
@@ -1720,12 +1776,11 @@ def _build_packed_mask_plan(
             bwd_total_n_blocks,
             bwd_partial_nnz,
             bwd_full_nnz,
-            error_value,
+            interval_invalid_value,
+            seqlens_invalid_value,
         ) = (int(value) for value in header.cpu().tolist())
     elif use_varlen_scan_header:
-        partial_scan = torch.empty(
-            (partial_counts_tmp.numel(),), dtype=torch.int64, device=device
-        )
+        partial_scan = torch.empty((partial_counts_tmp.numel(),), dtype=torch.int64, device=device)
         full_scan = torch.empty_like(partial_scan)
         if bwd_config is not None:
             assert bwd_partial_counts_tmp is not None
@@ -1743,7 +1798,7 @@ def _build_packed_mask_plan(
             dq_full_scan = torch.empty_like(dq_partial_scan)
         assert cu_total_m_blocks is not None
         assert metadata_invalid is not None
-        header = torch.empty((8,), dtype=torch.int64, device=device)
+        header = torch.empty((9,), dtype=torch.int64, device=device)
         varlen_scan_header = _compile_varlen_scan_header(
             arch,
             partial_counts_tmp,
@@ -1762,7 +1817,7 @@ def _build_packed_mask_plan(
             cu_total_bwd_m_blocks,
             cu_total_bwd_n_blocks,
             metadata_invalid,
-            error,
+            interval_invalid,
             header,
         )
         varlen_scan_header(
@@ -1782,7 +1837,7 @@ def _build_packed_mask_plan(
             cu_total_bwd_m_blocks,
             cu_total_bwd_n_blocks,
             metadata_invalid,
-            error,
+            interval_invalid,
             header,
         )
         (
@@ -1793,7 +1848,8 @@ def _build_packed_mask_plan(
             bwd_total_n_blocks,
             bwd_partial_nnz,
             bwd_full_nnz,
-            error_value,
+            interval_invalid_value,
+            seqlens_invalid_value,
         ) = (int(value) for value in header.cpu().tolist())
     else:
         partial_scan = torch.cumsum(partial_counts_tmp.reshape(-1), dim=0, dtype=torch.int64)
@@ -1850,17 +1906,15 @@ def _build_packed_mask_plan(
         bwd_full_total = (
             bwd_full_scan[-1] if bwd_full_scan is not None and bwd_full_scan.numel() else zero
         )
-        interval_error = error[0].to(torch.int64)
+        interval_invalid_header = interval_invalid[0].to(torch.int64)
         if fwd_upper_total_m_blocks > 0 and fwd_max_n_blocks == 0:
-            interval_error = interval_error | (
-                torch.any(arbitrary_func != 0).to(torch.int64)
-                * _ERROR_INVALID_INTERVAL
+            interval_invalid_header = torch.maximum(
+                interval_invalid_header,
+                torch.any(arbitrary_func != 0).to(torch.int64),
             )
-        combined_error = interval_error
-        if metadata_invalid is not None:
-            combined_error = combined_error | (
-                metadata_invalid[0].to(torch.int64) * _ERROR_INVALID_SEQLENS
-            )
+        seqlens_invalid_header = (
+            metadata_invalid[0].to(torch.int64) if metadata_invalid is not None else zero
+        )
         header = torch.stack(
             (
                 total_m_tensor,
@@ -1870,7 +1924,8 @@ def _build_packed_mask_plan(
                 bwd_total_n_tensor,
                 bwd_partial_total,
                 bwd_full_total,
-                combined_error,
+                interval_invalid_header,
+                seqlens_invalid_header,
             )
         )
         (
@@ -1881,15 +1936,16 @@ def _build_packed_mask_plan(
             bwd_total_n_blocks,
             bwd_partial_nnz,
             bwd_full_nnz,
-            error_value,
+            interval_invalid_value,
+            seqlens_invalid_value,
         ) = (int(value) for value in header.cpu().tolist())
     if not is_fake_mode():
-        if error_value & _ERROR_INVALID_SEQLENS:
+        if seqlens_invalid_value:
             raise ValueError(
                 "cu_seqlens_q/k must start at zero, be nondecreasing, end at "
                 "total_q/total_k, and respect max_seqlen_q/k"
             )
-        if error_value & _ERROR_INVALID_INTERVAL:
+        if interval_invalid_value:
             raise ValueError(
                 "mask_func endpoints must lie in each row's local-K range and be "
                 "nondecreasing for every Q row"
@@ -2294,6 +2350,8 @@ def _build_packed_mask_plan(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             cu_total_m_blocks=cu_total_m_blocks,
+            schedule_histogram=schedule_histogram,
+            schedule_section_cost=schedule_section_cost,
         )
     plan_rows = metadata["hmask"] * total_m_blocks
     # Full and partial blocks have equal scheduling cost.  The overlapped

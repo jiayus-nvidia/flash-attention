@@ -27,12 +27,6 @@ from flex_attn.plan.topology import (
     _consumer_plan_signature,
 )
 
-_PLAN_THREADS = 256
-_ERROR_INVALID_INTERVAL = 1
-_ERROR_INVALID_SEQLENS = 2
-_DQ_ORDER_COMPONENT_BITS = 16
-_DQ_ORDER_COMPONENT_LIMIT = 1 << _DQ_ORDER_COMPONENT_BITS
-
 
 @dsl_user_op
 def _shr_u32(val: Uint32, shift: Uint32, *, loc=None, ip=None) -> Uint32:
@@ -86,6 +80,8 @@ class _ArbitraryPlanCommonSm90:
         self.payload_valid_words = config.payload_valid_words
         self.payload_padded_words = config.payload_padded_words
         self.is_varlen = config.is_varlen
+        self.num_warps = 8
+        self.num_threads = cute.arch.WARP_SIZE * self.num_warps
 
     @cute.jit
     def _sample_info(
@@ -246,8 +242,7 @@ class _ArbitraryPlanK2QCommonSm90(_ArbitraryPlanCommonSm90):
         )
         self.spt = config.spt
         dq_order_format = _consumer_plan_signature(config).dq_order_format
-        self.dq_order_rank_only = dq_order_format == "rank_only"
-        self.dq_order_none = dq_order_format == "none"
+        self.store_dq_order = dq_order_format != "none"
 
     @cute.jit
     def _sample_info_k(

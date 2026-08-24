@@ -287,8 +287,10 @@ writes the sample-local Q block indices that were counted in Section 4.4, again 
 partial and full CSR arrays.
 
 The K2Q payload is generated for the backward consumer's accumulator layout. Generic backward
-may also materialize `dq_write_order` and `dq_write_order_full`; these arrays define a legal order
-for parallel dQ accumulation and do not change mask visibility.
+may also materialize `dq_write_order` and `dq_write_order_full`. Each entry stores only the dQ
+write rank and remains parallel to the corresponding block-index array; the Q block index is read
+from `mask_block_idx` or `full_block_idx`. This metadata defines a legal order for parallel dQ
+accumulation and does not change mask visibility.
 
 If a dedicated dQ kernel requires its own Q-major layout, the plan may additionally contain a
 separate Q2K view materialized for that consumer.

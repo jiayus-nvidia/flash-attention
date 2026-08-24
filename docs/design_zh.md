@@ -278,8 +278,10 @@ K2Q materializer 完成 sparse transpose 的 write 阶段。对于每个 K-major
 4.4 节已经统计过的 sample-local Q block indices，并继续使用独立的 partial/full CSR。
 
 K2Q payload 按 backward consumer 的 accumulator layout 生成。generic backward 还可以
-生成 `dq_write_order` 和 `dq_write_order_full`；它们只定义并行 dQ accumulation 的合法
-顺序，不改变 mask visibility。
+生成 `dq_write_order` 和 `dq_write_order_full`。每个 entry 只保存 dQ write rank，并与
+对应的 block-index array 平行；Q block index 直接从 `mask_block_idx` 或
+`full_block_idx` 读取。这些 metadata 只定义并行 dQ accumulation 的合法顺序，不改变
+mask visibility。
 
 如果 dedicated dQ kernel 需要独立的 Q-major layout，plan 还可以额外保存一份为该
 consumer materialize 的 Q2K view。

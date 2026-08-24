@@ -12,8 +12,6 @@ import cuda.bindings.driver as cuda
 
 from flex_attn.plan.kernels.common import (
     _ArbitraryPlanCommonSm90,
-    _ERROR_INVALID_INTERVAL,
-    _PLAN_THREADS,
     _shr_u32,
 )
 
@@ -29,7 +27,7 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
         mFullBits: cute.Tensor,
         mPartialCounts: cute.Tensor,
         mFullCounts: cute.Tensor,
-        mError: cute.Tensor,
+        mIntervalInvalid: cute.Tensor,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mCuTotalMBlocks: Optional[cute.Tensor],
@@ -51,7 +49,7 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
             mFullBits,
             mPartialCounts,
             mFullCounts,
-            mError,
+            mIntervalInvalid,
             mCuSeqlensQ,
             mCuSeqlensK,
             mCuTotalMBlocks,
@@ -65,15 +63,15 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
             nfunc,
         ).launch(
             grid=(upper_total_m_blocks, hmask, 1),
-            block=(_PLAN_THREADS, 1, 1),
+            block=(self.num_threads, 1, 1),
             stream=stream,
         )
 
     @cute.jit
-    def _mark_error(self, mError: cute.Tensor, value: Uint32) -> None:
+    def _mark_interval_invalid(self, mIntervalInvalid: cute.Tensor) -> None:
         cute.arch.atomic_or(
-            mError.iterator.llvm_ptr,
-            value,
+            mIntervalInvalid.iterator.llvm_ptr,
+            Uint32(1),
             sem="relaxed",
             scope="gpu",
         )
@@ -116,7 +114,7 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
         mFullBits: cute.Tensor,
         mPartialCounts: cute.Tensor,
         mFullCounts: cute.Tensor,
-        mError: cute.Tensor,
+        mIntervalInvalid: cute.Tensor,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mCuTotalMBlocks: Optional[cute.Tensor],
@@ -188,7 +186,7 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
                         | (endpoint_begin < previous_end)
                     )
                     if invalid:
-                        self._mark_error(mError, Uint32(_ERROR_INVALID_INTERVAL))
+                        self._mark_interval_invalid(mIntervalInvalid)
                     previous_end = endpoint_end
                     if local_end > local_begin:
                         block_begin = local_begin // Int32(self.tile_n)
@@ -200,17 +198,17 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
                             block_begin,
                             block_end,
                         )
-            logical_row += Int32(_PLAN_THREADS)
+            logical_row += Int32(self.num_threads)
 
         smem = cutlass_utils.SmemAllocator()
         sWarpPartial = smem.allocate_tensor(
             element_type=Int32,
-            layout=cute.make_layout((8,)),
+            layout=cute.make_layout((self.num_warps,)),
             byte_alignment=16,
         )
         sWarpFull = smem.allocate_tensor(
             element_type=Int32,
-            layout=cute.make_layout((8,)),
+            layout=cute.make_layout((self.num_warps,)),
             byte_alignment=16,
         )
         cute.arch.sync_threads()
@@ -283,7 +281,7 @@ class _ArbitraryPlanClassifySm90(_ArbitraryPlanCommonSm90):
         if tidx == Int32(0) and valid_m_block:
             partial_count = Int32(0)
             full_count = Int32(0)
-            for warp in cutlass.range_constexpr(8):
+            for warp in cutlass.range_constexpr(self.num_warps):
                 partial_count += sWarpPartial[warp]
                 full_count += sWarpFull[warp]
             mPartialCounts[mask_head, compact_outer_row] = partial_count

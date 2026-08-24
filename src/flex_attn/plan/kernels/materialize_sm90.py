@@ -16,7 +16,6 @@ from flex_attn.kernels.sm90.forward_config import (
     make_sm90_fwd_tiled_mma_qk,
 )
 from flex_attn.plan.kernels.common import (
-    _PLAN_THREADS,
     _shr_u32,
 )
 from flex_attn.plan.kernels.compact import (
@@ -80,7 +79,7 @@ class _ArbitraryPlanMaterializeSm90(_ArbitraryPlanQ2KCompact):
             max_n_blocks,
         ).launch(
             grid=(upper_total_m_blocks, hmask, 1),
-            block=(_PLAN_THREADS, 1, 1),
+            block=(self.num_threads, 1, 1),
             stream=stream,
         )
         if mPartialMasks.shape[0] > 0:
@@ -101,7 +100,7 @@ class _ArbitraryPlanMaterializeSm90(_ArbitraryPlanQ2KCompact):
                 nfunc,
             ).launch(
                 grid=(mPartialMasks.shape[0], 1, 1),
-                block=(_PLAN_THREADS, 1, 1),
+                block=(self.num_threads, 1, 1),
                 stream=stream,
             )
 
@@ -244,7 +243,7 @@ class _ArbitraryPlanMaterializeSm90(_ArbitraryPlanQ2KCompact):
             )
             gMask = cute.make_tensor(mask_ptr, (self.payload_padded_words,))
             cute.autovec_copy(rMask, gMask)
-            payload_group_idx += Int32(_PLAN_THREADS)
+            payload_group_idx += Int32(self.num_threads)
 
 
 class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCompact):
@@ -316,7 +315,7 @@ class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCompact):
             max_n_blocks,
         ).launch(
             grid=(upper_total_n_blocks, hmask, 1),
-            block=(_PLAN_THREADS, 1, 1),
+            block=(self.num_threads, 1, 1),
             stream=stream,
         )
         if mPartialMasks.shape[0] > 0:
@@ -338,7 +337,7 @@ class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCompact):
                 nfunc,
             ).launch(
                 grid=(mPartialMasks.shape[0], 1, 1),
-                block=(_PLAN_THREADS, 1, 1),
+                block=(self.num_threads, 1, 1),
                 stream=stream,
             )
 
@@ -485,4 +484,4 @@ class _ArbitraryPlanK2QMaterializeSm90(_ArbitraryPlanK2QCompact):
                 )
                 gMask = cute.make_tensor(mask_ptr, (self.payload_padded_words,))
                 cute.autovec_copy(rMask, gMask)
-            consumer_tidx += Int32(_PLAN_THREADS)
+            consumer_tidx += Int32(self.num_threads)

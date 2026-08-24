@@ -28,7 +28,6 @@ from flex_attn.kernels.sm100.fwd.forward_config_hd256 import (
     _ResolvedSm100Hd256FwdConsumerConfig,
 )
 from flex_attn.plan.kernels.common import (
-    _PLAN_THREADS,
     _shr_u32,
 )
 from flex_attn.plan.kernels.materialize_sm90 import (
@@ -115,7 +114,7 @@ class _ArbitraryPlanMaterializeSm100(_ArbitraryPlanMaterializeSm90):
             max_n_blocks,
         ).launch(
             grid=(upper_total_m_blocks, hmask, 1),
-            block=(_PLAN_THREADS, 1, 1),
+            block=(self.num_threads, 1, 1),
             stream=stream,
         )
         if mPartialMasks.shape[0] > 0:
@@ -135,7 +134,7 @@ class _ArbitraryPlanMaterializeSm100(_ArbitraryPlanMaterializeSm90):
                 nfunc,
             ).launch(
                 grid=(mPartialMasks.shape[0], 1, 1),
-                block=(_PLAN_THREADS, 1, 1),
+                block=(self.num_threads, 1, 1),
                 stream=stream,
             )
 
@@ -321,7 +320,7 @@ class _ArbitraryPlanK2QMaterializeSm100(_ArbitraryPlanK2QMaterializeSm90):
             max_n_blocks,
         ).launch(
             grid=(upper_total_n_blocks, hmask, 1),
-            block=(_PLAN_THREADS, 1, 1),
+            block=(self.num_threads, 1, 1),
             stream=stream,
         )
         if mPartialMasks.shape[0] > 0:
@@ -343,7 +342,7 @@ class _ArbitraryPlanK2QMaterializeSm100(_ArbitraryPlanK2QMaterializeSm90):
                 nfunc,
             ).launch(
                 grid=(mPartialMasks.shape[0], 1, 1),
-                block=(_PLAN_THREADS, 1, 1),
+                block=(self.num_threads, 1, 1),
                 stream=stream,
             )
 

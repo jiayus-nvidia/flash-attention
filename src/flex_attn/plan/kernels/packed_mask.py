@@ -2514,8 +2514,6 @@ def _store_one_dQaccum_sm90(
     mdQ_semaphore_cur: Optional[cute.Tensor] = None,
     warp_local_tidx: Int32 = Int32(0),
     lock_value: Int32 = Int32(0),
-    prefetch_dq_order: Optional[Callable] = None,
-    release_dq_empty: cutlass.Constexpr[bool] = True,
 ):
     """Store dQaccum for a single m_block."""
     if const_expr(accum_row_major and not deterministic):
@@ -2523,20 +2521,13 @@ def _store_one_dQaccum_sm90(
         # group. Do not release any writer for the next iteration until all
         # previous chunks have finished reading shared memory.
         cute.arch.cp_async_bulk_wait_group(0, read=True)
-    if const_expr(release_dq_empty):
-        for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
-            if const_expr(not deterministic and not accum_row_major):
-                cute.arch.cp_async_bulk_wait_group(
-                    num_dQ_warp_groups - 1 - warp_group_idx, read=True
-                )
-            cute.arch.barrier_arrive(
-                barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
-                number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
-            )
-
-    next_dq_order = Uint32(0)
-    if const_expr(prefetch_dq_order is not None):
-        next_dq_order = Uint32(prefetch_dq_order())
+    for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
+        if const_expr(not deterministic and not accum_row_major):
+            cute.arch.cp_async_bulk_wait_group(num_dQ_warp_groups - 1 - warp_group_idx, read=True)
+        cute.arch.barrier_arrive(
+            barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
+            number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
+        )
 
     if const_expr(deterministic):
         assert mdQ_semaphore_cur is not None
@@ -2589,93 +2580,6 @@ def _store_one_dQaccum_sm90(
             0,  # flag_offset
             1,
         )
-    return next_dq_order
-
-
-@cute.jit
-def _load_dq_order_entry(dq_write_order: cute.Tensor, index: Int32):
-    """Load one packed deterministic dQ entry for software prefetching."""
-    return Uint32(dq_write_order[index])
-
-
-@cute.jit
-def _store_one_dQaccum_from_packed_order_sm90(
-    packed_order: Uint32,
-    sdQaccum: cute.Tensor,
-    gdQaccum: cute.Tensor,
-    num_dQ_warp_groups: cutlass.Constexpr,
-    num_threads_per_warp_group: cutlass.Constexpr,
-    tma_copy_bytes_dQ,
-    mdQ_semaphore_cur: cute.Tensor,
-    warp_local_tidx: Int32,
-    accum_row_major: cutlass.Constexpr[bool],
-    prefetch_dq_order: Optional[Callable] = None,
-    release_dq_empty: cutlass.Constexpr[bool] = True,
-):
-    """Store one deterministic dQ tile from a packed (m_block, rank) entry."""
-    m_block = Int32(packed_order & Uint32(0xFFFF))
-    lock_value = Int32(packed_order >> Uint32(16))
-    return _store_one_dQaccum_sm90(
-        m_block,
-        sdQaccum,
-        gdQaccum,
-        num_dQ_warp_groups,
-        num_threads_per_warp_group,
-        tma_copy_bytes_dQ,
-        accum_row_major=accum_row_major,
-        deterministic=True,
-        mdQ_semaphore_cur=mdQ_semaphore_cur,
-        warp_local_tidx=warp_local_tidx,
-        lock_value=lock_value,
-        prefetch_dq_order=prefetch_dq_order,
-        release_dq_empty=release_dq_empty,
-    )
-
-
-@cute.jit
-def _store_dQaccum_packed_order_sequence_sm90(
-    packed_order: Uint32,
-    dq_write_order: cute.Tensor,
-    count: Int32,
-    sdQaccum: cute.Tensor,
-    gdQaccum: cute.Tensor,
-    num_dQ_warp_groups: cutlass.Constexpr,
-    num_threads_per_warp_group: cutlass.Constexpr,
-    tma_copy_bytes_dQ,
-    mdQ_semaphore_cur: cute.Tensor,
-    warp_local_tidx: Int32,
-    accum_row_major: cutlass.Constexpr[bool],
-    start_idx: Int32 = Int32(0),
-):
-    """Store a non-empty packed write-order sequence with pipelined loads."""
-    for sparse_idx in cutlass.range(start_idx, count - Int32(1), unroll=1):
-        packed_order = _store_one_dQaccum_from_packed_order_sm90(
-            packed_order,
-            sdQaccum,
-            gdQaccum,
-            num_dQ_warp_groups,
-            num_threads_per_warp_group,
-            tma_copy_bytes_dQ,
-            mdQ_semaphore_cur,
-            warp_local_tidx,
-            accum_row_major,
-            prefetch_dq_order=partial(
-                _load_dq_order_entry,
-                dq_write_order,
-                sparse_idx + Int32(1),
-            ),
-        )
-    _store_one_dQaccum_from_packed_order_sm90(
-        packed_order,
-        sdQaccum,
-        gdQaccum,
-        num_dQ_warp_groups,
-        num_threads_per_warp_group,
-        tma_copy_bytes_dQ,
-        mdQ_semaphore_cur,
-        warp_local_tidx,
-        accum_row_major,
-    )
 
 
 @cute.jit
@@ -2727,201 +2631,12 @@ def dQaccum_store_block_sparse_bwd_sm90(
         )
         assert curr_dq_write_order is not None
 
-    if const_expr(deterministic and subtile_factor == 1):
-        # Pipeline the packed write-order load behind dQEmpty release.  This
-        # keeps metadata latency off the MMA warp group's critical path while
-        # preserving the stable K2Q rank order required by deterministic mode.
-        assert mdQ_semaphore_cur is not None
-        if curr_q_cnt + curr_full_cnt > Int32(0):
-            for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
-                cute.arch.barrier_arrive(
-                    barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
-                    number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
-                )
-        if curr_q_cnt > Int32(0):
-            packed_order = _load_dq_order_entry(curr_dq_write_order, Int32(0))
-            if curr_q_cnt > Int32(1):
-                packed_order = _store_one_dQaccum_from_packed_order_sm90(
-                    packed_order,
-                    sdQaccum,
-                    gdQaccum,
-                    num_dQ_warp_groups,
-                    num_threads_per_warp_group,
-                    tma_copy_bytes_dQ,
-                    mdQ_semaphore_cur,
-                    warp_local_tidx,
-                    accum_row_major,
-                    prefetch_dq_order=partial(
-                        _load_dq_order_entry,
-                        curr_dq_write_order,
-                        Int32(1),
-                    ),
-                    release_dq_empty=False,
-                )
-                for sparse_idx in cutlass.range(Int32(1), curr_q_cnt - Int32(1), unroll=1):
-                    packed_order = _store_one_dQaccum_from_packed_order_sm90(
-                        packed_order,
-                        sdQaccum,
-                        gdQaccum,
-                        num_dQ_warp_groups,
-                        num_threads_per_warp_group,
-                        tma_copy_bytes_dQ,
-                        mdQ_semaphore_cur,
-                        warp_local_tidx,
-                        accum_row_major,
-                        prefetch_dq_order=partial(
-                            _load_dq_order_entry,
-                            curr_dq_write_order,
-                            sparse_idx + Int32(1),
-                        ),
-                    )
-                if curr_full_cnt > Int32(0):
-                    assert curr_dq_write_order_full is not None
-                    packed_order_full = _store_one_dQaccum_from_packed_order_sm90(
-                        packed_order,
-                        sdQaccum,
-                        gdQaccum,
-                        num_dQ_warp_groups,
-                        num_threads_per_warp_group,
-                        tma_copy_bytes_dQ,
-                        mdQ_semaphore_cur,
-                        warp_local_tidx,
-                        accum_row_major,
-                        prefetch_dq_order=partial(
-                            _load_dq_order_entry,
-                            curr_dq_write_order_full,
-                            Int32(0),
-                        ),
-                    )
-                    _store_dQaccum_packed_order_sequence_sm90(
-                        packed_order_full,
-                        curr_dq_write_order_full,
-                        curr_full_cnt,
-                        sdQaccum,
-                        gdQaccum,
-                        num_dQ_warp_groups,
-                        num_threads_per_warp_group,
-                        tma_copy_bytes_dQ,
-                        mdQ_semaphore_cur,
-                        warp_local_tidx,
-                        accum_row_major,
-                    )
-                else:
-                    _store_one_dQaccum_from_packed_order_sm90(
-                        packed_order,
-                        sdQaccum,
-                        gdQaccum,
-                        num_dQ_warp_groups,
-                        num_threads_per_warp_group,
-                        tma_copy_bytes_dQ,
-                        mdQ_semaphore_cur,
-                        warp_local_tidx,
-                        accum_row_major,
-                    )
-            else:
-                if curr_full_cnt > Int32(0):
-                    assert curr_dq_write_order_full is not None
-                    packed_order_full = _store_one_dQaccum_from_packed_order_sm90(
-                        packed_order,
-                        sdQaccum,
-                        gdQaccum,
-                        num_dQ_warp_groups,
-                        num_threads_per_warp_group,
-                        tma_copy_bytes_dQ,
-                        mdQ_semaphore_cur,
-                        warp_local_tidx,
-                        accum_row_major,
-                        prefetch_dq_order=partial(
-                            _load_dq_order_entry,
-                            curr_dq_write_order_full,
-                            Int32(0),
-                        ),
-                        release_dq_empty=False,
-                    )
-                    _store_dQaccum_packed_order_sequence_sm90(
-                        packed_order_full,
-                        curr_dq_write_order_full,
-                        curr_full_cnt,
-                        sdQaccum,
-                        gdQaccum,
-                        num_dQ_warp_groups,
-                        num_threads_per_warp_group,
-                        tma_copy_bytes_dQ,
-                        mdQ_semaphore_cur,
-                        warp_local_tidx,
-                        accum_row_major,
-                    )
-                else:
-                    _store_one_dQaccum_from_packed_order_sm90(
-                        packed_order,
-                        sdQaccum,
-                        gdQaccum,
-                        num_dQ_warp_groups,
-                        num_threads_per_warp_group,
-                        tma_copy_bytes_dQ,
-                        mdQ_semaphore_cur,
-                        warp_local_tidx,
-                        accum_row_major,
-                        release_dq_empty=False,
-                    )
-        elif curr_full_cnt > Int32(0):
-            assert curr_dq_write_order_full is not None
-            packed_order_full = _load_dq_order_entry(curr_dq_write_order_full, Int32(0))
-            if curr_full_cnt > Int32(1):
-                packed_order_full = _store_one_dQaccum_from_packed_order_sm90(
-                    packed_order_full,
-                    sdQaccum,
-                    gdQaccum,
-                    num_dQ_warp_groups,
-                    num_threads_per_warp_group,
-                    tma_copy_bytes_dQ,
-                    mdQ_semaphore_cur,
-                    warp_local_tidx,
-                    accum_row_major,
-                    prefetch_dq_order=partial(
-                        _load_dq_order_entry,
-                        curr_dq_write_order_full,
-                        Int32(1),
-                    ),
-                    release_dq_empty=False,
-                )
-                _store_dQaccum_packed_order_sequence_sm90(
-                    packed_order_full,
-                    curr_dq_write_order_full,
-                    curr_full_cnt,
-                    sdQaccum,
-                    gdQaccum,
-                    num_dQ_warp_groups,
-                    num_threads_per_warp_group,
-                    tma_copy_bytes_dQ,
-                    mdQ_semaphore_cur,
-                    warp_local_tidx,
-                    accum_row_major,
-                    start_idx=Int32(1),
-                )
-            else:
-                _store_one_dQaccum_from_packed_order_sm90(
-                    packed_order_full,
-                    sdQaccum,
-                    gdQaccum,
-                    num_dQ_warp_groups,
-                    num_threads_per_warp_group,
-                    tma_copy_bytes_dQ,
-                    mdQ_semaphore_cur,
-                    warp_local_tidx,
-                    accum_row_major,
-                    release_dq_empty=False,
-                )
-        return
-
     for sparse_idx in cutlass.range(curr_q_cnt, unroll=1):
+        sparse_m_block = curr_q_idx[sparse_idx] * subtile_factor
+        lock_value = Int32(0)
         if const_expr(deterministic):
-            packed_order = Uint32(curr_dq_write_order[sparse_idx])
-            sparse_m_block = Int32(packed_order & Uint32(0xFFFF)) * subtile_factor
-            lock_value = Int32(packed_order >> Uint32(16))
-        else:
-            sparse_m_block = curr_q_idx[sparse_idx] * subtile_factor
-            lock_value = curr_dq_write_order[sparse_idx] if const_expr(deterministic) else Int32(0)
+            assert curr_dq_write_order is not None
+            lock_value = curr_dq_write_order[sparse_idx]
         for subtile_offset in cutlass.range(subtile_factor, unroll=1):
             m_block = sparse_m_block + subtile_offset
 
@@ -2944,15 +2659,11 @@ def dQaccum_store_block_sparse_bwd_sm90(
         if const_expr(deterministic):
             assert curr_dq_write_order_full is not None
         for sparse_idx in cutlass.range(curr_full_cnt, unroll=1):
+            sparse_m_block = curr_full_idx[sparse_idx] * subtile_factor
+            lock_value = Int32(0)
             if const_expr(deterministic):
-                packed_order = Uint32(curr_dq_write_order_full[sparse_idx])
-                sparse_m_block = Int32(packed_order & Uint32(0xFFFF)) * subtile_factor
-                lock_value = Int32(packed_order >> Uint32(16))
-            else:
-                sparse_m_block = curr_full_idx[sparse_idx] * subtile_factor
-                lock_value = (
-                    curr_dq_write_order_full[sparse_idx] if const_expr(deterministic) else Int32(0)
-                )
+                assert curr_dq_write_order_full is not None
+                lock_value = curr_dq_write_order_full[sparse_idx]
             for subtile_offset in cutlass.range(subtile_factor, unroll=1):
                 m_block = sparse_m_block + subtile_offset
 
