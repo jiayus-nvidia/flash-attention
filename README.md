@@ -22,8 +22,9 @@ Paged KV, SplitKV, MLA, FP8, SM80, and SM120 paths are not currently supported.
 python -m pip install -e '.[dev]'
 ```
 
-The project requires `nvidia-cutlass-dsl>=4.5.2` and pins `quack-kernels==0.5.0`.
-Release compatibility is validated with NVIDIA CuTe DSL 4.7.0.
+The project supports `nvidia-cutlass-dsl>=4.5.2` and pins `quack-kernels==0.5.0`.
+We recommend `nvidia-cutlass-dsl==4.5.2`; compatibility is also validated with NVIDIA CuTe
+DSL 4.7.0.
 
 ## API
 

@@ -36,6 +36,14 @@ def _cute_dsl_version() -> tuple[int, int, int]:
 _CUTE_DSL_VERSION = _cute_dsl_version()
 
 
+def _cute_dsl_nvvm_fmax_has_explicit_result_type(
+    version: tuple[int, int, int] | None = None,
+) -> bool:
+    """Return whether nvvm.fmax requires an explicit result type."""
+    version = _CUTE_DSL_VERSION if version is None else version
+    return version < (4, 6, 0)
+
+
 def _cute_dsl_bulk_copy_self_elects(
     version: tuple[int, int, int] | None = None,
 ) -> bool:

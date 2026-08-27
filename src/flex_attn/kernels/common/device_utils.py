@@ -12,6 +12,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
+from flex_attn.runtime.dsl_utils import _cute_dsl_nvvm_fmax_has_explicit_result_type
+
 
 @dsl_user_op
 def mask_f32_by_u32_bit(
@@ -165,6 +167,8 @@ def fmax(
         Float32(a).ir_value(loc=loc, ip=ip),
         Float32(b).ir_value(loc=loc, ip=ip),
     )
+    if _cute_dsl_nvvm_fmax_has_explicit_result_type():
+        args = (T.f32(), *args)
     kwargs = {
         "c": Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
         "ftz": ftz,

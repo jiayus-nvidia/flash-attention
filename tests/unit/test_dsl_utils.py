@@ -2,7 +2,23 @@ from __future__ import annotations
 
 import pytest
 
-from flex_attn.runtime.dsl_utils import _cute_dsl_bulk_copy_self_elects
+from flex_attn.runtime.dsl_utils import (
+    _cute_dsl_bulk_copy_self_elects,
+    _cute_dsl_nvvm_fmax_has_explicit_result_type,
+)
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    (
+        ((4, 5, 2), True),
+        ((4, 6, 0), False),
+        ((4, 6, 1), False),
+        ((4, 7, 0), False),
+    ),
+)
+def test_nvvm_fmax_result_type_version_boundary(version, expected):
+    assert _cute_dsl_nvvm_fmax_has_explicit_result_type(version) is expected
 
 
 @pytest.mark.parametrize(
