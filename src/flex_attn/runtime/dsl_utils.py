@@ -36,9 +36,12 @@ def _cute_dsl_version() -> tuple[int, int, int]:
 _CUTE_DSL_VERSION = _cute_dsl_version()
 
 
-def _cute_dsl_bulk_copy_self_elects() -> bool:
+def _cute_dsl_bulk_copy_self_elects(
+    version: tuple[int, int, int] | None = None,
+) -> bool:
     """Return whether cute.copy elects a lane for bulk-async copies."""
-    return (4, 6, 0) <= _CUTE_DSL_VERSION < (4, 6, 2)
+    version = _CUTE_DSL_VERSION if version is None else version
+    return (4, 6, 0) <= version < (4, 6, 2)
 
 
 _BULK_COPY_SELF_ELECTS = _cute_dsl_bulk_copy_self_elects()

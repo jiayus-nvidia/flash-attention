@@ -12,6 +12,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 import cutlass.pipeline
 
+from flex_attn.runtime.dsl_utils import bulk_copy
+
 
 @dsl_user_op
 def cvt_copy(
@@ -304,19 +306,20 @@ def cpasync_bulk_get_copy_fn(
     src = cute.group_modes(src_tensor, 0, group_rank_src)
     dst = cute.group_modes(dst_tensor, 0, group_rank_dst)
 
-    def copy_bulk(src_idx, dst_idx, **new_kwargs):
-        size = const_expr(cute.size(src.shape[:-1]) * src.element_type.width // 8)
-        cpasync_bulk_g2s(
-            src[None, src_idx].iterator,
-            dst[None, dst_idx].iterator,
-            size=size,
+    def copy_bulk(src_idx, dst_idx, tma_bar_ptr: cute.Pointer, **new_kwargs):
+        atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
+        bulk_copy(
+            atom,
+            src[None, src_idx],
+            dst[None, dst_idx],
+            mbar_ptr=tma_bar_ptr,
             **new_kwargs,
             **kwargs,
         )
 
-    def copy_bulk_single_stage(**new_kwargs):
-        size = const_expr(cute.size(src.shape) * src.element_type.width // 8)
-        cpasync_bulk_g2s(src.iterator, dst.iterator, size=size, **new_kwargs, **kwargs)
+    def copy_bulk_single_stage(tma_bar_ptr: cute.Pointer, **new_kwargs):
+        atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
+        bulk_copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
 
     return copy_bulk if const_expr(not single_stage) else copy_bulk_single_stage
 

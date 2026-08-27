@@ -18,6 +18,7 @@ from quack import sm90_utils
 from quack.sm90_utils import gemm_zero_init, gemm_w_idx
 
 from flex_attn.runtime.dsl_utils import assume_tensor_aligned
+from flex_attn.kernels.common.copy_utils import cpasync_bulk_get_copy_fn
 from flex_attn.kernels.common import device_utils as utils
 from flex_attn.kernels.common.seqlen_info import SeqlenInfoQK
 from flex_attn.kernels.common import pipeline
@@ -898,9 +899,11 @@ class FlexAttentionBackwardSm90:
                     tma_atom_dO, 0, cute.make_layout(1), gdO, sdO
                 )
                 load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
-                load_LSE = copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE)
+                # Quack always adds an outer elect_one(), which deadlocks when
+                # the installed CuTe DSL bulk-copy lowering elects internally.
+                load_LSE = cpasync_bulk_get_copy_fn(gLSE, sLSE)
                 load_LSE = copy_utils.tma_producer_copy_fn(load_LSE, pipeline_Q)
-                load_dPsum = copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum)
+                load_dPsum = cpasync_bulk_get_copy_fn(gdPsum, sdPsum)
                 load_dPsum = copy_utils.tma_producer_copy_fn(load_dPsum, pipeline_dO)
 
                 m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
