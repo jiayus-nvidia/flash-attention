@@ -13,6 +13,7 @@ from tests.datas.sequence_cases import smoke_cases
 pytestmark = pytest.mark.gpu
 
 _FWD_TOPOLOGY_CASE_IDS = {0, 7, 14, 28, 43, 57, 339, 1027}
+_MAX_LOGIT_CASE_IDS = {0, 7, 14, 21, 28, 43}
 assert _FWD_TOPOLOGY_CASE_IDS <= {
     case.case_id for case in smoke_cases("fixed")
 }
@@ -117,7 +118,7 @@ def _attention_reference_rows(q_rows, k_rows, v_rows, visible, *, reorder_ops=Fa
         device=score.device,
     )
     lse_rows[has_keys] = torch.logsumexp(score[has_keys], dim=-1)
-    return out_rows, lse_rows
+    return out_rows, lse_rows, score.max(dim=-1).values
 
 
 def _reference_and_sparse_dout(q, k, v, mask_func, case):
@@ -135,12 +136,18 @@ def _reference_and_sparse_dout(q, k, v, mask_func, case):
     sampled_lse = []
     pytorch_out = []
     pytorch_lse = []
+    reference_max = [[] for _ in range(case.num_q_heads)]
+    pytorch_max = [[] for _ in range(case.num_q_heads)]
     reference_nodes = []
     pytorch_nodes = []
     dout_nodes = []
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
     qratio = case.num_q_heads // case.num_kv_heads
-    rows = tuple(range(seqlen_q)) if case.full_reference else _selected_rows(seqlen_q)
+    rows = (
+        tuple(range(seqlen_q))
+        if case.full_reference or case.case_id in _MAX_LOGIT_CASE_IDS
+        else _selected_rows(seqlen_q)
+    )
     for batch_idx in range(case.batch_size):
         flat_rows = torch.tensor(
             [batch_idx * seqlen_q + row for row in rows], device=q.device
@@ -152,13 +159,13 @@ def _reference_and_sparse_dout(q, k, v, mask_func, case):
             visible = torch.stack(
                 [_visible_columns(row_endpoints, seqlen_k) for row_endpoints in endpoints]
             )
-            out_rows, lse_rows = _attention_reference_rows(
+            out_rows, lse_rows, max_rows = _attention_reference_rows(
                 q_ref[batch_idx, rows, head_idx],
                 k_ref[batch_idx, :, kv_head],
                 v_ref[batch_idx, :, kv_head],
                 visible,
             )
-            out_rows_pt, lse_rows_pt = _attention_reference_rows(
+            out_rows_pt, lse_rows_pt, max_rows_pt = _attention_reference_rows(
                 q_pt[batch_idx, rows, head_idx],
                 k_pt[batch_idx, :, kv_head],
                 v_pt[batch_idx, :, kv_head],
@@ -176,6 +183,8 @@ def _reference_and_sparse_dout(q, k, v, mask_func, case):
             sampled_lse.append(lse_rows.detach())
             pytorch_out.append(out_rows_pt.detach())
             pytorch_lse.append(lse_rows_pt.detach())
+            reference_max[head_idx].append(max_rows.detach())
+            pytorch_max[head_idx].append(max_rows_pt.detach())
             reference_nodes.append(out_rows)
             pytorch_nodes.append(out_rows_pt)
             dout_nodes.append(dout_rows)
@@ -196,6 +205,8 @@ def _reference_and_sparse_dout(q, k, v, mask_func, case):
         gradients,
         torch.cat(pytorch_out),
         torch.cat(pytorch_lse),
+        torch.stack([torch.cat(values).max() for values in reference_max]),
+        torch.stack([torch.cat(values).max() for values in pytorch_max]),
         pytorch_gradients,
         rows,
     )
@@ -280,17 +291,35 @@ def test_flex_attn(case):
         ref_grads,
         pytorch_out,
         pytorch_lse,
+        ref_max_logit,
+        pytorch_max_logit,
         pytorch_grads,
         rows,
     ) = _reference_and_sparse_dout(q, k, v, mask_func, case)
-    out, lse = flex_attn_func(
-        q,
-        k,
-        v,
-        mask_plan=plan,
-        deterministic=case.deterministic,
-        return_lse=True,
-    )
+    check_max_logit = case.case_id in _MAX_LOGIT_CASE_IDS
+    if check_max_logit:
+        out, lse, max_logit = flex_attn_func(
+            q,
+            k,
+            v,
+            mask_plan=plan,
+            deterministic=case.deterministic,
+            return_lse=True,
+            return_max_logit=True,
+        )
+        assert max_logit.shape == (case.num_q_heads,)
+        assert max_logit.dtype == torch.float32
+        assert not max_logit.requires_grad
+        _assert_fa_error(max_logit, ref_max_logit, pytorch_max_logit, name="max_logit")
+    else:
+        out, lse = flex_attn_func(
+            q,
+            k,
+            v,
+            mask_plan=plan,
+            deterministic=case.deterministic,
+            return_lse=True,
+        )
     sampled_out = torch.cat(
         [out[batch_idx, rows].transpose(0, 1).reshape(-1, case.head_dim_v) for batch_idx in range(case.batch_size)]
     )
@@ -299,21 +328,37 @@ def test_flex_attn(case):
     )
     _assert_fa_error(sampled_out, ref_out, pytorch_out)
     _assert_fa_error(sampled_lse, ref_lse, pytorch_lse)
-    for candidate_plan in (
-        qstage1_1cta_plan,
-        qstage1_2cta_plan,
-        qstage2_1cta_plan,
+    for topology, candidate_plan in (
+        ("qstage1_1cta", qstage1_1cta_plan),
+        ("qstage1_2cta", qstage1_2cta_plan),
+        ("qstage2_1cta", qstage2_1cta_plan),
     ):
         if candidate_plan is None:
             continue
         with torch.no_grad():
-            candidate_out, candidate_lse = flex_attn_func(
-                q,
-                k,
-                v,
-                mask_plan=candidate_plan,
-                return_lse=True,
-            )
+            if check_max_logit:
+                candidate_out, candidate_lse, candidate_max_logit = flex_attn_func(
+                    q,
+                    k,
+                    v,
+                    mask_plan=candidate_plan,
+                    return_lse=True,
+                    return_max_logit=True,
+                )
+                _assert_fa_error(
+                    candidate_max_logit,
+                    ref_max_logit,
+                    pytorch_max_logit,
+                    name=f"{topology} max_logit",
+                )
+            else:
+                candidate_out, candidate_lse = flex_attn_func(
+                    q,
+                    k,
+                    v,
+                    mask_plan=candidate_plan,
+                    return_lse=True,
+                )
         candidate_sampled_out = torch.cat(
             [
                 candidate_out[batch_idx, rows]
@@ -330,7 +375,48 @@ def test_flex_attn(case):
         )
         _assert_fa_error(candidate_sampled_out, ref_out, pytorch_out)
         _assert_fa_error(candidate_sampled_lse, ref_lse, pytorch_lse)
-    if run_fwd_topology_variants and case.case_id == 0:
+    if case.case_id == 0:
+        max_only_plan = qstage2_1cta_plan or plan
+        with torch.no_grad():
+            max_only_out, max_only = flex_attn_func(
+                q.detach(),
+                k.detach(),
+                v.detach(),
+                mask_plan=max_only_plan,
+                return_max_logit=True,
+            )
+            _, zero_scale_max = flex_attn_func(
+                q.detach(),
+                k.detach(),
+                v.detach(),
+                mask_plan=max_only_plan,
+                softmax_scale=0.0,
+                return_max_logit=True,
+            )
+            _, custom_scale_max = flex_attn_func(
+                q.detach(),
+                k.detach(),
+                v.detach(),
+                mask_plan=max_only_plan,
+                softmax_scale=0.5,
+                return_max_logit=True,
+            )
+        _assert_fa_error(
+            max_only,
+            ref_max_logit,
+            pytorch_max_logit,
+            name="max-only max_logit",
+        )
+        assert max_only_out.shape == out.shape
+        assert torch.count_nonzero(zero_scale_max).item() == 0
+        default_scale = 1.0 / math.sqrt(case.head_dim)
+        _assert_fa_error(
+            custom_scale_max,
+            ref_max_logit * (0.5 / default_scale),
+            pytorch_max_logit * (0.5 / default_scale),
+            name="custom-scale max_logit",
+        )
+    if case.case_id == 0:
         empty_mask_func = torch.zeros(
             (1, 1, case.batch_size * seqlen_q),
             dtype=torch.int32,
@@ -342,18 +428,29 @@ def test_flex_attn(case):
             k,
             v,
             build_backward=False,
-            _fwd_variant="qstage1_1cta",
+            _fwd_variant="qstage1_1cta" if run_fwd_topology_variants else None,
         )
         with torch.no_grad():
-            empty_out, empty_lse = flex_attn_func(
+            empty_out, empty_lse, empty_max_logit = flex_attn_func(
                 q,
                 k,
                 v,
                 mask_plan=empty_plan,
                 return_lse=True,
+                return_max_logit=True,
+            )
+            _, empty_zero_scale_max_logit = flex_attn_func(
+                q,
+                k,
+                v,
+                mask_plan=empty_plan,
+                softmax_scale=0.0,
+                return_max_logit=True,
             )
         assert torch.count_nonzero(empty_out).item() == 0
         assert torch.isneginf(empty_lse).all().item()
+        assert torch.isneginf(empty_max_logit).all().item()
+        assert torch.isneginf(empty_zero_scale_max_logit).all().item()
     out.backward(dout)
     for name, actual, reference, pytorch in zip(
         ("dQ", "dK", "dV"),

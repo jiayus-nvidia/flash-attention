@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from flex_attn.runtime.dsl_utils import (
@@ -8,17 +10,17 @@ from flex_attn.runtime.dsl_utils import (
 )
 
 
-@pytest.mark.parametrize(
-    ("version", "expected"),
-    (
-        ((4, 5, 2), True),
-        ((4, 6, 0), False),
-        ((4, 6, 1), False),
-        ((4, 7, 0), False),
-    ),
-)
-def test_nvvm_fmax_result_type_version_boundary(version, expected):
-    assert _cute_dsl_nvvm_fmax_has_explicit_result_type(version) is expected
+def test_nvvm_fmax_result_type_matches_installed_signature():
+    from cutlass._mlir.dialects import nvvm
+
+    positional_parameters = tuple(
+        parameter
+        for parameter in inspect.signature(nvvm.fmax).parameters.values()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+    expects_result_type = len(positional_parameters) >= 3
+    assert _cute_dsl_nvvm_fmax_has_explicit_result_type() is expects_result_type
 
 
 @pytest.mark.parametrize(

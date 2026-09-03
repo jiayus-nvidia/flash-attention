@@ -21,21 +21,38 @@ def test_quack_cute_dsl_type_compatibility_is_initialized(monkeypatch, type_name
     assert getattr(cute.core, type_name) is getattr(cute, type_name)
 
 
-def test_public_return_lse_contract(monkeypatch):
+def test_public_auxiliary_output_contract(monkeypatch):
     class PlanStub:
         def _validate_runtime(self, q, k, v, *, mode):
             return None
 
     out = object()
     lse = object()
+    max_logit = object()
     plan = PlanStub()
     monkeypatch.setattr(interface, "_validate_plan", lambda value: None)
-    monkeypatch.setattr(interface.FlexAttnFunc, "apply", lambda *args: (out, lse))
-    monkeypatch.setattr(interface.FlexAttnVarlenFunc, "apply", lambda *args: (out, lse))
+    monkeypatch.setattr(interface.FlexAttnFunc, "apply", lambda *args: (out, lse, max_logit))
+    monkeypatch.setattr(
+        interface.FlexAttnVarlenFunc,
+        "apply",
+        lambda *args: (out, lse, max_logit),
+    )
 
     for function in (interface.flex_attn_func, interface.flex_attn_varlen_func):
         assert function(None, None, None, mask_plan=plan) is out
         assert function(None, None, None, mask_plan=plan, return_lse=True) == (out, lse)
+        assert function(None, None, None, mask_plan=plan, return_max_logit=True) == (
+            out,
+            max_logit,
+        )
+        assert function(
+            None,
+            None,
+            None,
+            mask_plan=plan,
+            return_lse=True,
+            return_max_logit=True,
+        ) == (out, lse, max_logit)
 
 
 def test_maybe_contiguous_alignment_contract():

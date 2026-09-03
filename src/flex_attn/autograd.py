@@ -19,9 +19,10 @@ class FlexAttnFunc(torch.autograd.Function):
         softmax_scale: float | None,
         deterministic: bool,
         return_lse: bool,
+        return_max_logit: bool,
     ):
         packed_plan, _, _ = mask_plan._runtime_args
-        out, lse = _flex_attn_fwd(
+        out, lse, max_logit = _flex_attn_fwd(
             q,
             k,
             v,
@@ -29,6 +30,7 @@ class FlexAttnFunc(torch.autograd.Function):
             pack_gqa=mask_plan.metadata.pack_gqa,
             block_sparse_tensors=packed_plan,
             return_lse=return_lse,
+            return_max_logit=return_max_logit,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.mask_plan = mask_plan
@@ -36,10 +38,12 @@ class FlexAttnFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.return_lse = return_lse
         ctx.set_materialize_grads(False)
-        return out, lse
+        if max_logit is not None:
+            ctx.mark_non_differentiable(max_logit)
+        return out, lse, max_logit
 
     @staticmethod
-    def backward(ctx, dout, dlse):
+    def backward(ctx, dout, dlse, _dmax_logit):
         q, k, v, out, lse = ctx.saved_tensors
         if dout is None:
             dout = torch.zeros_like(out)
@@ -56,7 +60,7 @@ class FlexAttnFunc(torch.autograd.Function):
             block_sparse_tensors=packed_plan,
             dlse=dlse if ctx.return_lse else None,
         )
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None
 
 
 class FlexAttnVarlenFunc(torch.autograd.Function):
@@ -70,10 +74,11 @@ class FlexAttnVarlenFunc(torch.autograd.Function):
         softmax_scale: float | None,
         deterministic: bool,
         return_lse: bool,
+        return_max_logit: bool,
     ):
         packed_plan, cu_seqlens_q, cu_seqlens_k = mask_plan._runtime_args
         metadata = mask_plan.metadata
-        out, lse = _flex_attn_fwd(
+        out, lse, max_logit = _flex_attn_fwd(
             q,
             k,
             v,
@@ -85,6 +90,7 @@ class FlexAttnVarlenFunc(torch.autograd.Function):
             pack_gqa=metadata.pack_gqa,
             block_sparse_tensors=packed_plan,
             return_lse=return_lse,
+            return_max_logit=return_max_logit,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.mask_plan = mask_plan
@@ -92,10 +98,12 @@ class FlexAttnVarlenFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.return_lse = return_lse
         ctx.set_materialize_grads(False)
-        return out, lse
+        if max_logit is not None:
+            ctx.mark_non_differentiable(max_logit)
+        return out, lse, max_logit
 
     @staticmethod
-    def backward(ctx, dout, dlse):
+    def backward(ctx, dout, dlse, _dmax_logit):
         q, k, v, out, lse = ctx.saved_tensors
         if dout is None:
             dout = torch.zeros_like(out)
@@ -117,7 +125,7 @@ class FlexAttnVarlenFunc(torch.autograd.Function):
             block_sparse_tensors=packed_plan,
             dlse=dlse if ctx.return_lse else None,
         )
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None
 
 
 __all__ = ["FlexAttnFunc", "FlexAttnVarlenFunc"]

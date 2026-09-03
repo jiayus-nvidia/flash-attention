@@ -1,8 +1,9 @@
 # Copyright (c) 2025, Tri Dao.
 
 import contextlib
-from functools import lru_cache
+import inspect
 import re
+from functools import lru_cache
 from typing import Tuple
 
 import torch
@@ -36,12 +37,19 @@ def _cute_dsl_version() -> tuple[int, int, int]:
 _CUTE_DSL_VERSION = _cute_dsl_version()
 
 
-def _cute_dsl_nvvm_fmax_has_explicit_result_type(
-    version: tuple[int, int, int] | None = None,
-) -> bool:
-    """Return whether nvvm.fmax requires an explicit result type."""
-    version = _CUTE_DSL_VERSION if version is None else version
-    return version < (4, 6, 0)
+@lru_cache(maxsize=1)
+def _cute_dsl_nvvm_fmax_has_explicit_result_type() -> bool:
+    """Return whether the installed nvvm.fmax expects a result type argument."""
+
+    from cutlass._mlir.dialects import nvvm
+
+    positional_parameters = tuple(
+        parameter
+        for parameter in inspect.signature(nvvm.fmax).parameters.values()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+    return len(positional_parameters) >= 3
 
 
 def _cute_dsl_bulk_copy_self_elects(

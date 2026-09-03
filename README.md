@@ -36,14 +36,31 @@ from flex_attn import create_mask_plan, flex_attn_func
 # v: [B, Sk, Hkv, Dv]
 # mask_func: contiguous CUDA int32 [Hmask, nfunc, B * Sq]
 plan = create_mask_plan(mask_func, q, k, v)
-out, lse = flex_attn_func(q, k, v, mask_plan=plan, return_lse=True)
+out, lse, max_logit = flex_attn_func(
+    q,
+    k,
+    v,
+    mask_plan=plan,
+    return_lse=True,
+    return_max_logit=True,
+)
 ```
 
 Each `mask_func` endpoint uses sample-local K coordinates. The public tensor does not require
 planner padding. After construction, `MaskPlan` does not retain `mask_func`; for variable-length
 inputs, it owns copies of the sequence-prefix tensors.
 
-With `return_lse=False`, the API returns `out`. With `return_lse=True`, it returns `(out, lse)`.
+`return_max_logit=True` returns a non-differentiable FP32 tensor of shape `[Hq]`. Element `h`
+is the maximum visible scaled score for query head `h` across the batch, query positions, and key
+positions. A head with no visible query-key pair returns `-inf`. This option requires a
+non-negative `softmax_scale`.
+
+The return contract is:
+
+- neither optional result: `out`
+- `return_lse=True`: `(out, lse)`
+- `return_max_logit=True`: `(out, max_logit)`
+- both options: `(out, lse, max_logit)`
 
 Variable-length geometry is provided only when constructing the plan:
 

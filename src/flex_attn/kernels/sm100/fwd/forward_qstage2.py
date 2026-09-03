@@ -10,6 +10,11 @@ import cutlass.pipeline as pipeline
 from cutlass import Boolean, Float32, Int32, const_expr
 
 from flex_attn.kernels.common import device_utils as utils
+from flex_attn.kernels.common.max_logit import (
+    init_max_logit,
+    store_max_logit,
+    update_max_logit,
+)
 from flex_attn.kernels.sm100 import blackwell_helpers as sm100_utils
 from flex_attn.kernels.sm100 import mma_desc as sm100_desc
 from flex_attn.plan.kernels import BlockSparseTensors
@@ -22,6 +27,7 @@ from flex_attn.plan.kernels.packed_mask import (
 from flex_attn.kernels.sm100.fwd.forward_config import (
     SM100_FWD_MASK_PAYLOAD_WORDS,
 )
+from flex_attn.kernels.sm100.fwd.named_barrier import NamedBarrierFwdSm100
 from quack import layout_utils
 
 from .forward import _FlexAttentionForwardSm100Base
@@ -337,8 +343,10 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
         tOtO: cute.Tensor,
         sScale: cute.Tensor,
         mO: cute.Tensor,
-        mLSE: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         sO: cute.Tensor,
+        sMaxLogit: Optional[cute.Tensor],
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_o_acc: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
@@ -347,6 +355,7 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
         pipeline_load_epi: Optional[pipeline.PipelineAsync],
         gmem_tiled_copy_O: cute.TiledCopy,
         softmax_scale_log2: Float32,
+        softmax_scale: Float32,
         SeqlenInfoCls: Callable,
         blocksparse_tensors: BlockSparseTensors = None,
         tile_scheduler=None,
@@ -379,6 +388,12 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
 
             max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
             seqlen = SeqlenInfoCls(batch_idx)
+            if const_expr(mMaxLogit is not None):
+                init_max_logit(sMaxLogit, tidx)
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwdSm100.Epilogue),
+                    number_of_threads=len(self.correction_warp_ids) * cute.arch.WARP_SIZE,
+                )
 
             mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
             gO = None
@@ -391,7 +406,13 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                 gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
 
             stats = [
-                (0.0, -Float32.inf if const_expr(mLSE is not None) else None, True)
+                (
+                    0.0,
+                    -Float32.inf
+                    if const_expr(mLSE is not None or mMaxLogit is not None)
+                    else None,
+                    True,
+                )
             ] * self.q_stage
 
             total_block_count = get_total_arbitrary_block_count_fwd_sm100(
@@ -436,7 +457,7 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                 for stage in cutlass.range_constexpr(self.q_stage):
                     sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
                     row_sum = sScale[tidx + stage * self.m_block_size]
-                    if const_expr(mLSE is not None):
+                    if const_expr(mLSE is not None or mMaxLogit is not None):
                         row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
                     else:
                         row_max = None
@@ -483,7 +504,7 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                     tidx,
                     self.q_stage,
                     self.m_block_size,
-                    mLSE,
+                    mLSE is not None or mMaxLogit is not None,
                     seqlen,
                     m_block,
                     sScale,
@@ -501,6 +522,47 @@ class FlexAttentionForwardSm100(_FlexAttentionForwardSm100Base):
                     mO_cur,
                     gO,
                     gmem_tiled_copy_O_for_empty_tile,
+                )
+
+            if const_expr(mMaxLogit is not None):
+                seqlen_q = seqlen.seqlen_q * (
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+                )
+                for stage in cutlass.range_constexpr(self.q_stage):
+                    m_tile_idx = (
+                        (m_block * self.q_stage + stage) * self.cta_group_size
+                        + mma_tile_coord_v
+                    )
+                    row = m_tile_idx * self.m_block_size + tidx
+                    _, row_max, invalid = stats[stage]
+                    update_max_logit(
+                        sMaxLogit,
+                        row_max,
+                        row < seqlen_q
+                        and (
+                            not invalid
+                            or softmax_scale == Float32(0.0)
+                        ),
+                        row % self.qhead_per_kvhead
+                        if const_expr(self.pack_gqa)
+                        else Int32(0),
+                        softmax_scale,
+                    )
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwdSm100.Epilogue),
+                    number_of_threads=len(self.correction_warp_ids) * cute.arch.WARP_SIZE,
+                )
+                store_max_logit(
+                    sMaxLogit,
+                    mMaxLogit,
+                    tidx,
+                    head_idx * self.qhead_per_kvhead
+                    if const_expr(self.pack_gqa)
+                    else head_idx,
+                )
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwdSm100.Epilogue),
+                    number_of_threads=len(self.correction_warp_ids) * cute.arch.WARP_SIZE,
                 )
 
             if const_expr(mLSE is not None):

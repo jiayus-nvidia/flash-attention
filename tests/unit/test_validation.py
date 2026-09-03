@@ -27,4 +27,28 @@ def test_call_option_validation(value):
             softmax_scale=value,
             deterministic=False,
             return_lse=False,
+            return_max_logit=False,
         )
+
+
+def test_max_logit_call_option_validation():
+    with pytest.raises(TypeError, match="return_max_logit must be a bool"):
+        validate_call_options(
+            softmax_scale=None,
+            deterministic=False,
+            return_lse=False,
+            return_max_logit=1,
+        )
+    with pytest.raises(ValueError, match="non-negative softmax_scale"):
+        validate_call_options(
+            softmax_scale=-0.5,
+            deterministic=False,
+            return_lse=False,
+            return_max_logit=True,
+        )
+    validate_call_options(
+        softmax_scale=0.0,
+        deterministic=False,
+        return_lse=False,
+        return_max_logit=True,
+    )

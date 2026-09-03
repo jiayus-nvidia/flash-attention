@@ -398,12 +398,15 @@ def _flex_attn_fwd(
     pack_gqa: Optional[bool] = None,
     block_sparse_tensors: BlockSparseTensorsTorch = None,
     return_lse: bool = False,
+    return_max_logit: bool = False,
     sm90_use_smem_mask_pipeline: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Run packed arbitrary-mask forward."""
 
     if type(sm90_use_smem_mask_pipeline) is not bool:
         raise TypeError("sm90_use_smem_mask_pipeline must be a bool")
+    if type(return_max_logit) is not bool:
+        raise TypeError("return_max_logit must be a bool")
 
     q, k, v = [maybe_contiguous(tensor) for tensor in (q, k, v)]
     if q.dtype not in (torch.float16, torch.bfloat16):
@@ -443,6 +446,8 @@ def _flex_attn_fwd(
     qhead_per_kvhead = num_q_heads // num_kv_heads
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+    if return_max_logit and softmax_scale < 0:
+        raise ValueError("return_max_logit requires a non-negative softmax_scale")
 
     plan_signature = _validate_plan_binding(
         block_sparse_tensors,
@@ -526,11 +531,18 @@ def _flex_attn_fwd(
         if needs_lse
         else None
     )
+    max_logit = (
+        torch.empty((num_q_heads,), dtype=torch.float32, device=q.device)
+        if return_max_logit
+        else None
+    )
+    if max_logit is not None:
+        max_logit.fill_(float("-inf"))
     if total_q == 0 or total_k == 0:
         out.zero_()
         if lse is not None:
             lse.fill_(float("-inf"))
-        return out, lse
+        return out, lse, max_logit
 
     use_hd256 = head_dim == 256 and head_dim_v == 256 and arch in (100, 103)
     scheduler_tile_counter = None
@@ -553,6 +565,7 @@ def _flex_attn_fwd(
         pack_gqa,
         is_varlen,
         lse is None,
+        max_logit is None,
         plan_signature.compile_key,
         get_broadcast_dims(q),
         get_broadcast_dims(k),
@@ -570,6 +583,11 @@ def _flex_attn_fwd(
         ]
         lse_tensor = (
             to_cute_tensor(lse, assumed_align=4) if lse is not None else None
+        )
+        max_logit_tensor = (
+            to_cute_tensor(max_logit, assumed_align=4, leading_dim=0)
+            if max_logit is not None
+            else None
         )
         cu_q_tensor, cu_k_tensor = [
             to_cute_tensor(tensor, assumed_align=4, leading_dim=0)
@@ -621,6 +639,7 @@ def _flex_attn_fwd(
                 v_tensor,
                 o_tensor,
                 lse_tensor,
+                max_logit_tensor,
                 softmax_scale,
                 cu_q_tensor,
                 cu_k_tensor,
@@ -651,6 +670,7 @@ def _flex_attn_fwd(
                 v_tensor,
                 o_tensor,
                 lse_tensor,
+                max_logit_tensor,
                 softmax_scale,
                 cu_q_tensor,
                 cu_k_tensor,
@@ -693,6 +713,7 @@ def _flex_attn_fwd(
                 v_tensor,
                 o_tensor,
                 lse_tensor,
+                max_logit_tensor,
                 softmax_scale,
                 cu_q_tensor,
                 cu_k_tensor,
@@ -714,6 +735,7 @@ def _flex_attn_fwd(
                 v.detach(),
                 out.detach(),
                 lse,
+                max_logit,
                 softmax_scale,
                 cu_seqlens_q,
                 cu_seqlens_k,
@@ -728,6 +750,7 @@ def _flex_attn_fwd(
                 v.detach(),
                 out.detach(),
                 lse,
+                max_logit,
                 softmax_scale,
                 cu_seqlens_q,
                 cu_seqlens_k,
@@ -740,13 +763,14 @@ def _flex_attn_fwd(
                 v.detach(),
                 out.detach(),
                 lse,
+                max_logit,
                 softmax_scale,
                 cu_seqlens_q,
                 cu_seqlens_k,
                 sparse_args,
             ]
         _flex_attn_fwd.compile_cache[compile_key](*call_args)
-    return out, lse
+    return out, lse, max_logit
 
 
 _flex_attn_fwd.compile_cache = get_jit_cache("fwd")

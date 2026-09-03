@@ -324,6 +324,7 @@ class _FlexAttentionForwardSm100Base:
         mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv)
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         softmax_scale: Float32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
@@ -375,6 +376,10 @@ class _FlexAttentionForwardSm100Base:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+        if const_expr(mLSE is not None and mLSE.element_type != Float32):
+            raise TypeError("LSE tensor must be Float32")
+        if const_expr(mMaxLogit is not None and mMaxLogit.element_type != Float32):
+            raise TypeError("max_logit tensor must be Float32")
         if const_expr(self.is_varlen_q != (mCuSeqlensQ is not None)):
             raise ValueError("is_varlen_q must match whether mCuSeqlensQ is provided")
         self._setup_attributes()
@@ -586,6 +591,11 @@ class _FlexAttentionForwardSm100Base:
             if const_expr(self.use_smem_mask_pipeline)
             else 0
         )
+        sMaxLogit_size = (
+            self.qhead_per_kvhead
+            if const_expr(mMaxLogit is not None and self.pack_gqa)
+            else int(mMaxLogit is not None)
+        )
 
         @cute.struct
         class SharedStorage:
@@ -615,6 +625,9 @@ class _FlexAttentionForwardSm100Base:
             ]
             sMask: cute.struct.Align[
                 cute.struct.MemRange[Uint32, sMask_size], 16
+            ]
+            sMaxLogit: cute.struct.Align[
+                cute.struct.MemRange[Float32, sMaxLogit_size], 16
             ]
             # CLC buffers placed here to utilize padding before sO's 1024-byte alignment.
             # This avoids adding bytes at the end when we're at the smem limit.
@@ -653,11 +666,13 @@ class _FlexAttentionForwardSm100Base:
             mV,
             mO,
             mLSE,
+            mMaxLogit,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
             tma_atom_O,
             softmax_scale_log2,
+            softmax_scale,
             blocksparse_tensors,
             sQ_layout,
             sK_layout,
@@ -686,11 +701,13 @@ class _FlexAttentionForwardSm100Base:
         mV: cute.Tensor,  # (d, s_k, h_k, b_k) or (d, total_k, h_k)
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
         tma_atom_O: Optional[cute.CopyAtom],
         softmax_scale_log2: Float32,
+        softmax_scale: Float32,
         blocksparse_tensors: BlockSparseTensors,
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
@@ -954,6 +971,13 @@ class _FlexAttentionForwardSm100Base:
                     ),
                 )
             )
+        sMaxLogit = None
+        if const_expr(mMaxLogit is not None):
+            sMaxLogit = storage.sMaxLogit.get_tensor(
+                cute.make_layout(
+                    (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,)
+                )
+            )
 
         thr_mma_qk = tiled_mma_qk.get_slice(mma_tile_coord_v)
         thr_mma_pv = tiled_mma_pv.get_slice(mma_tile_coord_v)
@@ -1152,6 +1176,7 @@ class _FlexAttentionForwardSm100Base:
                 thr_mma_qk=thr_mma_qk,
                 sScale=sScale,
                 mLSE=mLSE,
+                mMaxLogit=mMaxLogit,
                 pipeline_s_p_o=pipeline_s_p_o,
                 pipeline_p_lastsplit=pipeline_p_lastsplit,
                 pipeline_sm_stats=pipeline_sm_stats,
@@ -1203,7 +1228,9 @@ class _FlexAttentionForwardSm100Base:
                 sScale,
                 mO,
                 mLSE,
+                mMaxLogit,
                 sO,
+                sMaxLogit,
                 pipeline_s_p_o,
                 pipeline_o_acc,
                 pipeline_sm_stats,
@@ -1212,6 +1239,7 @@ class _FlexAttentionForwardSm100Base:
                 pipeline_load_epi,
                 gmem_tiled_copy_O,
                 softmax_scale_log2,
+                softmax_scale,
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
@@ -1415,6 +1443,7 @@ class _FlexAttentionForwardSm100Base:
         tStS: cute.Tensor,  # ((TILE_M, TILE_N), 1, 1, q_stage)
         sScale: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
@@ -1497,10 +1526,18 @@ class _FlexAttentionForwardSm100Base:
             softmax_scale_log2_eff = softmax_scale_log2
             softmax_scale_eff = None
 
+            # The rescale threshold may retain an older normalization reference.
+            # Disable it when the caller requests the exact attention-score maximum.
             rescale_threshold = (
-                8.0 if const_expr(self.q_dtype.width == 16) else
-                4.0 if const_expr(self.q_dtype.width == 8) else
                 0.0
+                if const_expr(mMaxLogit is not None)
+                else (
+                    8.0
+                    if const_expr(self.q_dtype.width == 16)
+                    else 4.0
+                    if const_expr(self.q_dtype.width == 8)
+                    else 0.0
+                )
             )
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2_eff,
@@ -1612,7 +1649,9 @@ class _FlexAttentionForwardSm100Base:
                 )
             if not empty_tile:
                 sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
-                if const_expr(mLSE is not None or self.n_direction_qstage1):
+                if const_expr(
+                    mLSE is not None or mMaxLogit is not None or self.n_direction_qstage1
+                ):
                     sScale[
                         tidx
                         + stage * self.m_block_size

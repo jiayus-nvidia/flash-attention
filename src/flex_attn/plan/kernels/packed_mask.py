@@ -1499,7 +1499,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
     tidx: Int32,
     q_stage: cutlass.Constexpr,
     m_block_size: cutlass.Constexpr,
-    mLSE,
+    track_row_max: cutlass.Constexpr[bool],
     seqlen_info,
     m_block: Int32,
     sScale: cute.Tensor,
@@ -1537,11 +1537,11 @@ def handle_block_sparse_empty_tile_correction_sm100(
 
     for stage in cutlass.range_constexpr(q_stage):
         row_sum_value = Float32(1.0)
-        row_max_value = -Float32.inf if const_expr(mLSE is not None) else None
+        row_max_value = -Float32.inf if const_expr(track_row_max) else None
         if tidx < m_block_size:
             scale_row_idx = tidx + stage * m_block_size
             sScale[scale_row_idx] = row_sum_value
-            if const_expr(mLSE is not None):
+            if const_expr(track_row_max):
                 sScale[scale_row_idx + q_stage * m_block_size] = row_max_value
         acc_flag = row_sum_value == Float32(0.0) or row_sum_value != row_sum_value
         stats[stage] = (row_sum_value, row_max_value, acc_flag)
