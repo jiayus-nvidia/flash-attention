@@ -483,8 +483,14 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
     #     is_align_stack=False,
     #     asm_dialect=llvm.AsmDialect.AD_ATT,
     # )
+    # nvidia-cutlass-dsl >=4.5 dropped the `res=` result-type kwarg; the op
+    # now returns the loaded value and infers the result type from `a`.
     nvvm.atomicrmw(
-        res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
+        op=nvvm.AtomicOpKind.FADD,
+        ptr=gmem_ptr.llvm_ptr,
+        a=Float32(a).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
     )
 
 

@@ -58,6 +58,10 @@ from flash_attn_cute.block_sparsity import (
 )
 from flash_attn_cute.mask import cute_arbitrary_mask
 
+# Architectures whose cute kernels apply `cute_arbitrary_mask` (HSTU `aux_tensors[0]`).
+_ARBITRARY_MASK_ARCH_MAJORS: tuple[int, ...] = (9, 10, 11, 12)
+
+
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
     import re
@@ -617,8 +621,11 @@ def _flash_attn_fwd(
     if arbitrary:
         if mask_mod is not None:
             raise ValueError("arbitrary=True cannot be combined with mask_mod")
-        if arch // 10 not in [9, 10, 11]:
-            raise NotImplementedError("arbitrary mask is only supported on SM90/SM100/SM110")
+        if arch // 10 not in _ARBITRARY_MASK_ARCH_MAJORS:
+            raise NotImplementedError(
+                "arbitrary mask is only supported on SM90/SM100/SM110/SM120, "
+                f"got compute capability {arch}"
+            )
         if qv is not None:
             raise NotImplementedError("arbitrary mask is not supported with MLA qv path")
         if is_fp8:
@@ -975,6 +982,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                q_subtile_factor=q_subtile_factor,
             )
         elif arch // 10 == 9:
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
@@ -1091,8 +1099,8 @@ def _flash_attn_fwd(
                     **fwd_kwargs,
                 )
         elif arch // 10 == 12:
-            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
-            assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
+            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity.
+            # Linear CSR is consumed by FlashAttentionForwardSm80 (num_stages=1).
             assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
             assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
             fa_fwd = FlashAttentionForwardSm120(
@@ -1111,6 +1119,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                q_subtile_factor=q_subtile_factor,
             )
         else:
             raise ValueError(
@@ -1494,8 +1503,11 @@ def _flash_attn_bwd(
     if arbitrary:
         if mask_mod is not None:
             raise ValueError("arbitrary=True cannot be combined with mask_mod")
-        if arch // 10 not in [9, 10, 11]:
-            raise NotImplementedError("arbitrary mask is only supported on SM90/SM100/SM110")
+        if arch // 10 not in _ARBITRARY_MASK_ARCH_MAJORS:
+            raise NotImplementedError(
+                "arbitrary mask is only supported on SM90/SM100/SM110/SM120, "
+                f"got compute capability {arch}"
+            )
         causal = False
         window_size_left = None
         window_size_right = None
@@ -1527,9 +1539,11 @@ def _flash_attn_bwd(
         cluster_size = 1
         use_2cta_instrs = False
         num_threads = 128
-        assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
+        dQ_single_wg = False
+        # HSTU/arbitrary mask_mod is applied token-wise. Linear CSR is accepted
+        # (Magi always passes it) but the SM80-MMA bwd kernel does not skip tiles;
+        # correctness comes from mask_mod, not from dropping Magi ranges.
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
-        assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
         assert deterministic is False, "deterministic backward not supported on SM 12.0"
     elif arch // 10 == 9:
         cfg = _tile_size_bwd_sm90(
@@ -2110,6 +2124,8 @@ def _flash_attn_bwd(
                 V_in_regs=V_in_regs,
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None,
             )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
