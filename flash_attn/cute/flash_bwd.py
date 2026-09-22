@@ -48,6 +48,8 @@ class FlashAttentionBackwardSm80:
         V_in_regs: bool = False,
         score_mod: cutlass.Constexpr | None = None,
         score_mod_bwd: cutlass.Constexpr | None = None,
+        mask_mod: cutlass.Constexpr | None = None,
+        has_aux_tensors: bool = False,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -95,6 +97,8 @@ class FlashAttentionBackwardSm80:
         self.share_QV_smem = V_in_regs
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
+        self.mask_mod = mask_mod
+        self.has_aux_tensors = has_aux_tensors
 
     @staticmethod
     def can_implement(
@@ -434,7 +438,9 @@ class FlashAttentionBackwardSm80:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
-        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
+        # Keep the original softmax_scale for the dK epilogue. When score_mod is
+        # None, compute_softmax_scale_log2 would otherwise replace it with None.
+        softmax_scale_log2, _ = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         self.kernel(
             mQ,
             mK,
@@ -470,6 +476,7 @@ class FlashAttentionBackwardSm80:
             SharedStorage,
             tile_sched_params,
             TileScheduler,
+            aux_tensors,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -514,6 +521,7 @@ class FlashAttentionBackwardSm80:
         SharedStorage: cutlass.Constexpr,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
+        aux_tensors=None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -817,11 +825,19 @@ class FlashAttentionBackwardSm80:
             # Mainloop
             # ///////////////////////////////////////////////////////////////////////////////
             # Start processing of the first n-block.
-            mask = AttentionMask(self.m_block_size, self.n_block_size, seqlen)
+            mask = AttentionMask(
+                self.m_block_size,
+                self.n_block_size,
+                seqlen,
+                qhead_per_kvhead_packgqa=self.qhead_per_kvhead if self.pack_gqa else 1,
+                swap_AB=self.SdP_swapAB,
+            )
             mask_fn = partial(
                 mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
                 batch_idx=batch_idx, head_idx=head_idx,
-                mask_seqlen=True, mask_causal=self.is_causal
+                mask_seqlen=True, mask_causal=self.is_causal,
+                mask_mod=self.mask_mod,
+                aux_tensors=aux_tensors,
             )
             smem_pipe_read_q = cutlass.Int32(0)
             smem_pipe_read_do = cutlass.Int32(0)

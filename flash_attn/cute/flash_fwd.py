@@ -33,6 +33,10 @@ from flash_attn_cute.block_info import BlockInfo
 from flash_attn_cute.pack_gqa import PackGQA
 from flash_attn_cute.named_barrier import NamedBarrierFwd
 from flash_attn_cute.block_sparsity import BlockSparseTensors
+from flash_attn_cute.block_sparse_utils import (
+    get_curr_blocksparse_tensors,
+    sparse_tensor_m_block,
+)
 from flash_attn_cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 
 
@@ -94,7 +98,9 @@ class FlashAttentionForwardBase:
         self.tile_n = tile_n
         self.num_threads = num_threads
         self.num_stages = num_stages
-        self.q_subtile_factor = q_subtile_factor
+        # None means "kernel tile == sparse Q tile" (factor 1). Stored as int so
+        # sparse_tensor_m_block can take a constexpr integer.
+        self.q_subtile_factor = 1 if q_subtile_factor is None else q_subtile_factor
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
         self.mask_mod = mask_mod
@@ -648,8 +654,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_producer_threads = self.num_threads
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
-        # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
-        self.use_tma_O = self.arch >= Arch.sm_90
+        # Original SM80/SM90 gate is arch >= sm_90. SM120/SM121 reuse this
+        # MMA kernel and never build tma_atom_O, so TMA-O stays off.
+        # const_expr: a Python `if self.arch >= sm_120` inside @cute.jit
+        # would capture `self` as a dynamic if region and fail to compile.
+        self.use_tma_O = const_expr(Arch.sm_90 <= self.arch < Arch.sm_120)
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
@@ -726,6 +735,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             SharedStorage,
             tile_sched_params,
             TileScheduler,
+            blocksparse_tensors,
             aux_tensors,
             fastdiv_mods,
         ).launch(
@@ -765,6 +775,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr,
         tile_sched_params,
         TileScheduler: cutlass.Constexpr[Callable],
+        blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
         fastdiv_mods=None,
     ):
@@ -800,6 +811,36 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # negative block index for K/V loads; the load/store predicates already
         # guard all memory accesses when seqlen is 0.
         n_block = cutlass.max(n_block_max - 1, 0)
+        use_block_sparsity = const_expr(blocksparse_tensors is not None)
+        curr_mask_block_cnt = Int32(0)
+        curr_full_block_cnt = Int32(0)
+        total_block_cnt = Int32(0)
+        if const_expr(use_block_sparsity):
+            qhead_per_kvhead_packgqa = self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+            m_block_sparse = sparse_tensor_m_block(
+                m_block, qhead_per_kvhead_packgqa, self.q_subtile_factor
+            )
+            (
+                curr_mask_block_cnt,
+                curr_mask_block_idx,
+                curr_full_block_cnt,
+                curr_full_block_idx,
+            ) = get_curr_blocksparse_tensors(
+                batch_size,
+                num_head,
+                m_block_sparse,
+                blocksparse_tensors,
+                seqlen,
+            )
+            total_block_cnt = curr_mask_block_cnt + curr_full_block_cnt
+            if total_block_cnt > 0:
+                n_block = self._csr_n_block(
+                    Int32(0),
+                    curr_mask_block_cnt,
+                    curr_mask_block_idx,
+                    curr_full_block_cnt,
+                    curr_full_block_idx,
+                )
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get the appropriate tiles for this thread block.
@@ -1012,41 +1053,98 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # First iteration with seqlen masking
         smem_pipe_read = Int32(0)
         smem_pipe_write = Int32(self.num_stages - 1)
-        compute_one_n_block(
-            n_block,
-            smem_pipe_read,
-            smem_pipe_write,
-            is_first_n_block=True,
-            seqlen=seqlen,
-            mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
-        )
-        smem_pipe_read = self.advance_pipeline(smem_pipe_read)
-        smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-        # Next couple of iterations with causal masking
-        if const_expr(self.is_causal or self.is_local):
-            n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
-                seqlen, m_block, n_block_min
-            )
-            for n_tile in cutlass.range(n_block_max - 1 - n_block_min_causal_local_mask, unroll=1):
-                n_block = n_block_max - 2 - n_tile
+        if const_expr(use_block_sparsity):
+            # SM80/SM120 CSR: visit mask then full KV blocks (same reverse order as SM90).
+            # Token-level HSTU is still applied via mask_mod; CSR only skips all-masked tiles.
+            if total_block_cnt > 0:
+                next_n_block = Int32(-1)
+                if total_block_cnt > 1:
+                    next_n_block = self._csr_n_block(
+                        Int32(1),
+                        curr_mask_block_cnt,
+                        curr_mask_block_idx,
+                        curr_full_block_cnt,
+                        curr_full_block_idx,
+                    )
                 compute_one_n_block(
                     n_block,
                     smem_pipe_read,
                     smem_pipe_write,
+                    is_first_n_block=True,
                     seqlen=seqlen,
                     mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+                    prefetch_n_block=next_n_block,
                 )
                 smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-        # The remaining iterations have no masking
-        for n_tile in cutlass.range(n_block, unroll=1):
+                for i in cutlass.range(1, total_block_cnt, unroll=1):
+                    n_block_i = self._csr_n_block(
+                        i,
+                        curr_mask_block_cnt,
+                        curr_mask_block_idx,
+                        curr_full_block_cnt,
+                        curr_full_block_idx,
+                    )
+                    next_n_block = Int32(-1)
+                    if i + 1 < total_block_cnt:
+                        next_n_block = self._csr_n_block(
+                            i + 1,
+                            curr_mask_block_cnt,
+                            curr_mask_block_idx,
+                            curr_full_block_cnt,
+                            curr_full_block_idx,
+                        )
+                    compute_one_n_block(
+                        n_block_i,
+                        smem_pipe_read,
+                        smem_pipe_write,
+                        seqlen=seqlen,
+                        is_first_n_block=False,
+                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+                        prefetch_n_block=next_n_block,
+                    )
+                    smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+                    smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+            else:
+                # Empty Q tile: drain the dummy K prologue so epilogue can reuse smem.
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()
+        else:
             compute_one_n_block(
-                n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
-                seqlen=seqlen, is_first_n_block=False,
-                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
+                n_block,
+                smem_pipe_read,
+                smem_pipe_write,
+                is_first_n_block=True,
+                seqlen=seqlen,
+                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
             )
             smem_pipe_read = self.advance_pipeline(smem_pipe_read)
             smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+            # Next couple of iterations with causal masking
+            if const_expr(self.is_causal or self.is_local):
+                n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
+                    seqlen, m_block, n_block_min
+                )
+                for n_tile in cutlass.range(n_block_max - 1 - n_block_min_causal_local_mask, unroll=1):
+                    n_block = n_block_max - 2 - n_tile
+                    compute_one_n_block(
+                        n_block,
+                        smem_pipe_read,
+                        smem_pipe_write,
+                        seqlen=seqlen,
+                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+                    )
+                    smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+                    smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+            # The remaining iterations have no masking
+            for n_tile in cutlass.range(n_block, unroll=1):
+                compute_one_n_block(
+                    n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
+                    seqlen=seqlen, is_first_n_block=False,
+                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
+                )
+                smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+                smem_pipe_write = self.advance_pipeline(smem_pipe_write)
         # TODO: local
 
         # normalize acc_O by row_sum and calculate the lse
@@ -1095,6 +1193,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
+        prefetch_n_block: Optional[Int32] = None,
     ):
         """Compute one n_block of S/O.
 
@@ -1154,7 +1253,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         smem_pipe_write = self.advance_pipeline(smem_pipe_write)
 
         def load_K_next():
-            if n_block - self.num_stages >= 0:
+            if const_expr(prefetch_n_block is not None):
+                if prefetch_n_block >= 0:
+                    load_K(prefetch_n_block, smem_pipe_write, need_predicates=True)
+            elif n_block - self.num_stages >= 0:
                 load_K(n_block - self.num_stages, smem_pipe_write, need_predicates=False)
             cute.arch.cp_async_commit_group()
 
@@ -1185,6 +1287,35 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         # if const_expr(self.num_stages > 1):
         #     load_K_next()
+
+    @cute.jit
+    def _csr_n_block(
+        self,
+        i: Int32,
+        mask_cnt: Int32,
+        mask_idx: cute.Tensor,
+        full_cnt: Int32,
+        full_idx: Optional[cute.Tensor],
+    ) -> Int32:
+        """Return the i-th KV block in SM90-compatible reverse CSR order.
+
+        Mask blocks occupy [0, mask_cnt); full blocks occupy the rest. Both lists
+        are walked from last to first so the prologue can load the same first
+        n_block as the dense path's n_block_max-1 convention.
+
+        CuteDSL forbids early ``return`` inside ``@cute.jit``, so the result is
+        written to a local then returned once.
+        """
+        n_block = Int32(0)
+        if const_expr(full_idx is None):
+            n_block = mask_idx[mask_cnt - 1 - i]
+        else:
+            if i < mask_cnt:
+                n_block = mask_idx[mask_cnt - 1 - i]
+            else:
+                n_block = full_idx[full_cnt - 1 - (i - mask_cnt)]
+        return n_block
+
     @cute.jit
     def apply_score_mod(
         self,
